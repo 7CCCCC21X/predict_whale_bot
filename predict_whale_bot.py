@@ -511,6 +511,10 @@ class TelegramBot:
         self._allowed_chat_id = str(cfg.tg_chat_id)
 
     async def run(self, stop: asyncio.Event) -> None:
+        LOG.info("Telegram 命令机器人启动，allowed chat_id=%s", self._allowed_chat_id)
+
+        await self._prepare()
+
         offset = 0
         long_poll_timeout = 25
         # 长轮询要求 HTTP 超时大于 polling timeout
@@ -527,10 +531,40 @@ class TelegramBot:
                     },
                     timeout=http_timeout,
                 )
-                resp.raise_for_status()
-                payload = resp.json()
             except Exception as exc:
-                LOG.warning("Telegram getUpdates 失败: %s", exc)
+                LOG.warning("Telegram getUpdates 网络异常: %s", exc)
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=3)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            try:
+                payload = resp.json()
+            except Exception:
+                LOG.warning(
+                    "Telegram getUpdates 返回非 JSON status=%s body=%s",
+                    resp.status_code,
+                    resp.text[:300],
+                )
+                await asyncio.sleep(3)
+                continue
+
+            if not payload.get("ok"):
+                code = payload.get("error_code")
+                desc = payload.get("description", "")
+                if code == 409:
+                    LOG.warning(
+                        "Telegram getUpdates 冲突 409：另一个实例占着轮询，或 webhook 还在生效。"
+                        "正在重新尝试 deleteWebhook。详情：%s",
+                        desc,
+                    )
+                    await self._delete_webhook()
+                elif code == 401:
+                    LOG.error("Telegram token 无效（401），命令机器人退出。检查 TG_BOT_TOKEN。")
+                    return
+                else:
+                    LOG.warning("Telegram getUpdates 错误 %s: %s", code, desc)
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=3)
                 except asyncio.TimeoutError:
@@ -544,6 +578,42 @@ class TelegramBot:
                 except Exception:
                     LOG.exception("处理 Telegram update 出错")
 
+    async def _prepare(self) -> None:
+        # webhook 和 getUpdates 互斥。bot 之前设过 webhook 会让 getUpdates 一直 409。
+        await self._delete_webhook()
+
+        # 在 Telegram 里登记命令，输入 / 时会有补全提示，新用户更容易发现菜单。
+        try:
+            resp = await self.client.post(
+                f"{self.base}/setMyCommands",
+                json={
+                    "commands": [
+                        {"command": "menu", "description": "打开监控菜单"},
+                        {"command": "status", "description": "查看当前阈值"},
+                        {"command": "set_match", "description": "设置成交阈值 (USDT)"},
+                        {"command": "set_book", "description": "设置盘口阈值 (USDT)"},
+                        {"command": "help", "description": "查看帮助"},
+                    ]
+                },
+                timeout=httpx.Timeout(10),
+            )
+            if resp.status_code == 200 and resp.json().get("ok"):
+                LOG.info("Telegram 命令列表已注册（/menu /status /set_match /set_book /help）")
+        except Exception as exc:
+            LOG.warning("setMyCommands 失败（不影响功能）: %s", exc)
+
+    async def _delete_webhook(self) -> None:
+        try:
+            resp = await self.client.post(
+                f"{self.base}/deleteWebhook",
+                json={"drop_pending_updates": False},
+                timeout=httpx.Timeout(10),
+            )
+            if resp.status_code == 200 and resp.json().get("ok"):
+                LOG.info("Telegram webhook 已清空（如有）")
+        except Exception as exc:
+            LOG.warning("deleteWebhook 失败（可忽略）: %s", exc)
+
     def _allowed(self, chat_id: Any) -> bool:
         return str(chat_id) == self._allowed_chat_id
 
@@ -554,13 +624,24 @@ class TelegramBot:
             await self._handle_callback(update["callback_query"])
 
     async def _handle_message(self, msg: Dict[str, Any]) -> None:
-        chat_id = (msg.get("chat") or {}).get("id")
+        chat = msg.get("chat") or {}
+        chat_id = chat.get("id")
+        chat_type = chat.get("type")
+        text = (msg.get("text") or "").strip()
+
         if not self._allowed(chat_id):
+            if text.startswith("/"):
+                LOG.warning(
+                    "收到未授权 chat 的命令 chat_id=%s type=%s 期望 %s text=%r — 忽略。"
+                    "如需用此 chat 控制 bot，请把 TG_CHAT_ID 改成它，或在期望的 chat 里发送命令。",
+                    chat_id, chat_type, self._allowed_chat_id, text[:80],
+                )
             return
 
-        text = (msg.get("text") or "").strip()
         if not text.startswith("/"):
             return
+
+        LOG.info("收到命令 chat=%s type=%s text=%r", chat_id, chat_type, text[:80])
 
         head, _, tail = text.partition(" ")
         # 兼容 "/set_match@MyBot 1000"
@@ -589,6 +670,10 @@ class TelegramBot:
         chat_id = ((cb.get("message") or {}).get("chat") or {}).get("id")
 
         if not self._allowed(chat_id):
+            LOG.warning(
+                "未授权回调 chat_id=%s 期望 %s data=%r",
+                chat_id, self._allowed_chat_id, cb.get("data"),
+            )
             await self.tg.answer_callback_query(cb_id, "无权限")
             return
 

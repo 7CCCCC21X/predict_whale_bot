@@ -104,6 +104,10 @@ class Config:
     # 没设或解析失败默认 UTC。Telegram 自带消息时间戳，这里只显示 HH:MM:SS。
     display_tz: str
 
+    # 实时性保护：成交 executedAt 距 now 超过这个秒数就不推（视为"过时"，比如 bot
+    # 重启回放、API 滞后、用户切阈值导致的补发）。0 = 关闭过滤（推所有 fresh）。
+    max_alert_age_sec: int
+
     @property
     def threshold_usdt_wei(self) -> int:
         scale = Decimal(10) ** self.usdt_wei_decimals
@@ -181,6 +185,10 @@ class Config:
             # 默认走上海时区（用户在国内）。海外用户可设 DISPLAY_TZ=America/New_York
             # 等任意 IANA 名；解析失败 get_display_tz 会 fallback 到 UTC + 写 warning。
             display_tz=(os.getenv("DISPLAY_TZ") or "Asia/Shanghai").strip() or "Asia/Shanghai",
+
+            # 默认 120s = 2 分钟。正常延迟中位 ~2s，p95 < 30s，120s 给足宽容；
+            # 但 7+ 分钟的事件几乎肯定是回放/补发，过滤掉。设 0 关闭。
+            max_alert_age_sec=int(os.getenv("MAX_ALERT_AGE_SEC", "120")),
         )
 
 
@@ -199,6 +207,10 @@ class RuntimeState:
     paused: bool = False
     # 摘要轮播间隔（秒），可以 /set_summary 动态改并写盘
     summary_interval_sec: int = 3600
+    # "汇总基线" — 用户最近一次激活/重置自动摘要的时间。auto summary_runner 会
+    # 把它当下界，确保"打开"汇总后只统计之后的大单，不回放历史。
+    # 用 ISO 字符串存（持久化方便），运行时按需 parse。
+    summary_baseline_iso: str = ""
     # 主告警 chat（持久化里不存；from_config 时从 cfg 注入），用来区分"主频道 vs DM"
     main_chat_id: str = ""
     # 私聊订阅者：chat_id → {"threshold_usdt": str, "lang": "zh"|"en", "created_at", "last_seen"}
@@ -257,11 +269,38 @@ class RuntimeState:
         if len(self.recent_matches) > self._RECENT_MATCHES_CAP:
             self.recent_matches = self.recent_matches[-self._RECENT_MATCHES_CAP:]
 
-    def summarize_window(self, window_seconds: int) -> Optional[Dict[str, Any]]:
-        """聚合最近 window 秒内的成交。无数据返回 None。"""
+    def get_summary_baseline(self) -> Optional[datetime]:
+        """解析 summary_baseline_iso（None / 解析失败都返回 None）。"""
+        if not self.summary_baseline_iso:
+            return None
+        try:
+            ts = datetime.fromisoformat(self.summary_baseline_iso)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts
+        except Exception:
+            return None
+
+    def reset_summary_baseline(self) -> None:
+        """把汇总基线推到"现在"。下次自动汇总只统计这之后的大单。"""
+        self.summary_baseline_iso = datetime.now(timezone.utc).isoformat()
+
+    def summarize_window(
+        self, window_seconds: int, *, respect_baseline: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """聚合最近 window 秒内的成交。无数据返回 None。
+
+        respect_baseline=True 时（自动 summary_runner 用），下界 = max(now-window,
+        summary_baseline_ts)。这样用户"打开"汇总后第一次推送只算激活后产生的大单，
+        不会带历史回放。手动 /summary 按钮不传，给用户看真正的过去 N 秒。
+        """
         if window_seconds <= 0:
             return None
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+        if respect_baseline:
+            baseline = self.get_summary_baseline()
+            if baseline and baseline > cutoff:
+                cutoff = baseline
         within = [m for m in self.recent_matches if m["ts"] >= cutoff]
         if not within:
             return None
@@ -353,6 +392,8 @@ class RuntimeState:
                     state.lang = saved["lang"]
                 if "summary_interval_sec" in saved:
                     state.summary_interval_sec = int(saved["summary_interval_sec"])
+                if "summary_baseline_iso" in saved:
+                    state.summary_baseline_iso = str(saved["summary_baseline_iso"])
                 if "paused" in saved:
                     state.paused = bool(saved["paused"])
                 if "subscribers" in saved and isinstance(saved["subscribers"], dict):
@@ -400,6 +441,7 @@ class RuntimeState:
             "telegram_offset": self.telegram_offset,
             "lang": self.lang,
             "summary_interval_sec": self.summary_interval_sec,
+            "summary_baseline_iso": self.summary_baseline_iso,
             "paused": self.paused,
             "subscribers": self.subscribers,
             "address_labels": self.address_labels,
@@ -2080,6 +2122,8 @@ class TelegramBot:
                 await self.tg.answer_callback_query(cb_id, "无效操作")
                 return
             self.state.summary_interval_sec = secs
+            # 重置基线：用户"打开"汇总后第一次推送只算激活后的成交，不带历史
+            self.state.reset_summary_baseline()
             self.state.persist()
             if secs == 0:
                 ack = t(self.state, "dfreq_set_off_ok")
@@ -2109,6 +2153,9 @@ class TelegramBot:
                 return
             cur = self.state.is_paused_for(chat_id)
             self.state.set_paused_for(chat_id, not cur)
+            # 主频道从"暂停"恢复 → 重置汇总基线，下次 auto-summary 不带暂停期间的成交
+            if is_main and cur and not self.state.paused:
+                self.state.reset_summary_baseline()
             self.state.persist()
             await self.tg.answer_callback_query(
                 cb_id, "⏸ 已暂停" if not cur else "▶️ 已恢复",
@@ -2150,6 +2197,8 @@ class TelegramBot:
         # 主频道改全局；DM 改私有
         if is_main:
             self.state.threshold_usdt = amount
+            # 改了阈值 → 重置汇总基线，下一次 auto-summary 不带旧门槛下的历史
+            self.state.reset_summary_baseline()
             self.state.persist()
             scope_label = "global"
         else:
@@ -2189,6 +2238,8 @@ class TelegramBot:
 
         if target_chat_id is None or self.state.is_main_chat(target_chat_id):
             self.state.threshold_usdt = amount
+            # 主频道改全局阈值 → 重置汇总基线
+            self.state.reset_summary_baseline()
             LOG.info("全局成交阈值更新为 %s USDT", amount)
         else:
             self.state.upsert_subscriber(target_chat_id, threshold_usdt=amount)
@@ -2354,6 +2405,9 @@ class TelegramBot:
         admin 检查由分发器（main_chat_admin_cmds）兜底，这里只关心写状态。"""
         already = self.state.is_paused_for(target_chat_id)
         self.state.set_paused_for(target_chat_id, paused)
+        # 主频道从"暂停"恢复 → 重置汇总基线，下次 auto-summary 不带暂停期间的成交
+        if is_main and not paused and already:
+            self.state.reset_summary_baseline()
         self.state.persist()
 
         scope = "全局推送" if is_main else "你的私聊推送"
@@ -3009,6 +3063,28 @@ async def monitor_matches(
             while len(seen) > cfg.max_seen_ids:
                 seen.popitem(last=False)
 
+            # 实时性过滤：丢掉 executedAt 距 now 超过 max_alert_age_sec 的事件。
+            # 触发场景：bot 重启回放、Predict API 滞后追溯、用户切阈值后 fanout 才命中
+            # 旧单 —— 这些都不算"实时"，推出去会让用户看到 "延迟 7 分钟" 这种过时告警。
+            # 仍把它们留在 seen 里（避免下一轮再重复评估），只是不发。
+            if fresh and cfg.max_alert_age_sec > 0:
+                now_utc = datetime.now(timezone.utc)
+                limit_sec = cfg.max_alert_age_sec
+                fresh_realtime: List[Dict[str, Any]] = []
+                stale_n = 0
+                for ev in fresh:
+                    ts = parse_iso_ts(ev.get("executedAt") or ev.get("createdAt"))
+                    if ts is not None and (now_utc - ts).total_seconds() > limit_sec:
+                        stale_n += 1
+                        continue
+                    fresh_realtime.append(ev)
+                if stale_n:
+                    LOG.info(
+                        "[matches] 丢弃 %d 个过时事件（>%ds 旧），保留 %d 个实时",
+                        stale_n, limit_sec, len(fresh_realtime),
+                    )
+                fresh = fresh_realtime
+
             # 决定本轮要不要真发告警：
             # - 不是 startup（已经跑过几轮）→ 永远发
             # - startup + 有 seen 文件（重启续跑）→ "fresh" 是上次保存后的新单 → 发
@@ -3213,7 +3289,9 @@ async def summary_runner(
             window = state.summary_interval_sec  # 用最新值（可能刚被 /set_summary 改过）
             if window <= 0:
                 continue
-            summary = state.summarize_window(window)
+            # auto summary 只算"汇总基线"之后的成交 — 用户刚切了档位/恢复推送时，
+            # 不会被历史回放刷屏
+            summary = state.summarize_window(window, respect_baseline=True)
             if not summary:
                 LOG.info(
                     "[summary] iter=%d 过去 %ds 无大单，跳过",

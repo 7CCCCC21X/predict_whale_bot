@@ -195,6 +195,11 @@ class RuntimeState:
     lang: str = "zh"
     # 摘要轮播间隔（秒），可以 /set_summary 动态改并写盘
     summary_interval_sec: int = 3600
+    # 主告警 chat（持久化里不存；from_config 时从 cfg 注入），用来区分"主频道 vs DM"
+    main_chat_id: str = ""
+    # 私聊订阅者：chat_id → {"threshold_usdt": str, "lang": "zh"|"en", "created_at", "last_seen"}
+    # 每个私聊用户保存自己的阈值/语言，告警时按各自门槛分发。持久化在 runtime_state.json。
+    subscribers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # 内存里维护"本会话每个钱包大单计数"。重启清零（不持久化），FIFO 限 5000。
     cumulative_trades: "OrderedDict[str, int]" = field(default_factory=OrderedDict)
     # 滚动窗口：最近被告警过的成交，用于摘要聚合。重启清零（短窗口数据，不需持久化）。
@@ -293,6 +298,7 @@ class RuntimeState:
             usdt_wei_decimals=cfg.usdt_wei_decimals,
             lang=lang,
             summary_interval_sec=cfg.summary_interval_sec,
+            main_chat_id=str(cfg.tg_chat_id),
             _path=cfg.runtime_state_path,
         )
 
@@ -307,11 +313,28 @@ class RuntimeState:
                     state.lang = saved["lang"]
                 if "summary_interval_sec" in saved:
                     state.summary_interval_sec = int(saved["summary_interval_sec"])
+                if "subscribers" in saved and isinstance(saved["subscribers"], dict):
+                    # 校验+裁掉异常项；threshold 留 str 形态在 dict 里，用时再转 Decimal
+                    valid: Dict[str, Dict[str, Any]] = {}
+                    for cid, info in saved["subscribers"].items():
+                        if not isinstance(info, dict):
+                            continue
+                        try:
+                            Decimal(str(info.get("threshold_usdt", "0")))
+                        except (InvalidOperation, ValueError, TypeError):
+                            continue
+                        valid[str(cid)] = {
+                            "threshold_usdt": str(info.get("threshold_usdt", "0")),
+                            "lang": info.get("lang", "zh") if info.get("lang") in {"zh", "en"} else "zh",
+                            "created_at": str(info.get("created_at", "")),
+                            "last_seen": str(info.get("last_seen", "")),
+                        }
+                    state.subscribers = valid
                 LOG.info(
-                    "已从 %s 恢复 runtime state: threshold=%s offset=%s lang=%s summary=%ss",
+                    "已从 %s 恢复 runtime state: threshold=%s offset=%s lang=%s summary=%ss subscribers=%d",
                     cfg.runtime_state_path,
                     state.threshold_usdt, state.telegram_offset, state.lang,
-                    state.summary_interval_sec,
+                    state.summary_interval_sec, len(state.subscribers),
                 )
             except (InvalidOperation, ValueError, TypeError) as exc:
                 LOG.warning("runtime state 字段格式异常 (%s): %s — 用 env 默认", saved, exc)
@@ -319,7 +342,7 @@ class RuntimeState:
         return state
 
     def persist(self) -> None:
-        """把当前阈值 + offset + lang + summary_interval 写盘。失败只 log，不抛异常。"""
+        """把当前阈值 + offset + lang + summary_interval + subscribers 写盘。失败只 log。"""
         if not self._path:
             return
         save_runtime_state(self._path, {
@@ -327,7 +350,72 @@ class RuntimeState:
             "telegram_offset": self.telegram_offset,
             "lang": self.lang,
             "summary_interval_sec": self.summary_interval_sec,
+            "subscribers": self.subscribers,
         })
+
+    # ---------- 私聊订阅者（每个 chat 自己的阈值 / 语言） ----------
+
+    def is_main_chat(self, chat_id: Any) -> bool:
+        return str(chat_id) == self.main_chat_id
+
+    def get_threshold_for(self, chat_id: Any) -> Decimal:
+        """主告警频道用全局阈值；其它 chat 用各自订阅记录里的阈值。"""
+        key = str(chat_id)
+        if key == self.main_chat_id:
+            return self.threshold_usdt
+        info = self.subscribers.get(key)
+        if not info:
+            return self.threshold_usdt  # 还没订阅，回退全局
+        try:
+            return Decimal(str(info.get("threshold_usdt", "0")))
+        except (InvalidOperation, ValueError, TypeError):
+            return self.threshold_usdt
+
+    def get_lang_for(self, chat_id: Any) -> str:
+        key = str(chat_id)
+        if key == self.main_chat_id:
+            return self.lang
+        info = self.subscribers.get(key)
+        if info and info.get("lang") in {"zh", "en"}:
+            return info["lang"]
+        return self.lang
+
+    def upsert_subscriber(
+        self,
+        chat_id: Any,
+        *,
+        threshold_usdt: Optional[Decimal] = None,
+        lang: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """私聊用户首次发命令就注册；之后调阈值/切语言走这里。主告警频道不入表。"""
+        key = str(chat_id)
+        if key == self.main_chat_id:
+            return {}
+        now = datetime.now(timezone.utc).isoformat()
+        existing = self.subscribers.get(key)
+        if not existing:
+            existing = {
+                # 默认从 env 全局阈值起步
+                "threshold_usdt": str(self.threshold_usdt),
+                "lang": self.lang,
+                "created_at": now,
+                "last_seen": now,
+            }
+            self.subscribers[key] = existing
+            LOG.info("[subscribers] 新订阅 chat_id=%s 默认阈值=%s", key, existing["threshold_usdt"])
+        existing["last_seen"] = now
+        if threshold_usdt is not None:
+            existing["threshold_usdt"] = str(threshold_usdt)
+        if lang in {"zh", "en"}:
+            existing["lang"] = lang
+        return existing
+
+    def remove_subscriber(self, chat_id: Any) -> bool:
+        key = str(chat_id)
+        if key in self.subscribers:
+            del self.subscribers[key]
+            return True
+        return False
 
 
 def load_runtime_state(path: str) -> Optional[Dict[str, Any]]:
@@ -674,17 +762,21 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "stopped": "🛑 <b>Predict 大额监控已停止</b>",
         "help_text": (
             "🐋 <b>Predict Whale Bot</b>\n\n"
-            "底部按钮：<b>菜单 · 状态</b>\n\n"
-            "<b>菜单按钮（管理员）</b>\n"
-            "💵 预设 $100/$300/$500/$1k → 一键改阈值\n"
-            "✏️ → 输入任意金额\n"
-            "🌐 → 切换中英文\n"
-            "🧪 → 用当前阈值发测试推送\n\n"
-            "<b>命令（任意聊天可用）</b>\n"
-            "<code>/menu /status /summary /whoami /lang zh|en</code>\n"
-            "<b>命令（管理员）</b>\n"
-            "<code>/set_match 1000</code>  改成交阈值\n"
-            "<code>/set_summary 60</code>  改自动摘要间隔（分钟，<code>0</code>=关）"
+            "<b>私聊 bot</b>：自动注册，能改你<b>自己的</b>门槛、自己的语言。\n"
+            "<b>主告警频道</b>：管理员才能改全局阈值。\n\n"
+            "<b>菜单按钮</b>\n"
+            "💵 预设 $100/$300/$500/$1k\n"
+            "✏️ 自定义（最低 $10）\n"
+            "🌐 切换中英文 · 🔄 刷新 · 🧪 测试推送（admin）\n\n"
+            "<b>命令</b>（任意聊天）\n"
+            "<code>/menu</code> · <code>/status</code> · <code>/summary</code>\n"
+            "<code>/whoami</code> · <code>/lang zh|en</code>\n"
+            "<code>/set_match 100</code>  改阈值（私聊改你自己的；主频道要 admin）\n"
+            "<code>/unsubscribe</code>  退订私聊推送\n"
+            "<code>/speed</code>  当前 API 占用\n\n"
+            "<b>仅管理员</b>\n"
+            "<code>/set_summary 60</code> · <code>/benchmark 0.2 30</code>\n"
+            "<code>/subscribers</code> · <code>/test</code>"
         ),
     },
     "en": {
@@ -740,17 +832,21 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "stopped": "🛑 <b>Predict whale-bot stopped</b>",
         "help_text": (
             "🐋 <b>Predict Whale Bot</b>\n\n"
-            "Bottom buttons: <b>Menu · Status</b>\n\n"
-            "<b>Menu (admin)</b>\n"
-            "💵 Presets $100/$300/$500/$1k → set threshold\n"
-            "✏️ → enter any amount\n"
-            "🌐 → toggle zh/en\n"
-            "🧪 → send a test alert with current threshold\n\n"
-            "<b>Commands (any chat)</b>\n"
-            "<code>/menu /status /summary /whoami /lang zh|en</code>\n"
-            "<b>Commands (admin)</b>\n"
-            "<code>/set_match 1000</code>  threshold (USDT)\n"
-            "<code>/set_summary 60</code>  auto-summary interval (min, <code>0</code>=off)"
+            "<b>DM the bot</b>: auto-registers; controls <b>your own</b> threshold + language.\n"
+            "<b>Main alert chat</b>: admin only for the global threshold.\n\n"
+            "<b>Menu buttons</b>\n"
+            "💵 Presets $100/$300/$500/$1k\n"
+            "✏️ Custom (min $10)\n"
+            "🌐 Toggle zh/en · 🔄 Refresh · 🧪 Test (admin)\n\n"
+            "<b>Commands</b> (any chat)\n"
+            "<code>/menu</code> · <code>/status</code> · <code>/summary</code>\n"
+            "<code>/whoami</code> · <code>/lang zh|en</code>\n"
+            "<code>/set_match 100</code>  threshold (DM = your own; main chat = admin)\n"
+            "<code>/unsubscribe</code>  stop DM alerts\n"
+            "<code>/speed</code>  current API usage\n\n"
+            "<b>Admin only</b>\n"
+            "<code>/set_summary 60</code> · <code>/benchmark 0.2 30</code>\n"
+            "<code>/subscribers</code> · <code>/test</code>"
         ),
     },
 }
@@ -1190,22 +1286,62 @@ def market_title_of(m: Dict[str, Any]) -> str:
 
 
 PRESET_AMOUNTS = (Decimal("100"), Decimal("300"), Decimal("500"), Decimal("1000"))
-MIN_THRESHOLD_USDT = Decimal("1")
+MIN_THRESHOLD_USDT = Decimal("10")  # 防止 DM 用户设到 $1 导致刷屏
 MAX_THRESHOLD_USDT = Decimal("10000000")
 
 
-def _menu_text(state: RuntimeState, *, mode: str = "") -> str:
-    """紧凑两行：阈值 + 元数据。所有操作放按钮里，文案不再啰嗦。"""
-    lang_label = t(state, "lang_zh") if state.lang == "zh" else t(state, "lang_en")
+def _menu_text(
+    state: RuntimeState, *, mode: str = "", chat_id: Optional[Any] = None
+) -> str:
+    """紧凑两行：阈值 + 元数据。chat_id 决定显示主频道还是用户私有的阈值/语言。"""
+    if chat_id is None or state.is_main_chat(chat_id):
+        threshold = state.threshold_usdt
+        lang = state.lang
+        scope_hint = ""
+    else:
+        threshold = state.get_threshold_for(chat_id)
+        lang = state.get_lang_for(chat_id)
+        # 给私聊用户一句话提示这是"个人门槛"
+        if lang == "zh":
+            scope_hint = "（私聊订阅 · 你的门槛）\n"
+        else:
+            scope_hint = "(your private subscription)\n"
+
+    # 临时 view-state 用来取翻译；不修改真正的 state.lang
+    tmp_state = state if lang == state.lang else dataclass_replace_lang(state, lang)
+    lang_label = t(tmp_state, "lang_zh") if lang == "zh" else t(tmp_state, "lang_en")
     return (
-        f"{t(state, 'menu_title')}\n\n"
-        f"💵 {t(state, 'match_short')} <b>${fmt_decimal(state.threshold_usdt, 2)} USDT</b>\n"
+        f"{t(tmp_state, 'menu_title')}\n\n"
+        f"{scope_hint}"
+        f"💵 {t(tmp_state, 'match_short')} <b>${fmt_decimal(threshold, 2)} USDT</b>\n"
         f"🌐 {lang_label}"
     )
 
 
-def _menu_keyboard(state: RuntimeState) -> Dict[str, Any]:
-    """3 行紧凑布局：每个 kind 的预设 + 自定义在一行；底部一行控制按钮。"""
+def dataclass_replace_lang(state: RuntimeState, lang: str) -> RuntimeState:
+    """生成一个 lang 不同的浅拷贝 state，用来给翻译函数传上下文。"""
+    if lang == state.lang:
+        return state
+    # 不能简单复制 OrderedDict / list 的 default_factory 字段；这里只 view 用
+    clone = RuntimeState(
+        threshold_usdt=state.threshold_usdt,
+        usdt_wei_decimals=state.usdt_wei_decimals,
+        telegram_offset=state.telegram_offset,
+        lang=lang,
+        summary_interval_sec=state.summary_interval_sec,
+        main_chat_id=state.main_chat_id,
+        subscribers=state.subscribers,
+        cumulative_trades=state.cumulative_trades,
+        recent_matches=state.recent_matches,
+        _path="",  # 不让 view 副本碰盘
+    )
+    return clone
+
+
+def _menu_keyboard(state: RuntimeState, *, chat_id: Optional[Any] = None) -> Dict[str, Any]:
+    """3 行紧凑布局：预设 + 自定义；底部控制按钮。chat_id 决定按钮文案的语言。"""
+    lang = state.get_lang_for(chat_id) if chat_id is not None else state.lang
+    view = state if lang == state.lang else dataclass_replace_lang(state, lang)
 
     def amount_label(amt: Decimal) -> str:
         v = int(amt)
@@ -1220,16 +1356,16 @@ def _menu_keyboard(state: RuntimeState) -> Dict[str, Any]:
             label = amount_label(amt)
             text = f"{head_emoji} {label}" if i == 0 else label
             cells.append({"text": text, "callback_data": f"{prefix}:{int(amt)}"})
-        cells.append({"text": t(state, "btn_custom"), "callback_data": f"custom:{prefix}"})
+        cells.append({"text": t(view, "btn_custom"), "callback_data": f"custom:{prefix}"})
         return cells
 
     return {
         "inline_keyboard": [
             preset_row("match", "💵"),
             [
-                {"text": t(state, "btn_lang_switch"), "callback_data": "lang:toggle"},
-                {"text": t(state, "btn_refresh"), "callback_data": "refresh"},
-                {"text": t(state, "btn_test"), "callback_data": "test"},
+                {"text": t(view, "btn_lang_switch"), "callback_data": "lang:toggle"},
+                {"text": t(view, "btn_refresh"), "callback_data": "refresh"},
+                {"text": t(view, "btn_test"), "callback_data": "test"},
             ],
         ]
     }
@@ -1402,8 +1538,12 @@ class TelegramBot:
                         {"command": "menu", "description": "打开监控菜单"},
                         {"command": "status", "description": "查看当前阈值"},
                         {"command": "summary", "description": "查看当前窗口摘要"},
-                        {"command": "set_match", "description": "设置成交阈值 (USDT)"},
+                        {"command": "set_match", "description": "设置成交阈值 (USDT，DM 里改自己的)"},
                         {"command": "set_summary", "description": "设置自动摘要间隔（如 60 / 2h / 0）"},
+                        {"command": "unsubscribe", "description": "退订私聊推送"},
+                        {"command": "speed", "description": "查看当前 API 占用"},
+                        {"command": "benchmark", "description": "速度压测（admin）"},
+                        {"command": "subscribers", "description": "列出订阅者（admin）"},
                         {"command": "whoami", "description": "查看自己的 user_id"},
                         {"command": "help", "description": "查看帮助"},
                     ]
@@ -1411,7 +1551,7 @@ class TelegramBot:
                 timeout=httpx.Timeout(10),
             )
             if resp.status_code == 200 and resp.json().get("ok"):
-                LOG.info("Telegram 命令列表已注册（/menu /status /summary /set_match /set_summary /whoami /help）")
+                LOG.info("Telegram 命令列表已注册")
         except Exception as exc:
             LOG.warning("setMyCommands 失败（不影响功能）: %s", exc)
 
@@ -1443,12 +1583,16 @@ class TelegramBot:
         user_label = from_user.get("username") or from_user.get("first_name") or user_id
 
         is_admin = self._is_admin(user_id)
-        # 命令在哪发的就回哪。私聊 bot → 私聊回复，群里发 → 群里回复。
-        # 主告警频道（cfg.tg_chat_id）不参与命令路由 —— 只用于发布全局 alert。
+        is_main = self.state.is_main_chat(chat_id)
+        # 命令在哪发的就回哪。私聊 → 私聊回复，群里 → 群里回复。
         src = chat_id
 
-        # 自定义阈值的 force_reply 回填：用户的消息是对 bot 之前的"请输入自定义"提示
-        # 的回复时，把后续消息当作金额处理。
+        # 私聊或非主频道首次发任何命令 → 自动注册订阅者，初始阈值 = 全局
+        if not is_main and chat_type == "private" and (text.startswith("/") or text in KEYBOARD_ALIASES):
+            self.state.upsert_subscriber(chat_id)
+            self.state.persist()
+
+        # 自定义阈值的 force_reply 回填
         reply_to = msg.get("reply_to_message")
         if (
             isinstance(reply_to, dict)
@@ -1457,12 +1601,15 @@ class TelegramBot:
             and not text.startswith("/")
             and text not in KEYBOARD_ALIASES
         ):
-            if not is_admin:
-                LOG.warning("非管理员尝试改阈值: user=%s id=%s", user_label, user_id)
-                await self.tg.send("⛔ 仅管理员可改阈值。", chat_id=src)
+            # 主频道：要 admin（改全局）；私聊：用户改自己的（无需 admin）
+            if is_main and not is_admin:
+                await self.tg.send("⛔ 仅管理员可改全局阈值。", chat_id=src)
                 return
-            await self._set_threshold("match", text, reply_chat_id=src)
-            LOG.info("admin %s (id=%s) 改了成交阈值 -> %s", user_label, user_id, text)
+            await self._set_threshold(text, reply_chat_id=src, target_chat_id=chat_id)
+            LOG.info(
+                "%s 改了%s阈值 -> %s",
+                "admin" if is_main else "subscriber", "全局" if is_main else "私聊", text,
+            )
             return
 
         # 持久键盘按钮发回来的是纯文本（如「菜单」），转成对应命令处理。
@@ -1473,8 +1620,9 @@ class TelegramBot:
             return
 
         LOG.info(
-            "收到命令 chat=%s(type=%s) user=%s(id=%s) text=%r admin=%s",
-            chat_id, chat_type, user_label, user_id, text[:80], is_admin,
+            "收到命令 chat=%s(type=%s%s) user=%s(id=%s) text=%r admin=%s",
+            chat_id, chat_type, " main" if is_main else "",
+            user_label, user_id, text[:80], is_admin,
         )
 
         head, _, tail = text.partition(" ")
@@ -1482,65 +1630,103 @@ class TelegramBot:
         cmd = head.split("@", 1)[0].lower()
         arg = tail.strip()
 
-        write_cmds = {"/set_match", "/set_summary", "/test"}
-        if cmd in write_cmds and not is_admin:
+        # 主频道里 /set_match / /set_summary / /test / /benchmark 需要 admin。
+        # 私聊里 /set_match 是改"自己的"，不要 admin 检查。
+        admin_only_cmds = {"/set_summary", "/test", "/benchmark"}
+        main_chat_admin_cmds = {"/set_match"}
+        if cmd in admin_only_cmds and not is_admin:
             await self.tg.send(
-                f"⛔ 仅管理员可执行此命令。当前 user_id=<code>{user_id}</code>，"
-                "如需授权请把它加进 ALLOWED_USER_IDS。",
+                f"⛔ 仅管理员可执行此命令。当前 user_id=<code>{user_id}</code>。",
                 chat_id=src,
             )
             LOG.warning("非管理员尝试 %s: user=%s id=%s", cmd, user_label, user_id)
             return
+        if cmd in main_chat_admin_cmds and is_main and not is_admin:
+            await self.tg.send(
+                f"⛔ 仅管理员可改全局阈值。私聊 bot 调你自己的就不需要管理员权限。",
+                chat_id=src,
+            )
+            return
 
         if cmd == "/start":
             await self.tg.send(
-                _menu_text(self.state),
+                _menu_text(self.state, chat_id=chat_id),
                 reply_markup=_persistent_keyboard(),
                 chat_id=src,
             )
         elif cmd == "/menu":
             await self.tg.send(
-                _menu_text(self.state),
-                reply_markup=_menu_keyboard(self.state),
+                _menu_text(self.state, chat_id=chat_id),
+                reply_markup=_menu_keyboard(self.state, chat_id=chat_id),
                 chat_id=src,
             )
         elif cmd == "/status":
             await self.tg.send(
-                _menu_text(self.state),
+                _menu_text(self.state, chat_id=chat_id),
                 reply_markup=_persistent_keyboard(),
                 chat_id=src,
             )
         elif cmd == "/whoami":
+            scope = "全局（主告警频道）" if is_main else "私聊订阅"
+            my_threshold = self.state.get_threshold_for(chat_id)
             await self.tg.send(
                 f"你的 Telegram user_id：<code>{user_id}</code>\n"
                 f"用户名：<code>{html.escape(str(user_label))}</code>\n"
-                f"管理员权限：<b>{'✅ 是' if is_admin else '❌ 否'}</b>",
+                f"管理员权限：<b>{'✅ 是' if is_admin else '❌ 否'}</b>\n"
+                f"当前 chat 类型：{scope}\n"
+                f"chat 阈值：<b>${fmt_decimal(my_threshold, 2)} USDT</b>",
                 chat_id=src,
             )
         elif cmd == "/lang":
             wanted = arg.strip().lower()
+            new_lang: Optional[str] = None
             if wanted in {"zh", "cn", "chinese", "中文"}:
-                self.state.lang = "zh"
-                self.state.persist()
-                await self.tg.send(t(self.state, "lang_switched"), chat_id=src)
+                new_lang = "zh"
             elif wanted in {"en", "english", "英文"}:
-                self.state.lang = "en"
-                self.state.persist()
-                await self.tg.send(t(self.state, "lang_switched"), chat_id=src)
-            else:
+                new_lang = "en"
+            if new_lang is None:
+                cur = self.state.get_lang_for(chat_id)
                 await self.tg.send(
-                    f"Current language: <b>{self.state.lang}</b>\n"
-                    "Usage: <code>/lang zh</code> 或 <code>/lang en</code>",
+                    f"Current language: <b>{cur}</b>\n"
+                    "Usage: <code>/lang zh</code> or <code>/lang en</code>",
                     chat_id=src,
                 )
+            else:
+                if is_main:
+                    self.state.lang = new_lang
+                else:
+                    self.state.upsert_subscriber(chat_id, lang=new_lang)
+                self.state.persist()
+                # 用更新后的语言回应
+                await self.tg.send(t(dataclass_replace_lang(self.state, new_lang), "lang_switched"), chat_id=src)
         elif cmd == "/set_match":
-            await self._set_threshold("match", arg, reply_chat_id=src)
-            LOG.info("admin %s (id=%s) /set_match -> %s", user_label, user_id, arg)
+            await self._set_threshold(arg, reply_chat_id=src, target_chat_id=chat_id)
+            LOG.info(
+                "%s (id=%s) /set_match -> %s on chat %s",
+                user_label, user_id, arg, chat_id,
+            )
+        elif cmd == "/unsubscribe":
+            if is_main:
+                await self.tg.send("主频道不可退订。", chat_id=src)
+            elif self.state.remove_subscriber(chat_id):
+                self.state.persist()
+                await self.tg.send("✅ 已退订，不再向你私聊推送大单。", chat_id=src)
+            else:
+                await self.tg.send("你当前没有订阅记录。", chat_id=src)
         elif cmd == "/summary":
-            # 任何用户都能查询当前摘要；回复在源聊天。
             await self._send_summary(reply_chat_id=src)
         elif cmd == "/set_summary":
             await self._handle_set_summary(arg, reply_chat_id=src)
+        elif cmd == "/subscribers":
+            # admin 才能查看订阅列表
+            if not is_admin:
+                await self.tg.send("⛔ 仅管理员", chat_id=src)
+                return
+            await self._send_subscriber_list(reply_chat_id=src)
+        elif cmd == "/speed":
+            await self._send_speed_status(reply_chat_id=src)
+        elif cmd == "/benchmark":
+            await self._run_benchmark(arg, reply_chat_id=src)
         elif cmd == "/help":
             await self.tg.send(
                 t(self.state, "help_text"),
@@ -1553,15 +1739,20 @@ class TelegramBot:
     async def _handle_callback(self, cb: Dict[str, Any]) -> None:
         cb_id = cb.get("id", "")
         chat_id = ((cb.get("message") or {}).get("chat") or {}).get("id")
+        chat_type = ((cb.get("message") or {}).get("chat") or {}).get("type", "")
         from_user = cb.get("from") or {}
         user_id = from_user.get("id")
         user_label = from_user.get("username") or from_user.get("first_name") or user_id
 
-        # 不再按 chat_id 拒绝。任何 chat 都能点按钮，回复就地刷新。
-        # 写操作（改阈值/测试推送）仍按 user_id 看 ALLOWED_USER_IDS。
         data = cb.get("data") or ""
         message_id = (cb.get("message") or {}).get("message_id")
         src = chat_id
+        is_main = self.state.is_main_chat(chat_id)
+
+        # 私聊里点按钮也算自动注册一次
+        if not is_main and chat_type == "private":
+            self.state.upsert_subscriber(chat_id)
+            self.state.persist()
 
         # 刷新：只读，谁都能点
         if data == "refresh":
@@ -1569,27 +1760,36 @@ class TelegramBot:
             if message_id:
                 await self.tg.edit_message(
                     message_id,
-                    _menu_text(self.state),
-                    reply_markup=_menu_keyboard(self.state),
+                    _menu_text(self.state, chat_id=chat_id),
+                    reply_markup=_menu_keyboard(self.state, chat_id=chat_id),
                     chat_id=src,
                 )
             return
 
-        # 切换语言：zh ↔ en
+        # 切换语言：在 DM 里只翻 sub.lang；在主频道翻 state.lang
         if data == "lang:toggle":
-            self.state.lang = "en" if self.state.lang == "zh" else "zh"
+            if is_main:
+                self.state.lang = "en" if self.state.lang == "zh" else "zh"
+                new_lang = self.state.lang
+            else:
+                cur = self.state.get_lang_for(chat_id)
+                new_lang = "en" if cur == "zh" else "zh"
+                self.state.upsert_subscriber(chat_id, lang=new_lang)
             self.state.persist()
-            await self.tg.answer_callback_query(cb_id, t(self.state, "lang_switched"))
+            await self.tg.answer_callback_query(
+                cb_id,
+                t(dataclass_replace_lang(self.state, new_lang), "lang_switched"),
+            )
             if message_id:
                 await self.tg.edit_message(
                     message_id,
-                    _menu_text(self.state),
-                    reply_markup=_menu_keyboard(self.state),
+                    _menu_text(self.state, chat_id=chat_id),
+                    reply_markup=_menu_keyboard(self.state, chat_id=chat_id),
                     chat_id=src,
                 )
             return
 
-        # 测试推送：构造一笔假成交，按当前阈值/语言渲染一遍。仅管理员可触发。
+        # 测试推送：仅 admin
         if data == "test":
             if not self._is_admin(user_id):
                 await self.tg.answer_callback_query(cb_id, "⛔ admin only")
@@ -1598,19 +1798,19 @@ class TelegramBot:
             await self._send_test_alert(reply_chat_id=src)
             return
 
-        # 其它都是写操作（改阈值），需要管理员权限
-        if not self._is_admin(user_id):
+        # 其它写操作（改阈值）：主频道里要 admin；DM 里改自己的不要 admin
+        if is_main and not self._is_admin(user_id):
             LOG.warning(
-                "非管理员尝试改阈值（callback）user=%s id=%s data=%r",
+                "非管理员尝试改全局阈值（callback）user=%s id=%s data=%r",
                 user_label, user_id, data,
             )
-            await self.tg.answer_callback_query(cb_id, "⛔ 仅管理员可改阈值")
+            await self.tg.answer_callback_query(cb_id, "⛔ 仅管理员可改全局阈值")
             return
 
         if data == "custom:match":
             await self.tg.answer_callback_query(cb_id, "输入成交阈值")
             await self.tg.send(
-                f"💰 {CUSTOM_PROMPT_MARKER}成交阈值（USDT 数字，如 2500）。\n"
+                f"💰 {CUSTOM_PROMPT_MARKER}成交阈值（USDT 数字，如 2500，最低 ${int(MIN_THRESHOLD_USDT)}）。\n"
                 "回复这条消息即可，发送 /menu 取消。",
                 reply_markup=_custom_prompt_markup(),
                 chat_id=src,
@@ -1623,41 +1823,67 @@ class TelegramBot:
             await self.tg.answer_callback_query(cb_id, "无效操作")
             return
 
-        await self._apply_threshold(kind, amount)
-        LOG.info("admin %s (id=%s) callback %s -> %s", user_label, user_id, kind, amount)
+        # 主频道改全局；DM 改私有
+        if is_main:
+            self.state.threshold_usdt = amount
+            self.state.persist()
+            scope_label = "global"
+        else:
+            self.state.upsert_subscriber(chat_id, threshold_usdt=amount)
+            self.state.persist()
+            scope_label = "private"
+
+        LOG.info(
+            "callback %s -> %s by user=%s(id=%s) scope=%s",
+            kind, amount, user_label, user_id, scope_label,
+        )
         await self.tg.answer_callback_query(cb_id, f"✓ ${int(amount):,}")
         if message_id:
             await self.tg.edit_message(
                 message_id,
-                _menu_text(self.state),
-                reply_markup=_menu_keyboard(self.state),
+                _menu_text(self.state, chat_id=chat_id),
+                reply_markup=_menu_keyboard(self.state, chat_id=chat_id),
                 chat_id=src,
             )
 
     async def _set_threshold(
-        self, kind: str, raw: str, *, reply_chat_id: Optional[Any] = None
+        self,
+        raw: str,
+        *,
+        reply_chat_id: Optional[Any] = None,
+        target_chat_id: Optional[Any] = None,
     ) -> None:
+        """改阈值。target_chat_id 决定改全局（主频道）还是私有（DM 订阅者）。"""
         amount = _parse_amount(raw)
         if amount is None:
             await self.tg.send(
                 f"❌ 无效金额：<code>{html.escape(raw or '(空)')}</code>\n"
-                f"范围 {MIN_THRESHOLD_USDT}–{int(MAX_THRESHOLD_USDT):,} USDT",
+                f"范围 ${int(MIN_THRESHOLD_USDT)}–${int(MAX_THRESHOLD_USDT):,} USDT",
                 chat_id=reply_chat_id,
             )
             return
 
-        await self._apply_threshold(kind, amount)
+        if target_chat_id is None or self.state.is_main_chat(target_chat_id):
+            self.state.threshold_usdt = amount
+            LOG.info("全局成交阈值更新为 %s USDT", amount)
+        else:
+            self.state.upsert_subscriber(target_chat_id, threshold_usdt=amount)
+            LOG.info(
+                "[subscribers] chat_id=%s 私有阈值更新为 %s USDT",
+                target_chat_id, amount,
+            )
+        self.state.persist()
+
         await self.tg.send(
-            _menu_text(self.state),
-            reply_markup=_menu_keyboard(self.state),
+            _menu_text(self.state, chat_id=target_chat_id),
+            reply_markup=_menu_keyboard(self.state, chat_id=target_chat_id),
             chat_id=reply_chat_id,
         )
 
     async def _apply_threshold(self, kind: str, amount: Decimal) -> None:
-        # kind 历史上区分 match/book，盘口监控移除后只剩 match。
+        """旧 API，保留做向后兼容。新代码请用 _set_threshold(target_chat_id=...)"""
         self.state.threshold_usdt = amount
         LOG.info("成交阈值更新为 %s USDT", amount)
-        # 立刻写盘，重启续跑就能恢复用户调过的阈值
         self.state.persist()
 
     async def _send_summary(self, *, reply_chat_id: Optional[Any] = None) -> None:
@@ -1699,6 +1925,152 @@ class TelegramBot:
                 t(self.state, "summary_set_ok_fmt").format(label=label),
                 chat_id=reply_chat_id,
             )
+
+    async def _send_subscriber_list(self, *, reply_chat_id: Optional[Any] = None) -> None:
+        """admin only：列出所有订阅者及其阈值。"""
+        subs = self.state.subscribers
+        if not subs:
+            await self.tg.send("(无订阅者)", chat_id=reply_chat_id)
+            return
+        lines = [f"<b>订阅者列表（{len(subs)}）</b>"]
+        for cid, info in sorted(subs.items(), key=lambda kv: kv[0]):
+            try:
+                amt = Decimal(str(info.get("threshold_usdt", "0")))
+            except (InvalidOperation, ValueError, TypeError):
+                amt = Decimal("0")
+            lines.append(
+                f"<code>{html.escape(cid)}</code> · "
+                f"${fmt_decimal(amt, 0)} · "
+                f"{info.get('lang', 'zh')} · "
+                f"last_seen=<code>{html.escape(str(info.get('last_seen', '?'))[:19])}</code>"
+            )
+        await self.tg.send("\n".join(lines), chat_id=reply_chat_id)
+
+    async def _send_speed_status(self, *, reply_chat_id: Optional[Any] = None) -> None:
+        """读 Predict._request_log 显示当前 60s API 占用。任何人都能用。"""
+        import time as _time
+        now = _time.monotonic()
+        recent = [t for t in self.predict._request_log if t >= now - 60]
+        count = len(recent)
+        pct = count * 100 // Predict.RATE_LIMIT_PER_MIN
+        bar_len = min(20, pct // 5)
+        bar = "█" * bar_len + "░" * (20 - bar_len)
+        msg = (
+            "📊 <b>API 速度状态</b>\n\n"
+            f"最近 60s 调用：<b>{count}</b> 次\n"
+            f"限速预算：<b>{Predict.RATE_LIMIT_PER_MIN}/min</b>\n"
+            f"占用：<b>{pct}%</b>\n"
+            f"<code>{bar}</code>\n\n"
+            f"当前 POLL_INTERVAL_SEC = <code>{self.cfg.poll_interval_sec}s</code>"
+        )
+        await self.tg.send(msg, chat_id=reply_chat_id)
+
+    async def _run_benchmark(self, raw: str, *, reply_chat_id: Optional[Any] = None) -> None:
+        """admin only。/benchmark [interval] [duration] — 直接探测 Predict API 速度上限。"""
+        import time as _time
+        parts = (raw or "").split()
+        try:
+            interval = float(parts[0]) if len(parts) >= 1 and parts[0] else 0.2
+            duration = float(parts[1]) if len(parts) >= 2 and parts[1] else 30.0
+        except ValueError:
+            await self.tg.send(
+                "用法：<code>/benchmark [interval_sec] [duration_sec]</code>\n"
+                "例：<code>/benchmark 0.2 30</code>（默认值）\n"
+                "限制：interval ≥ 0.05，duration ≤ 60",
+                chat_id=reply_chat_id,
+            )
+            return
+        if interval < 0.05 or interval > 5 or duration < 1 or duration > 60:
+            await self.tg.send(
+                "❌ 参数超界。interval 0.05–5s，duration 1–60s。",
+                chat_id=reply_chat_id,
+            )
+            return
+
+        await self.tg.send(
+            f"⏱ 速度测试运行中…\n"
+            f"间隔 {interval}s · 时长 {duration}s · 预计 {int(duration / interval)} 次请求",
+            chat_id=reply_chat_id,
+        )
+
+        url = f"{self.cfg.predict_api_base}/v1/markets"
+        headers = self.predict.headers
+        params = {"first": 1}
+
+        end = _time.monotonic() + duration
+        counts = {"200": 0, "429": 0, "5xx": 0, "4xx": 0, "err": 0}
+        timings: List[float] = []
+
+        while _time.monotonic() < end:
+            t0 = _time.monotonic()
+            try:
+                resp = await self.predict.client.get(
+                    url, params=params, headers=headers,
+                    timeout=httpx.Timeout(5),
+                )
+                rtt = (_time.monotonic() - t0) * 1000  # ms
+                timings.append(rtt)
+                if resp.status_code == 200:
+                    counts["200"] += 1
+                elif resp.status_code == 429:
+                    counts["429"] += 1
+                elif 500 <= resp.status_code < 600:
+                    counts["5xx"] += 1
+                else:
+                    counts["4xx"] += 1
+            except Exception:
+                counts["err"] += 1
+            elapsed = _time.monotonic() - t0
+            sleep_for = max(0, interval - elapsed)
+            try:
+                await asyncio.sleep(sleep_for)
+            except asyncio.CancelledError:
+                break
+
+        total = sum(counts.values())
+        pct429 = (counts["429"] / total * 100) if total else 0
+        if timings:
+            timings.sort()
+            t_min = timings[0]
+            t_med = timings[len(timings) // 2]
+            t_p95 = timings[max(0, int(len(timings) * 0.95) - 1)]
+            t_max = timings[-1]
+            rtt_line = f"min {t_min:.0f}ms · 中位 {t_med:.0f}ms · p95 {t_p95:.0f}ms · max {t_max:.0f}ms"
+        else:
+            rtt_line = "(无成功响应)"
+
+        # 建议
+        if pct429 < 1:
+            suggestion = (
+                f"✅ 当前间隔 <b>{interval}s</b> 表现良好（429 < 1%），"
+                f"可以把 <code>POLL_INTERVAL_SEC</code> 设到 <code>{interval}</code>。"
+            )
+        elif pct429 < 5:
+            suggestion = (
+                f"⚠️ 间隔 <b>{interval}s</b> 触发 {pct429:.1f}% 429。可用但偏紧；"
+                f"稳健选 <code>POLL_INTERVAL_SEC={interval * 1.5:.2f}</code>。"
+            )
+        else:
+            suggestion = (
+                f"❌ 间隔 <b>{interval}s</b> 触发 {pct429:.1f}% 429，过激进。"
+                f"建议 <code>POLL_INTERVAL_SEC={max(interval * 2, 0.4):.2f}</code> 起步。"
+            )
+
+        report = (
+            "🏎 <b>速度测试结果</b>\n\n"
+            f"间隔 <code>{interval}s</code> · 时长 <code>{duration}s</code> · 总计 <b>{total}</b> 次\n\n"
+            f"✓ 200: <b>{counts['200']}</b> ({counts['200'] / total * 100 if total else 0:.1f}%)\n"
+            f"⚠️ 429: <b>{counts['429']}</b> ({pct429:.1f}%)\n"
+        )
+        if counts["5xx"]:
+            report += f"⚠️ 5xx: {counts['5xx']}\n"
+        if counts["4xx"]:
+            report += f"❓ 4xx: {counts['4xx']}\n"
+        if counts["err"]:
+            report += f"❌ 网络异常: {counts['err']}\n"
+        report += f"\n响应：{rtt_line}\n\n{suggestion}"
+
+        await self.tg.send(report, chat_id=reply_chat_id)
 
     async def _send_test_alert(self, *, reply_chat_id: Optional[Any] = None) -> None:
         """构造一笔假成交，按当前阈值/语言渲染一遍。用于验证消息样式 + 通道。
@@ -2295,9 +2667,17 @@ async def monitor_matches(
                 )
                 raw_logged = True
 
-            # 客户端按 notional value 过滤（API 不靠谱，见 fetch_new_matches 注释）。
-            threshold = state.threshold_usdt
-            events = [ev for ev in events if event_value_usdt(ev, cfg) >= threshold]
+            # 客户端按 notional value 过滤。门槛取"全局 + 所有订阅者中最低值"，
+            # 让每个订阅者都能拿到 ≥ 自己门槛的成交。后续在分发处再按各自门槛二次筛。
+            min_threshold = state.threshold_usdt
+            for _info in state.subscribers.values():
+                try:
+                    sub_th = Decimal(str(_info.get("threshold_usdt", "0")))
+                    if sub_th > 0 and sub_th < min_threshold:
+                        min_threshold = sub_th
+                except (InvalidOperation, ValueError, TypeError):
+                    continue
+            events = [ev for ev in events if event_value_usdt(ev, cfg) >= min_threshold]
 
             fresh: List[Dict[str, Any]] = []
             for ev in events:
@@ -2324,8 +2704,49 @@ async def monitor_matches(
                     # "本轮第 N 笔" 只反映被推送的大单。
                     signer = extract_signer(ev) or ""
                     n = state.bump_cumulative(signer) if signer else 0
-                    text, markup = format_match_alert(ev, cfg, state, cumulative=n)
-                    await tg.send(text, reply_markup=markup)
+                    notional_for_filter = event_value_usdt(ev, cfg)
+
+                    # 主告警频道：过全局阈值才发
+                    if notional_for_filter >= state.threshold_usdt:
+                        text, markup = format_match_alert(ev, cfg, state, cumulative=n)
+                        await tg.send(text, reply_markup=markup)
+
+                    # 私聊订阅者：按各自门槛分发；删掉一份 snapshot 防止迭代时
+                    # remove_subscriber 改字典报错。
+                    fanout_failed: List[str] = []
+                    for sub_chat_id, info in list(state.subscribers.items()):
+                        try:
+                            sub_threshold = Decimal(str(info.get("threshold_usdt", "0")))
+                        except (InvalidOperation, ValueError, TypeError):
+                            continue
+                        if notional_for_filter < sub_threshold:
+                            continue
+                        # 用订阅者各自的语言渲染
+                        sub_lang = info.get("lang", state.lang)
+                        view = (
+                            state if sub_lang == state.lang
+                            else dataclass_replace_lang(state, sub_lang)
+                        )
+                        text, markup = format_match_alert(ev, cfg, view, cumulative=n)
+                        try:
+                            mid = await tg.send(
+                                text, reply_markup=markup, chat_id=sub_chat_id,
+                            )
+                            # mid is None ⇒ 4xx (typically 403 = bot blocked)。
+                            # 不立刻删，万一是临时错误；连续多笔失败再考虑清理。
+                            if mid is None:
+                                fanout_failed.append(sub_chat_id)
+                        except Exception as exc:
+                            LOG.warning(
+                                "[fanout] 发给 chat %s 异常: %s",
+                                sub_chat_id, exc,
+                            )
+                    # 简化策略：只 log 失败的 chat，不自动删除（避免误伤临时网络异常）
+                    if fanout_failed:
+                        LOG.info(
+                            "[fanout] 本轮 %d 个订阅者推送失败（4xx），稍后人工 /subscribers 清理",
+                            len(fanout_failed),
+                        )
 
                     # 同步记入摘要滚动窗口（聚合用），不影响 alert 发送。
                     try:

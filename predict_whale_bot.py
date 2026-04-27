@@ -16,6 +16,8 @@ import html
 import json
 import logging
 import os
+import random
+import re
 import signal
 import sys
 from collections import OrderedDict
@@ -48,6 +50,20 @@ def env_decimal(name: str, default: str) -> Decimal:
         raise RuntimeError(f"环境变量 {name} 不是合法数字: {raw}") from exc
 
 
+def parse_user_id_list(raw: str) -> "frozenset[int]":
+    """解析逗号分隔的 Telegram user_id 列表。空字符串/无效项被忽略。"""
+    out: "set[int]" = set()
+    for token in (raw or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.add(int(token))
+        except ValueError:
+            LOG.warning("ALLOWED_USER_IDS 里有非整数项已忽略: %r", token)
+    return frozenset(out)
+
+
 @dataclass(frozen=True)
 class Config:
     predict_api_base: str
@@ -68,15 +84,20 @@ class Config:
     alert_on_startup: bool
     max_seen_ids: int
     seen_state_path: str
+    runtime_state_path: str
 
     market_refresh_sec: int
     orderbook_sub_batch: int
     orderbook_threshold_usdt: Decimal
 
     request_timeout_sec: float
+    api_max_retries: int
 
     market_url_template: str
     tx_url_template: str
+
+    # 仅这些 user.id 才能改阈值。空集合 = 沿用旧行为（只看 chat_id）。
+    allowed_user_ids: frozenset
     user_url_template: str
 
     watch_new_markets: bool
@@ -126,8 +147,11 @@ class Config:
             # 真正的"首次空 seen"会有特殊路径，不会刷屏。
             alert_on_startup=env_bool("ALERT_ON_STARTUP", True),
             max_seen_ids=int(os.getenv("MAX_SEEN_IDS", "10000")),
-            # Railway 容器重启会丢 /tmp，要真正持久化请挂 volume 到这个路径。
-            seen_state_path=os.getenv("SEEN_STATE_PATH", "/tmp/predict_seen.json").strip(),
+            # 默认指向 /data，配合 Railway Volume 才能真正跨重启持久化。
+            # /data 没挂载时仍能跑，只是状态文件读写会失败（只 log 警告，不 crash）。
+            seen_state_path=os.getenv("SEEN_STATE_PATH", "/data/predict_seen.json").strip(),
+            # 用户用 /menu 调过的阈值、Telegram update offset 等运行期状态。
+            runtime_state_path=os.getenv("RUNTIME_STATE_PATH", "/data/runtime_state.json").strip(),
 
             market_refresh_sec=int(os.getenv("MARKET_REFRESH_SEC", "300")),
             orderbook_sub_batch=int(os.getenv("ORDERBOOK_SUB_BATCH", "80")),
@@ -137,6 +161,7 @@ class Config:
             ),
 
             request_timeout_sec=float(os.getenv("REQUEST_TIMEOUT_SEC", "12")),
+            api_max_retries=int(os.getenv("API_MAX_RETRIES", "5")),
 
             # 默认按 predict.fun 前端 + BNB Chain 浏览器拼接，覆盖默认即可换链或换路径。
             market_url_template=os.getenv(
@@ -145,6 +170,8 @@ class Config:
             tx_url_template=os.getenv(
                 "TX_URL_TEMPLATE", "https://bscscan.com/tx/{hash}"
             ).strip(),
+
+            allowed_user_ids=parse_user_id_list(os.getenv("ALLOWED_USER_IDS", "")),
             # 用户链接：默认指向 BscScan 钱包页（一定能打开）。
             # 如果将来 predict.fun 有公开的用户主页，可以覆盖成 https://predict.fun/profile/{address}
             # 模板可用占位符：{address} / {username}
@@ -155,17 +182,22 @@ class Config:
             watch_new_markets=env_bool("WATCH_NEW_MARKETS", True),
             new_markets_check_sec=int(os.getenv("NEW_MARKETS_CHECK_SEC", "120")),
             seen_markets_path=os.getenv(
-                "SEEN_MARKETS_PATH", "/tmp/predict_seen_markets.json"
+                "SEEN_MARKETS_PATH", "/data/predict_seen_markets.json"
             ).strip(),
         )
 
 
 @dataclass
 class RuntimeState:
-    """运行期可变状态。Telegram 菜单可以改这里的阈值，监控任务每轮读取最新值。"""
+    """
+    运行期可变状态。Telegram 菜单可以改这里的阈值，监控任务每轮读取最新值。
+    通过 persist() 写入 RUNTIME_STATE_PATH，重启续跑会自动加载。
+    """
     threshold_usdt: Decimal
     orderbook_threshold_usdt: Decimal
     usdt_wei_decimals: int
+    telegram_offset: int = 0
+    _path: str = ""  # 仅内部用，不参与持久化
 
     @property
     def threshold_usdt_wei(self) -> int:
@@ -174,11 +206,69 @@ class RuntimeState:
 
     @classmethod
     def from_config(cls, cfg: Config) -> "RuntimeState":
-        return cls(
+        # 先按 env 默认值初始化，再用磁盘上的快照覆盖（如果有）。
+        state = cls(
             threshold_usdt=cfg.threshold_usdt,
             orderbook_threshold_usdt=cfg.orderbook_threshold_usdt,
             usdt_wei_decimals=cfg.usdt_wei_decimals,
+            _path=cfg.runtime_state_path,
         )
+
+        saved = load_runtime_state(cfg.runtime_state_path)
+        if saved:
+            try:
+                if "threshold_usdt" in saved:
+                    state.threshold_usdt = Decimal(str(saved["threshold_usdt"]))
+                if "orderbook_threshold_usdt" in saved:
+                    state.orderbook_threshold_usdt = Decimal(str(saved["orderbook_threshold_usdt"]))
+                if "telegram_offset" in saved:
+                    state.telegram_offset = int(saved["telegram_offset"])
+                LOG.info(
+                    "已从 %s 恢复 runtime state: threshold=%s orderbook=%s offset=%s",
+                    cfg.runtime_state_path,
+                    state.threshold_usdt, state.orderbook_threshold_usdt, state.telegram_offset,
+                )
+            except (InvalidOperation, ValueError, TypeError) as exc:
+                LOG.warning("runtime state 字段格式异常 (%s): %s — 用 env 默认", saved, exc)
+
+        return state
+
+    def persist(self) -> None:
+        """把当前阈值 + offset 写盘。失败只 log，不抛异常。"""
+        if not self._path:
+            return
+        save_runtime_state(self._path, {
+            "threshold_usdt": str(self.threshold_usdt),
+            "orderbook_threshold_usdt": str(self.orderbook_threshold_usdt),
+            "telegram_offset": self.telegram_offset,
+        })
+
+
+def load_runtime_state(path: str) -> Optional[Dict[str, Any]]:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        LOG.warning("runtime state 文件格式异常 (%s)，期望 object，得到 %s", path, type(data))
+    except Exception as exc:
+        LOG.warning("加载 runtime state 失败 (%s): %s", path, exc)
+    return None
+
+
+def save_runtime_state(path: str, data: Dict[str, Any]) -> None:
+    if not path:
+        return
+    tmp = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as exc:
+        LOG.warning("保存 runtime state 失败 (%s): %s", path, exc)
 
 
 def to_decimal(value: Any, decimals: int = 18, *, wei_hint: bool = True) -> Decimal:
@@ -366,16 +456,37 @@ def extract_tx_hash(event: Dict[str, Any]) -> str:
 
 
 def stable_event_id(event: Dict[str, Any]) -> str:
-    tx = extract_tx_hash(event)
-    executed = event.get("executedAt") or event.get("createdAt")
-    market = (event.get("market") or {}).get("id") or event.get("marketId")
-    amount = event.get("amountFilled") or event.get("amount")
-    signer = ((event.get("taker") or {}).get("signer")) or event.get("signer")
+    """
+    用稳定的业务字段构造去重 ID。
 
-    if tx:
-        return f"{tx}:{executed}:{market}:{amount}:{signer}"
+    旧实现的 fallback 是对整条 event JSON 做 hash，遇到 API 加新字段、字段顺序
+    变化、嵌套 market 对象的 title/slug 改名时，就会把同一笔成交当成新成交
+    导致重复推送。这里改成只取已知 stable 的字段，按固定顺序拼接后 hash。
+    """
+    market = event.get("market") or {}
+    taker = event.get("taker") if isinstance(event.get("taker"), dict) else {}
+    outcome = taker.get("outcome") if isinstance(taker.get("outcome"), dict) else {}
+    makers = event.get("makers") or []
 
-    raw = json.dumps(event, sort_keys=True, ensure_ascii=False)
+    maker_sigs = "|".join(sorted(
+        str((m or {}).get("signer") or "")
+        for m in makers
+        if isinstance(m, dict)
+    ))
+
+    parts = [
+        extract_tx_hash(event),
+        str(event.get("executedAt") or event.get("createdAt") or ""),
+        str(market.get("id") or event.get("marketId") or ""),
+        str(taker.get("signer") or event.get("signer") or ""),
+        str(taker.get("quoteType") or event.get("quoteType") or ""),
+        str(outcome.get("indexSet") or outcome.get("name") or ""),
+        str(event.get("amountFilled") or taker.get("amount") or ""),
+        str(event.get("priceExecuted") or taker.get("price") or ""),
+        maker_sigs,
+    ]
+
+    raw = "\x1f".join(parts)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -384,6 +495,44 @@ def normalize_text(s: Any, limit: int = 180) -> str:
     if len(text) > limit:
         text = text[: limit - 1] + "…"
     return html.escape(text)
+
+
+def chunk_html_safely(text: str, limit: int = 3900) -> List[str]:
+    """
+    按行切块，不会随便切断 HTML 标签或多字节字符。
+    极端情况下单行超过 limit，才会硬切；正常的告警每行都很短，不会触发。
+    """
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    chunks: List[str] = []
+    current: List[str] = []
+    size = 0
+
+    for line in text.splitlines(keepends=True):
+        # 超长单行：硬切（罕见；正常 alert 行都 < 200 字符）
+        while len(line) > limit:
+            if current:
+                chunks.append("".join(current))
+                current = []
+                size = 0
+            chunks.append(line[:limit])
+            line = line[limit:]
+
+        if size + len(line) > limit and current:
+            chunks.append("".join(current))
+            current = []
+            size = 0
+
+        current.append(line)
+        size += len(line)
+
+    if current:
+        chunks.append("".join(current))
+
+    return chunks
 
 
 class Telegram:
@@ -400,7 +549,7 @@ class Telegram:
         silent: bool = False,
         reply_markup: Optional[Dict[str, Any]] = None,
     ) -> Optional[int]:
-        chunks = [text[i: i + 3900] for i in range(0, len(text), 3900)] or [text]
+        chunks = chunk_html_safely(text, 3900) or [text]
         last_message_id: Optional[int] = None
 
         # 串行发送，避免 matches/orderbook 两个任务并发触发 Telegram 限流。
@@ -456,8 +605,38 @@ class Telegram:
                 continue
 
             if resp.status_code >= 400:
+                body = resp.text[:500]
+                # 400 + "can't parse entities" 通常是消息里 HTML 标签或实体被误切。
+                # 退一步用纯文本（去掉所有标签）再发一次，确保信息能落地。
+                if (
+                    resp.status_code == 400
+                    and "parse" in body.lower()
+                    and payload.get("parse_mode")
+                ):
+                    LOG.warning("Telegram HTML 解析失败，回退纯文本: %s", body)
+                    fallback_payload = dict(payload)
+                    fallback_payload.pop("parse_mode", None)
+                    fallback_payload.pop("reply_markup", None)  # markup 也可能挂在解析问题上
+                    fallback_payload["text"] = re.sub(r"<[^>]*>", "", payload["text"])
+                    try:
+                        resp2 = await self.client.post(
+                            f"{self.base}/sendMessage", json=fallback_payload
+                        )
+                        if resp2.status_code < 400:
+                            try:
+                                return int(resp2.json().get("result", {}).get("message_id"))
+                            except Exception:
+                                return None
+                        LOG.error(
+                            "Telegram 纯文本回退也失败: %s %s",
+                            resp2.status_code, resp2.text[:300],
+                        )
+                    except Exception as exc:
+                        LOG.error("Telegram 纯文本回退异常: %s", exc)
+                    return None
+
                 # 4xx 一般是请求本身的问题（比如格式错误），重试也修不了。
-                LOG.error("Telegram sendMessage 失败: %s %s", resp.status_code, resp.text[:500])
+                LOG.error("Telegram sendMessage 失败: %s %s", resp.status_code, body)
                 return None
 
             try:
@@ -519,19 +698,68 @@ class Predict:
         return {}
 
     async def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        统一的 Predict API GET：429 / 5xx / 网络错误一律指数退避重试。
+        - 429：尊重 Retry-After header，否则按 2^attempt（带 jitter）退
+        - 5xx：指数退避 + jitter
+        - 网络异常：同上
+        - 4xx（非 429）：直接抛
+        - 重试上限由 API_MAX_RETRIES 控制（默认 5）
+        """
         url = f"{self.cfg.predict_api_base}{path}"
-        resp = await self.client.get(url, params=params, headers=self.headers)
-        resp.raise_for_status()
+        last_exc: Optional[BaseException] = None
+        max_attempts = max(1, self.cfg.api_max_retries)
 
-        data = resp.json()
+        for attempt in range(max_attempts):
+            try:
+                resp = await self.client.get(url, params=params, headers=self.headers)
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPError) as exc:
+                last_exc = exc
+                delay = min(30.0, 2 ** attempt + random.random())
+                LOG.warning(
+                    "Predict API %s 网络异常 (attempt=%d/%d): %s — %.1fs 后重试",
+                    path, attempt + 1, max_attempts, exc, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
 
-        if isinstance(data, dict) and data.get("success") is False:
-            raise RuntimeError(f"Predict API 返回失败: {data}")
+            if resp.status_code == 429:
+                retry_after_raw = resp.headers.get("Retry-After")
+                try:
+                    delay = float(retry_after_raw) if retry_after_raw else min(30.0, 2 ** attempt)
+                except ValueError:
+                    delay = min(30.0, 2 ** attempt)
+                LOG.warning(
+                    "Predict API %s 429 限流 (attempt=%d/%d) — %.1fs 后重试",
+                    path, attempt + 1, max_attempts, delay,
+                )
+                await asyncio.sleep(delay + 0.5)
+                continue
 
-        if not isinstance(data, dict):
-            raise RuntimeError(f"Predict API 返回格式不是 dict: {type(data)}")
+            if 500 <= resp.status_code < 600:
+                delay = min(30.0, 2 ** attempt + random.random())
+                LOG.warning(
+                    "Predict API %s %s (attempt=%d/%d) — %.1fs 后重试",
+                    path, resp.status_code, attempt + 1, max_attempts, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
 
-        return data
+            resp.raise_for_status()
+
+            data = resp.json()
+
+            if isinstance(data, dict) and data.get("success") is False:
+                raise RuntimeError(f"Predict API 返回失败: {data}")
+
+            if not isinstance(data, dict):
+                raise RuntimeError(f"Predict API 返回格式不是 dict: {type(data)}")
+
+            return data
+
+        raise RuntimeError(
+            f"Predict API {path} 重试 {max_attempts} 次仍失败"
+        ) from last_exc
 
     async def fetch_new_matches(
         self,
@@ -764,13 +992,27 @@ class TelegramBot:
         self.base = tg.base
         # 只接受配置好的 chat_id 的命令，避免别人加机器人后乱改阈值。
         self._allowed_chat_id = str(cfg.tg_chat_id)
+        # 写入类命令（改阈值）只有这些 user_id 能用。空 = 不限制（兼容老部署）。
+        self._admin_user_ids = cfg.allowed_user_ids
+
+    def _is_admin(self, user_id: Any) -> bool:
+        """是否允许执行写操作。空白名单时回退为"所有人都可"。"""
+        if not self._admin_user_ids:
+            return True
+        try:
+            return int(user_id) in self._admin_user_ids
+        except (TypeError, ValueError):
+            return False
 
     async def run(self, stop: asyncio.Event) -> None:
         LOG.info("Telegram 命令机器人启动，allowed chat_id=%s", self._allowed_chat_id)
 
         await self._prepare()
 
-        offset = 0
+        # 从持久化的 runtime state 恢复 offset，避免重启后重新处理 24h 内的旧命令。
+        offset = self.state.telegram_offset
+        if offset:
+            LOG.info("Telegram 长轮询从 offset=%d 续跑", offset)
         long_poll_timeout = 25
         # 长轮询要求 HTTP 超时大于 polling timeout
         http_timeout = httpx.Timeout(long_poll_timeout + 10)
@@ -826,12 +1068,18 @@ class TelegramBot:
                     pass
                 continue
 
-            for update in payload.get("result") or []:
+            updates = payload.get("result") or []
+            for update in updates:
                 offset = int(update.get("update_id", 0)) + 1
                 try:
                     await self._handle_update(update)
                 except Exception:
                     LOG.exception("处理 Telegram update 出错")
+
+            # 处理完一批就把 offset 落盘（即便没有 update 也无所谓，文件 atomic write 很便宜）。
+            if updates:
+                self.state.telegram_offset = offset
+                self.state.persist()
 
     async def _prepare(self) -> None:
         # webhook 和 getUpdates 互斥。bot 之前设过 webhook 会让 getUpdates 一直 409。
@@ -883,15 +1131,19 @@ class TelegramBot:
         chat_id = chat.get("id")
         chat_type = chat.get("type")
         text = (msg.get("text") or "").strip()
+        from_user = msg.get("from") or {}
+        user_id = from_user.get("id")
+        user_label = from_user.get("username") or from_user.get("first_name") or user_id
 
         if not self._allowed(chat_id):
             if text.startswith("/"):
                 LOG.warning(
-                    "收到未授权 chat 的命令 chat_id=%s type=%s 期望 %s text=%r — 忽略。"
-                    "如需用此 chat 控制 bot，请把 TG_CHAT_ID 改成它，或在期望的 chat 里发送命令。",
+                    "收到未授权 chat 的命令 chat_id=%s type=%s 期望 %s text=%r — 忽略。",
                     chat_id, chat_type, self._allowed_chat_id, text[:80],
                 )
             return
+
+        is_admin = self._is_admin(user_id)
 
         # 自定义阈值的 force_reply 回填：用户的消息是对 bot 之前的"请输入自定义"提示
         # 的回复时，按提示里写的"成交"/"盘口"决定改哪个阈值。
@@ -903,10 +1155,15 @@ class TelegramBot:
             and not text.startswith("/")
             and text not in KEYBOARD_ALIASES
         ):
+            if not is_admin:
+                LOG.warning("非管理员尝试改阈值: user=%s id=%s", user_label, user_id)
+                await self.tg.send("⛔ 仅管理员可改阈值。")
+                return
             parent_text = reply_to.get("text") or ""
             kind = "match" if "成交" in parent_text else ("book" if "盘口" in parent_text else None)
             if kind:
                 await self._set_threshold(kind, text)
+                LOG.info("admin %s (id=%s) 改了 %s 阈值 -> %s", user_label, user_id, kind, text)
                 return
 
         # 持久键盘按钮发回来的是纯文本（如「菜单」），转成对应命令处理。
@@ -916,12 +1173,24 @@ class TelegramBot:
         if not text.startswith("/"):
             return
 
-        LOG.info("收到命令 chat=%s type=%s text=%r", chat_id, chat_type, text[:80])
+        LOG.info(
+            "收到命令 chat=%s user=%s(id=%s) text=%r admin=%s",
+            chat_id, user_label, user_id, text[:80], is_admin,
+        )
 
         head, _, tail = text.partition(" ")
         # 兼容 "/set_match@MyBot 1000"
         cmd = head.split("@", 1)[0].lower()
         arg = tail.strip()
+
+        write_cmds = {"/set_match", "/set_book"}
+        if cmd in write_cmds and not is_admin:
+            await self.tg.send(
+                f"⛔ 仅管理员可改阈值。当前 user_id=<code>{user_id}</code>，"
+                "如需授权请把它加进 ALLOWED_USER_IDS。"
+            )
+            LOG.warning("非管理员尝试 %s: user=%s id=%s", cmd, user_label, user_id)
+            return
 
         if cmd == "/start":
             # /start 用持久键盘开场，让底部「菜单」按钮立刻就位。
@@ -935,17 +1204,27 @@ class TelegramBot:
             await self.tg.send(_menu_text(self.state), reply_markup=_menu_keyboard())
         elif cmd == "/status":
             await self.tg.send(_menu_text(self.state), reply_markup=_persistent_keyboard())
+        elif cmd == "/whoami":
+            # 帮用户查自己的 user_id，方便加进 ALLOWED_USER_IDS。
+            await self.tg.send(
+                f"你的 Telegram user_id：<code>{user_id}</code>\n"
+                f"用户名：<code>{html.escape(str(user_label))}</code>\n"
+                f"管理员权限：<b>{'✅ 是' if is_admin else '❌ 否'}</b>"
+            )
         elif cmd == "/set_match":
             await self._set_threshold("match", arg)
+            LOG.info("admin %s (id=%s) /set_match -> %s", user_label, user_id, arg)
         elif cmd == "/set_book":
             await self._set_threshold("book", arg)
+            LOG.info("admin %s (id=%s) /set_book -> %s", user_label, user_id, arg)
         elif cmd == "/help":
             await self.tg.send(
                 "命令列表：\n"
                 "<code>/menu</code> 打开菜单（含快捷按钮）\n"
                 "<code>/status</code> 查看当前阈值\n"
-                "<code>/set_match 1000</code> 设置成交阈值（USDT）\n"
-                "<code>/set_book 1000</code> 设置盘口阈值（USDT）\n"
+                "<code>/whoami</code> 查看自己的 user_id\n"
+                "<code>/set_match 1000</code> 设置成交阈值（USDT，需管理员）\n"
+                "<code>/set_book 1000</code> 设置盘口阈值（USDT，需管理员）\n"
                 "底部「菜单」按钮 = /menu，「状态」按钮 = /status",
                 reply_markup=_persistent_keyboard(),
             )
@@ -953,6 +1232,9 @@ class TelegramBot:
     async def _handle_callback(self, cb: Dict[str, Any]) -> None:
         cb_id = cb.get("id", "")
         chat_id = ((cb.get("message") or {}).get("chat") or {}).get("id")
+        from_user = cb.get("from") or {}
+        user_id = from_user.get("id")
+        user_label = from_user.get("username") or from_user.get("first_name") or user_id
 
         if not self._allowed(chat_id):
             LOG.warning(
@@ -965,12 +1247,22 @@ class TelegramBot:
         data = cb.get("data") or ""
         message_id = (cb.get("message") or {}).get("message_id")
 
+        # 刷新是只读，谁都能点
         if data == "refresh":
             await self.tg.answer_callback_query(cb_id, "已刷新")
             if message_id:
                 await self.tg.edit_message(
                     message_id, _menu_text(self.state), reply_markup=_menu_keyboard()
                 )
+            return
+
+        # 其它都是写操作（改阈值），需要管理员权限
+        if not self._is_admin(user_id):
+            LOG.warning(
+                "非管理员尝试改阈值（callback）user=%s id=%s data=%r",
+                user_label, user_id, data,
+            )
+            await self.tg.answer_callback_query(cb_id, "⛔ 仅管理员可改阈值")
             return
 
         if data in {"custom:match", "custom:book"}:
@@ -993,6 +1285,7 @@ class TelegramBot:
             return
 
         await self._apply_threshold(kind, amount)
+        LOG.info("admin %s (id=%s) callback %s -> %s", user_label, user_id, kind, amount)
         await self.tg.answer_callback_query(cb_id, f"已设置 ${int(amount):,}")
         if message_id:
             await self.tg.edit_message(
@@ -1018,6 +1311,8 @@ class TelegramBot:
         else:
             self.state.orderbook_threshold_usdt = amount
             LOG.info("盘口阈值更新为 %s USDT", amount)
+        # 立刻写盘，重启续跑就能恢复用户调过的阈值
+        self.state.persist()
 
 
 def event_value_usdt(event: Dict[str, Any], cfg: Config) -> Decimal:

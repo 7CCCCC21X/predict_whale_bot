@@ -562,16 +562,32 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "newm_started": "🆕 <b>Predict 新市场监控已启动</b>",
         "threshold": "阈值",
         "interval": "检查间隔",
-        "open_menu_hint": "点底部「菜单」按钮或发 /menu 调整阈值",
-        "menu_title": "🐋 <b>Predict 监控菜单</b>",
-        "match_threshold": "成交阈值",
-        "ob_threshold": "盘口阈值",
-        "menu_hint": (
-            "点预设按钮一键设置，或点 <b>🔧 自定义</b> 弹出输入框输入任意金额。\n"
-            "也可手动发：<code>/set_match 数额</code> / <code>/set_book 数额</code>"
-        ),
-        "lang_switched": "已切换到中文。",
+        "open_menu_hint": "点底部「菜单」或发 /menu 调阈值",
+        "menu_title": "🐋 <b>Predict 监控</b>",
+        "match_short": "成交",
+        "ob_short": "盘口",
+        "lang_zh": "中文",
+        "lang_en": "EN",
+        "lang_switched": "已切换到中文",
+        "btn_lang_switch": "🌐 EN",
+        "btn_refresh": "🔄",
+        "btn_test": "🧪 测试推送",
+        "btn_custom": "✏️",
+        "test_caption": "🧪 <b>测试推送</b>（不是真实成交）",
         "stopped": "🛑 <b>Predict 大额监控已停止</b>",
+        "help_text": (
+            "🐋 <b>Predict Whale Bot</b>\n\n"
+            "底部按钮：<b>菜单 · 状态</b>\n\n"
+            "<b>菜单按钮（管理员）</b>\n"
+            "💵/📊 预设金额 → 一键改阈值\n"
+            "✏️ → 输入任意金额\n"
+            "🌐 → 切换中英文\n"
+            "🧪 → 用当前阈值发测试推送\n\n"
+            "<b>命令</b>\n"
+            "<code>/menu /status</code>\n"
+            "<code>/set_match 1000</code> · <code>/set_book 1000</code>\n"
+            "<code>/lang zh|en</code> · <code>/whoami</code>"
+        ),
     },
     "en": {
         "whale_title": "🐳 <b>Whale Alert</b>",
@@ -589,16 +605,32 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "newm_started": "🆕 <b>Predict new-market watcher started</b>",
         "threshold": "Threshold",
         "interval": "Check interval",
-        "open_menu_hint": "Tap the “Menu” button or send /menu to change thresholds",
-        "menu_title": "🐋 <b>Predict whale-bot menu</b>",
-        "match_threshold": "Match threshold",
-        "ob_threshold": "Orderbook threshold",
-        "menu_hint": (
-            "Tap a preset, or hit <b>🔧 Custom</b> to enter any amount.\n"
-            "Or send: <code>/set_match N</code> / <code>/set_book N</code>"
-        ),
-        "lang_switched": "Switched to English.",
+        "open_menu_hint": "Tap “Menu” or send /menu to change thresholds",
+        "menu_title": "🐋 <b>Predict Whale Bot</b>",
+        "match_short": "Match",
+        "ob_short": "Book",
+        "lang_zh": "中文",
+        "lang_en": "EN",
+        "lang_switched": "Switched to English",
+        "btn_lang_switch": "🌐 中",
+        "btn_refresh": "🔄",
+        "btn_test": "🧪 Test",
+        "btn_custom": "✏️",
+        "test_caption": "🧪 <b>Test alert</b> (not a real trade)",
         "stopped": "🛑 <b>Predict whale-bot stopped</b>",
+        "help_text": (
+            "🐋 <b>Predict Whale Bot</b>\n\n"
+            "Bottom buttons: <b>Menu · Status</b>\n\n"
+            "<b>Menu (admin)</b>\n"
+            "💵/📊 Preset amounts → set threshold\n"
+            "✏️ → enter any amount\n"
+            "🌐 → toggle zh/en\n"
+            "🧪 → send a test alert with current threshold\n\n"
+            "<b>Commands</b>\n"
+            "<code>/menu /status</code>\n"
+            "<code>/set_match 1000</code> · <code>/set_book 1000</code>\n"
+            "<code>/lang zh|en</code> · <code>/whoami</code>"
+        ),
     },
 }
 
@@ -1008,34 +1040,50 @@ MIN_THRESHOLD_USDT = Decimal("1")
 MAX_THRESHOLD_USDT = Decimal("10000000")
 
 
-def _menu_text(state: RuntimeState) -> str:
+def _menu_text(state: RuntimeState, *, mode: str = "") -> str:
+    """紧凑两行：阈值 + 元数据。所有操作放按钮里，文案不再啰嗦。"""
+    lang_label = t(state, "lang_zh") if state.lang == "zh" else t(state, "lang_en")
+    meta_bits = [f"🌐 {lang_label}"]
+    if mode:
+        meta_bits.append(f"⚡ <code>{html.escape(mode)}</code>")
     return (
-        f"{t(state, 'menu_title')}\n"
-        f"{t(state, 'match_threshold')}: <b>${fmt_decimal(state.threshold_usdt, 2)} USDT</b>\n"
-        f"{t(state, 'ob_threshold')}: <b>${fmt_decimal(state.orderbook_threshold_usdt, 2)} USDT</b>\n\n"
-        f"{t(state, 'menu_hint')}"
+        f"{t(state, 'menu_title')}\n\n"
+        f"💵 {t(state, 'match_short')} <b>${fmt_decimal(state.threshold_usdt, 2)}</b>"
+        f"  ｜  "
+        f"📊 {t(state, 'ob_short')} <b>${fmt_decimal(state.orderbook_threshold_usdt, 2)}</b>\n"
+        + "  ｜  ".join(meta_bits)
     )
 
 
-def _menu_keyboard() -> Dict[str, Any]:
-    def row(prefix: str, label: str) -> List[Dict[str, str]]:
-        return [
-            {
-                "text": f"{label} ${int(amt):,}",
-                "callback_data": f"{prefix}:{int(amt)}",
-            }
-            for amt in PRESET_AMOUNTS
-        ]
+def _menu_keyboard(state: RuntimeState) -> Dict[str, Any]:
+    """3 行紧凑布局：每个 kind 的预设 + 自定义在一行；底部一行控制按钮。"""
+
+    def amount_label(amt: Decimal) -> str:
+        v = int(amt)
+        # 万以下显示 $1k/$5k；万以上显示 $10k 这样的紧凑形式
+        if v >= 1000:
+            return f"${v // 1000}k"
+        return f"${v}"
+
+    def preset_row(prefix: str, head_emoji: str) -> List[Dict[str, str]]:
+        cells = []
+        for i, amt in enumerate(PRESET_AMOUNTS):
+            label = amount_label(amt)
+            # 第一格带 emoji，让"这一行是成交还是盘口"一眼可见
+            text = f"{head_emoji} {label}" if i == 0 else label
+            cells.append({"text": text, "callback_data": f"{prefix}:{int(amt)}"})
+        cells.append({"text": t(state, "btn_custom"), "callback_data": f"custom:{prefix}"})
+        return cells
 
     return {
         "inline_keyboard": [
-            row("match", "成交"),
-            row("book", "盘口"),
+            preset_row("match", "💵"),
+            preset_row("book", "📊"),
             [
-                {"text": "🔧 自定义成交", "callback_data": "custom:match"},
-                {"text": "🔧 自定义盘口", "callback_data": "custom:book"},
+                {"text": t(state, "btn_lang_switch"), "callback_data": "lang:toggle"},
+                {"text": t(state, "btn_refresh"), "callback_data": "refresh"},
+                {"text": t(state, "btn_test"), "callback_data": "test"},
             ],
-            [{"text": "🔄 刷新", "callback_data": "refresh"}],
         ]
     }
 
@@ -1306,15 +1354,20 @@ class TelegramBot:
         if cmd == "/start":
             # /start 用持久键盘开场，让底部「菜单」按钮立刻就位。
             await self.tg.send(
-                "👋 <b>欢迎</b>\n点底部「菜单」按钮或发 /menu 进入菜单。\n"
-                + _menu_text(self.state),
+                _menu_text(self.state, mode=self.cfg.mode),
                 reply_markup=_persistent_keyboard(),
             )
         elif cmd == "/menu":
             # /menu 用 inline 预设按钮，底部持久键盘不会被覆盖。
-            await self.tg.send(_menu_text(self.state), reply_markup=_menu_keyboard())
+            await self.tg.send(
+                _menu_text(self.state, mode=self.cfg.mode),
+                reply_markup=_menu_keyboard(self.state),
+            )
         elif cmd == "/status":
-            await self.tg.send(_menu_text(self.state), reply_markup=_persistent_keyboard())
+            await self.tg.send(
+                _menu_text(self.state, mode=self.cfg.mode),
+                reply_markup=_persistent_keyboard(),
+            )
         elif cmd == "/whoami":
             # 帮用户查自己的 user_id，方便加进 ALLOWED_USER_IDS。
             await self.tg.send(
@@ -1345,16 +1398,12 @@ class TelegramBot:
             await self._set_threshold("book", arg)
             LOG.info("admin %s (id=%s) /set_book -> %s", user_label, user_id, arg)
         elif cmd == "/help":
-            await self.tg.send(
-                "命令列表：\n"
-                "<code>/menu</code> 打开菜单（含快捷按钮）\n"
-                "<code>/status</code> 查看当前阈值\n"
-                "<code>/whoami</code> 查看自己的 user_id\n"
-                "<code>/set_match 1000</code> 设置成交阈值（USDT，需管理员）\n"
-                "<code>/set_book 1000</code> 设置盘口阈值（USDT，需管理员）\n"
-                "底部「菜单」按钮 = /menu，「状态」按钮 = /status",
-                reply_markup=_persistent_keyboard(),
-            )
+            await self.tg.send(t(self.state, "help_text"), reply_markup=_persistent_keyboard())
+        elif cmd == "/test":
+            if not is_admin:
+                await self.tg.send("⛔ admin only")
+                return
+            await self._send_test_alert()
 
     async def _handle_callback(self, cb: Dict[str, Any]) -> None:
         cb_id = cb.get("id", "")
@@ -1376,11 +1425,35 @@ class TelegramBot:
 
         # 刷新是只读，谁都能点
         if data == "refresh":
-            await self.tg.answer_callback_query(cb_id, "已刷新")
+            await self.tg.answer_callback_query(cb_id, "✓")
             if message_id:
                 await self.tg.edit_message(
-                    message_id, _menu_text(self.state), reply_markup=_menu_keyboard()
+                    message_id,
+                    _menu_text(self.state, mode=self.cfg.mode),
+                    reply_markup=_menu_keyboard(self.state),
                 )
+            return
+
+        # 切换语言：zh ↔ en，并刷新菜单消息
+        if data == "lang:toggle":
+            self.state.lang = "en" if self.state.lang == "zh" else "zh"
+            self.state.persist()
+            await self.tg.answer_callback_query(cb_id, t(self.state, "lang_switched"))
+            if message_id:
+                await self.tg.edit_message(
+                    message_id,
+                    _menu_text(self.state, mode=self.cfg.mode),
+                    reply_markup=_menu_keyboard(self.state),
+                )
+            return
+
+        # 测试推送：构造一笔假成交，按当前阈值/语言渲染一遍。仅管理员可触发。
+        if data == "test":
+            if not self._is_admin(user_id):
+                await self.tg.answer_callback_query(cb_id, "⛔ admin only")
+                return
+            await self.tg.answer_callback_query(cb_id, "✓")
+            await self._send_test_alert()
             return
 
         # 其它都是写操作（改阈值），需要管理员权限
@@ -1413,10 +1486,12 @@ class TelegramBot:
 
         await self._apply_threshold(kind, amount)
         LOG.info("admin %s (id=%s) callback %s -> %s", user_label, user_id, kind, amount)
-        await self.tg.answer_callback_query(cb_id, f"已设置 ${int(amount):,}")
+        await self.tg.answer_callback_query(cb_id, f"✓ ${int(amount):,}")
         if message_id:
             await self.tg.edit_message(
-                message_id, _menu_text(self.state), reply_markup=_menu_keyboard()
+                message_id,
+                _menu_text(self.state, mode=self.cfg.mode),
+                reply_markup=_menu_keyboard(self.state),
             )
 
     async def _set_threshold(self, kind: str, raw: str) -> None:
@@ -1429,7 +1504,10 @@ class TelegramBot:
             return
 
         await self._apply_threshold(kind, amount)
-        await self.tg.send(_menu_text(self.state), reply_markup=_menu_keyboard())
+        await self.tg.send(
+            _menu_text(self.state, mode=self.cfg.mode),
+            reply_markup=_menu_keyboard(self.state),
+        )
 
     async def _apply_threshold(self, kind: str, amount: Decimal) -> None:
         if kind == "match":
@@ -1440,6 +1518,40 @@ class TelegramBot:
             LOG.info("盘口阈值更新为 %s USDT", amount)
         # 立刻写盘，重启续跑就能恢复用户调过的阈值
         self.state.persist()
+
+    async def _send_test_alert(self) -> None:
+        """构造一笔假成交，按当前阈值/语言渲染一遍。用于验证消息样式 + 通道。"""
+        # 用当前 match 阈值 + 一些方便心算的数（500 股 × 0.5 = 250 USDT）
+        sample_notional = self.state.threshold_usdt
+        sample_price = Decimal("0.5")  # 50¢
+        sample_shares = sample_notional / sample_price if sample_price > 0 else Decimal("100")
+
+        scale_shares = Decimal(10) ** self.cfg.shares_wei_decimals
+        scale_usdt = Decimal(10) ** self.cfg.usdt_wei_decimals
+
+        fake_event = {
+            "transactionHash": "0x" + "ab" * 32,
+            "executedAt": "2026-01-01T00:00:00.000Z",
+            "amountFilled": str(int((sample_shares * scale_shares).to_integral_value(rounding=ROUND_DOWN))),
+            "priceExecuted": str(int((sample_price * scale_usdt).to_integral_value(rounding=ROUND_DOWN))),
+            "market": {
+                "id": 0,
+                "title": "Test Market",
+                "slug": "predict-bot-test-event",
+            },
+            "taker": {
+                "signer": "0x1234567890abcdef1234567890abcdef12345678",
+                "username": "predict_bot_test",
+                "outcome": {"name": "Yes"},
+                "quoteType": "Bid",
+            },
+            "makers": [],
+        }
+
+        text, markup = format_match_alert(fake_event, self.cfg, self.state)
+        # 加个"测试推送"前缀，让用户分清这不是真单
+        text = f"{t(self.state, 'test_caption')}\n\n{text}"
+        await self.tg.send(text, reply_markup=markup)
 
 
 def event_value_usdt(event: Dict[str, Any], cfg: Config) -> Decimal:

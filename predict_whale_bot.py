@@ -507,6 +507,16 @@ def fmt_decimal(x: Decimal, places: int = 2) -> str:
     return f"{x:,.{places}f}"
 
 
+def fmt_money(x: Decimal) -> str:
+    """钱的自适应格式：≥ $100 不要小数（$12,480），< $100 保留 2 位（$50.50）。
+    告警标题用得到，避免 "$12,480.00" 这种累赘。"""
+    if x <= 0:
+        return "-"
+    if x >= 100:
+        return f"${int(x.to_integral_value(rounding=ROUND_DOWN)):,}"
+    return f"${fmt_decimal(x, 2)}"
+
+
 def short_addr(addr: Any) -> str:
     s = str(addr or "")
     if len(s) <= 14:
@@ -764,6 +774,18 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "cumulative_fmt": "本轮第 {n} 笔",
         "btn_custom": "✏️ 自定义",
         "test_caption": "🧪 <b>测试推送</b>（不是真实成交）",
+        # 卡片内字段标签
+        "card_side": "方向",
+        "card_amount": "数量",
+        "card_price": "价格",
+        "card_trader": "交易者",
+        "card_time": "时间",
+        "card_traded": "成交",
+        "tier_super": "超级鲸鱼单",
+        "tier_big": "大鲸鱼单",
+        "tier_mid": "中型鲸鱼单",
+        "tier_normal": "普通大单",
+        "tier_small": "小单",
         "summary_title": "📊 <b>Predict Whale 摘要</b>",
         "summary_period_fmt": "过去 {label}：",
         "summary_total_count": "总大单",
@@ -835,6 +857,17 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "cumulative_fmt": "trade #{n} this session",
         "btn_custom": "✏️ Custom",
         "test_caption": "🧪 <b>Test alert</b> (not a real trade)",
+        "card_side": "Side",
+        "card_amount": "Amount",
+        "card_price": "Price",
+        "card_trader": "Trader",
+        "card_time": "Time",
+        "card_traded": "trade",
+        "tier_super": "Super whale",
+        "tier_big": "Big whale",
+        "tier_mid": "Mid whale",
+        "tier_normal": "Whale",
+        "tier_small": "Small",
         "summary_title": "📊 <b>Predict Whale Summary</b>",
         "summary_period_fmt": "Past {label}:",
         "summary_total_count": "Total trades",
@@ -1388,7 +1421,8 @@ def _menu_keyboard(state: RuntimeState, *, chat_id: Optional[Any] = None) -> Dic
             [
                 {"text": t(view, "btn_lang_switch"), "callback_data": "lang:toggle"},
                 {"text": t(view, "btn_refresh"), "callback_data": "refresh"},
-                {"text": t(view, "btn_test"), "callback_data": "test"},
+                # 🧪 测试推送按钮已移除（用户反馈"没啥用"）。/test 命令仍在，
+                # 真要测就 admin 直接发 /test。
             ],
         ]
     }
@@ -2708,6 +2742,26 @@ def _render_template(template: str, **kwargs: Any) -> str:
         return ""
 
 
+def whale_tier(notional: Decimal, state: "RuntimeState") -> Tuple[str, str]:
+    """
+    根据成交价值返回 (emoji, 等级标签)。
+      🟣 $100k+   超级鲸鱼单
+      🔴 $20k+    大鲸鱼单
+      🟠 $5k+     中型鲸鱼单
+      🟡 $1k+     普通大单
+      🟢 < $1k    小单（用户阈值低于 $1k 时也能用）
+    """
+    if notional >= Decimal("100000"):
+        return "🟣", t(state, "tier_super")
+    if notional >= Decimal("20000"):
+        return "🔴", t(state, "tier_big")
+    if notional >= Decimal("5000"):
+        return "🟠", t(state, "tier_mid")
+    if notional >= Decimal("1000"):
+        return "🟡", t(state, "tier_normal")
+    return "🟢", t(state, "tier_small")
+
+
 def format_match_alert(
     event: Dict[str, Any],
     cfg: Config,
@@ -2716,11 +2770,17 @@ def format_match_alert(
     cumulative: int = 0,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """
-    巨鲸提醒风格的成交告警。返回 (text, reply_markup)。
+    成交大单告警。卡片式布局：
+        🔴 $12,480 成交 ｜ YES @ 62.0¢
+        Lakers vs Warriors
 
-    设计目标：一眼看清"谁在哪里以多少价格做了什么"。省略 Market ID / 手续费 /
-    完整时间戳 / 方向字段 / Taker 地址行 / Makers 数 — 这些细节都已经能从底部
-    "查看市场 / 查看钱包 / 查看交易"按钮跳进去看到。
+        方向：BUY YES
+        数量：20,129 shares
+        价格：62.0¢
+        交易者：0x1234…abcd
+        时间：2026-04-27 16:42:31 UTC
+
+    标题 emoji 按金额分级。底部按钮：查看市场 / 查看钱包 / 查看交易。
     """
     market = event.get("market") or {}
     taker = event.get("taker") if isinstance(event.get("taker"), dict) else {}
@@ -2742,7 +2802,6 @@ def format_match_alert(
     )
     mid = market.get("id") or event.get("marketId")
     mid_str = str(mid) if mid is not None else ""
-    # categorySlug 在 Predict 实际响应里通常是市场专属 slug（"polymarket-fdv-..."）
     slug = (
         market.get("slug")
         or market.get("urlSlug")
@@ -2752,43 +2811,27 @@ def format_match_alert(
     if not raw_title:
         raw_title = f"Market #{mid_str}" if mid_str else "Unknown market"
 
-    # 把 slug 渲染成"父问题"标题，让单独看 "$4B" 这种短 title 时也知道是什么市场
-    parent_label = slug_to_label(slug)
-    # 如果父标题等价于子标题就不重复（比如 title="GC Hit Jun 2026" / slug="gc-hit-jun-2026"）
-    norm_title = re.sub(r"[\s\-_]+", "", raw_title.lower())
-    norm_parent = re.sub(r"[\s\-_]+", "", parent_label.lower())
-    if parent_label and norm_parent != norm_title:
-        market_line = (
-            f"📊 <b>{normalize_text(parent_label)}</b>\n"
-            f"<b>{normalize_text(raw_title)}</b> — <b>{normalize_text(outcome_name)}</b>"
-        )
-    else:
-        market_line = (
-            f"📊 <b>{normalize_text(raw_title)}</b> — <b>{normalize_text(outcome_name)}</b>"
-        )
+    # 卡片设计偏简洁：直接展示 market.title，不再额外塞 slug 转的"父标题"
+    market_line = normalize_text(raw_title)
 
     amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.shares_wei_decimals)
     notional = event_value_usdt(event, cfg)
-    # 价格用 notional/amount 反算最可靠；priceExecuted 在某些市场会编码出离谱数。
     price = event_price_usdt(event, notional, amount)
 
-    # 方向：Ask = 卖出（红），Bid = 买入（绿）
+    # 方向：Ask = SELL，Bid = BUY
     quote_type = str(taker.get("quoteType") or event.get("quoteType") or "").strip().lower()
     if quote_type in {"bid", "buy"}:
         action_label = t(state, "buy")
-        action_emoji = "🟢"
     elif quote_type in {"ask", "sell"}:
         action_label = t(state, "sell")
-        action_emoji = "🔴"
     else:
         action_label = t(state, "trade")
-        action_emoji = "⚪"
 
     signer = extract_signer(event) or ""
     username_raw = extract_username(event)
-    # 没有 username 就用截短地址；都没有则匿名
     if not username_raw:
         username_raw = short_addr(signer) if signer else t(state, "anon_wallet")
+    username_safe = normalize_text(username_raw)
 
     tx = extract_tx_hash(event)
 
@@ -2800,56 +2843,46 @@ def format_match_alert(
     )
     tx_link = _render_template(cfg.tx_url_template, hash=tx) if tx else ""
 
-    username_safe = normalize_text(username_raw)
-
-    # 价格按"美分"展示（× 100，一位小数），符合 image 1 风格
+    # 标题：emoji + value（≥$100 无小数）+ outcome + 价格（cents）
+    tier_emoji, _tier_label = whale_tier(notional, state)
     price_cents = price * Decimal("100")
-
-    # notional / price 找不到合理值时显示 "-" 而不是 $0.00 / 0.0¢，避免误导
-    notional_str = f"${fmt_decimal(notional, 2)}" if notional > 0 else "-"
+    notional_str = fmt_money(notional)
     price_str = f"{fmt_decimal(price_cents, 1)}¢" if price > 0 else "-"
+    outcome_safe = normalize_text(outcome_name)
 
-    # === 增强行 1：隐含概率 + 手续费 ===
-    enrich_a_bits: List[str] = []
-    if price > 0:
-        # price 是 0..1 的 USDT/share，× 100 = 隐含概率 %
-        enrich_a_bits.append(
-            f"{t(state, 'implied_label')} {fmt_decimal(price * Decimal('100'), 1)}%"
-        )
-    fee = event_fee_usdt(event, cfg)
-    if fee > 0:
-        enrich_a_bits.append(f"{t(state, 'fee_label')} ${fmt_decimal(fee, 4)}")
+    title_line = (
+        f"{tier_emoji} <b>{notional_str} {t(state, 'card_traded')}</b>"
+        f" ｜ {outcome_safe} @ {price_str}"
+    )
 
-    # === 增强行 2：对手方数（>1）+ 时间 + 本轮第 N 笔 ===
-    enrich_b_bits: List[str] = []
-    makers_count = len(event.get("makers") or [])
-    if makers_count > 1:
-        enrich_b_bits.append(f"{t(state, 'makers_label')} {makers_count}")
-    time_ago = format_time_ago(state, event.get("executedAt") or event.get("createdAt"))
-    if time_ago:
-        enrich_b_bits.append(time_ago)
-    if cumulative >= 2:
-        enrich_b_bits.append(t(state, "cumulative_fmt").format(n=cumulative))
+    # 卡片正文 5 行
+    side_line = f"{t(state, 'card_side')}：<b>{action_label} {outcome_safe}</b>"
+    amount_line = (
+        f"{t(state, 'card_amount')}：<code>{fmt_decimal(amount, 0)}</code>"
+        f" {t(state, 'shares')}"
+    )
+    price_body_line = f"{t(state, 'card_price')}：<code>{price_str}</code>"
+    trader_line = f"{t(state, 'card_trader')}：<code>{short_addr(signer) if signer else '-'}</code>"
+    # 时间：用 event.executedAt 的 UTC 时间戳；找不到就用 now
+    ts_raw = event.get("executedAt") or event.get("createdAt") or ""
+    if ts_raw:
+        ts_str = str(ts_raw).replace("T", " ").replace("Z", " UTC")
+        # 截断毫秒
+        ts_str = re.sub(r"(\d{2}:\d{2}:\d{2})\.\d+", r"\1", ts_str)
+    else:
+        ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    time_line = f"{t(state, 'card_time')}：<code>{html.escape(ts_str)}</code>"
 
-    lines = [
-        t(state, "whale_title"),
-        "",
-        f"<b>{username_safe}</b> {t(state, 'made_trade')}",
-        "",
+    text = "\n".join([
+        title_line,
         market_line,
         "",
-        (
-            f"{action_emoji} <b>{action_label}</b> "
-            f"{notional_str} @ {price_str} · "
-            f"{fmt_decimal(amount, 1)} {t(state, 'shares')}"
-        ),
-    ]
-    if enrich_a_bits:
-        lines.append("└ " + " · ".join(enrich_a_bits))
-    if enrich_b_bits:
-        lines.append("└ " + " · ".join(enrich_b_bits))
-
-    text = "\n".join(lines)
+        side_line,
+        amount_line,
+        price_body_line,
+        trader_line,
+        time_line,
+    ])
 
     # 底部 inline 按钮：查看市场 / 查看钱包 / 查看交易
     buttons: List[Dict[str, str]] = []
@@ -3459,8 +3492,32 @@ async def main() -> None:
             pass
 
     timeout = httpx.Timeout(cfg.request_timeout_sec)
+    # 速度优化：
+    # 1) HTTP/2 复用 TCP+TLS 连接 → 节省每次握手 ~50-150ms（Predict 服务端支持
+    #    时自动启用，不支持时无声回退到 HTTP/1.1）
+    # 2) 连接池：matches 轮询 + getUpdates 长轮询 + 潜在的 benchmark/ramp 并发，
+    #    保 20 条空闲连接随时可用，避免连接重建
+    transport_limits = httpx.Limits(
+        max_keepalive_connections=20,
+        max_connections=30,
+        keepalive_expiry=60,
+    )
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    # http2 需要 h2 包；没装就降级到 http2=False（确保 import 不会失败）
+    try:
+        import h2  # noqa: F401  # 仅探测是否可用
+        use_http2 = True
+    except ImportError:
+        use_http2 = False
+        LOG.info("h2 包未安装，HTTP/2 不启用（pip install h2 可省每次 ~50-150ms 握手）")
+
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        http2=use_http2,
+        limits=transport_limits,
+        # User-Agent 让 Predict 一眼能看出是这个 bot，方便他们排查
+        headers={"User-Agent": "predict-whale-bot/1.0"},
+    ) as client:
         tg = Telegram(cfg, client)
         predict = Predict(cfg, client)
         bot = TelegramBot(cfg, state, tg, client, predict)

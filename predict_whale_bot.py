@@ -143,7 +143,9 @@ class Config:
             matches_max_pages=int(os.getenv("MATCHES_MAX_PAGES", "5")),
             # 默认开：seen 持久化后，重启不会重复推送，所以 startup 告警是安全的。
             # 真正的"首次空 seen"会有特殊路径，不会刷屏。
-            alert_on_startup=env_bool("ALERT_ON_STARTUP", True),
+            # 默认 false：刚启动只 seed 不补推历史。用户体验：bot 一打开就只
+            # 推"打开之后"的真实新单，不会一上来就刷一屏旧单。
+            alert_on_startup=env_bool("ALERT_ON_STARTUP", False),
             max_seen_ids=int(os.getenv("MAX_SEEN_IDS", "10000")),
             # 默认指向 /data，配合 Railway Volume 才能真正跨重启持久化。
             # /data 没挂载时仍能跑，只是状态文件读写会失败（只 log 警告，不 crash）。
@@ -763,7 +765,8 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "lang_switched": "已切换到中文",
         "btn_lang_switch": "🌐 EN",
         "btn_refresh": "🔄",
-        "btn_test": "🧪 测试推送",
+        "btn_summary": "📊 摘要",
+        "btn_test": "🧪 测试推送",  # 保留键以备 _send_test_alert 调用，按钮已不挂菜单
         "implied_label": "隐含",
         "fee_label": "手续费",
         "makers_label": "对手方",
@@ -846,6 +849,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "lang_switched": "Switched to English",
         "btn_lang_switch": "🌐 中",
         "btn_refresh": "🔄",
+        "btn_summary": "📊 Summary",
         "btn_test": "🧪 Test",
         "implied_label": "Implied",
         "fee_label": "Fee",
@@ -1420,9 +1424,8 @@ def _menu_keyboard(state: RuntimeState, *, chat_id: Optional[Any] = None) -> Dic
             preset_row("match", "💵"),
             [
                 {"text": t(view, "btn_lang_switch"), "callback_data": "lang:toggle"},
+                {"text": t(view, "btn_summary"), "callback_data": "summary"},
                 {"text": t(view, "btn_refresh"), "callback_data": "refresh"},
-                # 🧪 测试推送按钮已移除（用户反馈"没啥用"）。/test 命令仍在，
-                # 真要测就 admin 直接发 /test。
             ],
         ]
     }
@@ -1694,7 +1697,7 @@ class TelegramBot:
 
         # 主频道里 /set_match / /set_summary / /test / /benchmark 需要 admin。
         # 私聊里 /set_match 是改"自己的"，不要 admin 检查。
-        admin_only_cmds = {"/set_summary", "/test", "/benchmark", "/ramp"}
+        admin_only_cmds = {"/set_summary", "/benchmark", "/ramp"}
         main_chat_admin_cmds = {"/set_match"}
         if cmd in admin_only_cmds and not is_admin:
             await self.tg.send(
@@ -1799,8 +1802,8 @@ class TelegramBot:
                 reply_markup=_persistent_keyboard(),
                 chat_id=src,
             )
-        elif cmd == "/test":
-            await self._send_test_alert(reply_chat_id=src)
+        # /test 命令已废弃（按用户要求清理"测试功能"）。_send_test_alert 方法
+        # 保留在代码里以备调试用，不再在命令路由里挂出来。
 
     async def _handle_callback(self, cb: Dict[str, Any]) -> None:
         cb_id = cb.get("id", "")
@@ -1830,6 +1833,12 @@ class TelegramBot:
                     reply_markup=_menu_keyboard(self.state, chat_id=chat_id),
                     chat_id=src,
                 )
+            return
+
+        # 摘要按钮：任何人可点；在源 chat 里直接发当前窗口摘要
+        if data == "summary":
+            await self.tg.answer_callback_query(cb_id, "✓")
+            await self._send_summary(reply_chat_id=src)
             return
 
         # 切换语言：在 DM 里只翻 sub.lang；在主频道翻 state.lang
@@ -2811,8 +2820,24 @@ def format_match_alert(
     if not raw_title:
         raw_title = f"Market #{mid_str}" if mid_str else "Unknown market"
 
-    # 卡片设计偏简洁：直接展示 market.title，不再额外塞 slug 转的"父标题"
-    market_line = normalize_text(raw_title)
+    # 标题逻辑：title 信息量足够 → 单行；title 太短/全是符号（如 "↓ 30,000" /
+    # "$4B"）→ 加 slug 转的"父问题"作为上下文
+    title_safe = normalize_text(raw_title)
+    title_letters = sum(1 for c in raw_title if c.isalpha())
+    informative = len(raw_title) >= 12 and title_letters >= 4
+    if informative:
+        market_line = f"<b>{title_safe}</b>"
+    else:
+        parent = slug_to_label(slug)
+        norm_title = re.sub(r"[\s\-_]+", "", raw_title.lower())
+        norm_parent = re.sub(r"[\s\-_]+", "", parent.lower()) if parent else ""
+        if parent and norm_parent != norm_title:
+            market_line = (
+                f"<b>{normalize_text(parent)}</b>\n"
+                f"<i>{title_safe}</i>"
+            )
+        else:
+            market_line = f"<b>{title_safe}</b>"
 
     amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.shares_wei_decimals)
     notional = event_value_usdt(event, cfg)
@@ -2829,9 +2854,17 @@ def format_match_alert(
 
     signer = extract_signer(event) or ""
     username_raw = extract_username(event)
-    if not username_raw:
-        username_raw = short_addr(signer) if signer else t(state, "anon_wallet")
-    username_safe = normalize_text(username_raw)
+    short = short_addr(signer) if signer else ""
+    # 用户名 + 短地址组合：有 username 就 "username · 0xabc…123"，没有就只显示短地址
+    if username_raw and username_raw != short:
+        trader_html = (
+            f"<b>{normalize_text(username_raw)}</b> · "
+            f"<code>{html.escape(short or '-')}</code>"
+        )
+    else:
+        trader_html = f"<code>{html.escape(short or '-')}</code>"
+
+    fee = event_fee_usdt(event, cfg)
 
     tx = extract_tx_hash(event)
 
@@ -2855,34 +2888,33 @@ def format_match_alert(
         f" ｜ {outcome_safe} @ {price_str}"
     )
 
-    # 卡片正文 5 行
+    # 卡片正文
     side_line = f"{t(state, 'card_side')}：<b>{action_label} {outcome_safe}</b>"
     amount_line = (
         f"{t(state, 'card_amount')}：<code>{fmt_decimal(amount, 0)}</code>"
         f" {t(state, 'shares')}"
     )
     price_body_line = f"{t(state, 'card_price')}：<code>{price_str}</code>"
-    trader_line = f"{t(state, 'card_trader')}：<code>{short_addr(signer) if signer else '-'}</code>"
+    trader_line = f"{t(state, 'card_trader')}：{trader_html}"
+    fee_line = (
+        f"{t(state, 'fee_label')}：<code>${fmt_decimal(fee, 4)} USDT</code>"
+        if fee > 0 else None
+    )
     # 时间：用 event.executedAt 的 UTC 时间戳；找不到就用 now
     ts_raw = event.get("executedAt") or event.get("createdAt") or ""
     if ts_raw:
         ts_str = str(ts_raw).replace("T", " ").replace("Z", " UTC")
-        # 截断毫秒
         ts_str = re.sub(r"(\d{2}:\d{2}:\d{2})\.\d+", r"\1", ts_str)
     else:
         ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     time_line = f"{t(state, 'card_time')}：<code>{html.escape(ts_str)}</code>"
 
-    text = "\n".join([
-        title_line,
-        market_line,
-        "",
-        side_line,
-        amount_line,
-        price_body_line,
-        trader_line,
-        time_line,
-    ])
+    body_lines = [side_line, amount_line, price_body_line, trader_line]
+    if fee_line:
+        body_lines.append(fee_line)
+    body_lines.append(time_line)
+
+    text = "\n".join([title_line, market_line, ""] + body_lines)
 
     # 底部 inline 按钮：查看市场 / 查看钱包 / 查看交易
     buttons: List[Dict[str, str]] = []
@@ -3240,14 +3272,24 @@ async def monitor_matches(
             while len(seen) > cfg.max_seen_ids:
                 seen.popitem(last=False)
 
-            should_alert = resumed_from_disk or not startup or cfg.alert_on_startup
+            # 决定本轮要不要真发告警：
+            # - 不是 startup（已经跑过几轮）→ 永远发
+            # - startup + 有 seen 文件（重启续跑）→ "fresh" 是上次保存后的新单 → 发
+            # - startup + 无 seen 文件（首次部署 / 状态丢失）→ 默认静默 seed，
+            #   除非显式 ALERT_ON_STARTUP=true 让用户主动选择补推历史
+            if not startup:
+                should_alert = True
+            elif resumed_from_disk:
+                should_alert = True
+            else:
+                should_alert = cfg.alert_on_startup  # 默认 False → 静默 seed
 
             sent_main = 0
             sent_subs = 0
 
             if fresh and not should_alert:
                 LOG.info(
-                    "首次启动且未启用 ALERT_ON_STARTUP，已记录 %d 条历史成交不告警",
+                    "首次启动（无 seen 文件），已记录 %d 条历史成交但不告警，等下一轮新单",
                     len(fresh),
                 )
             elif fresh:

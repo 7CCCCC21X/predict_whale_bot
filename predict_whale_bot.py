@@ -1971,11 +1971,11 @@ class TelegramBot:
         parts = (raw or "").split()
         try:
             interval = float(parts[0]) if len(parts) >= 1 and parts[0] else 0.2
-            duration = float(parts[1]) if len(parts) >= 2 and parts[1] else 30.0
+            duration = float(parts[1]) if len(parts) >= 2 and parts[1] else 15.0
         except ValueError:
             await self.tg.send(
                 "用法：<code>/benchmark [interval_sec] [duration_sec]</code>\n"
-                "例：<code>/benchmark 0.2 30</code>（默认值）\n"
+                "例：<code>/benchmark 0.2 15</code>（默认值）\n"
                 "限制：interval ≥ 0.05，duration ≤ 60",
                 chat_id=reply_chat_id,
             )
@@ -2000,32 +2000,72 @@ class TelegramBot:
         end = _time.monotonic() + duration
         counts = {"200": 0, "429": 0, "5xx": 0, "4xx": 0, "err": 0}
         timings: List[float] = []
+        iter_n = 0
+        last_log = _time.monotonic()
 
-        while _time.monotonic() < end:
-            t0 = _time.monotonic()
-            try:
-                resp = await self.predict.client.get(
-                    url, params=params, headers=headers,
-                    timeout=httpx.Timeout(5),
-                )
-                rtt = (_time.monotonic() - t0) * 1000  # ms
-                timings.append(rtt)
-                if resp.status_code == 200:
-                    counts["200"] += 1
-                elif resp.status_code == 429:
-                    counts["429"] += 1
-                elif 500 <= resp.status_code < 600:
-                    counts["5xx"] += 1
-                else:
-                    counts["4xx"] += 1
-            except Exception:
-                counts["err"] += 1
-            elapsed = _time.monotonic() - t0
-            sleep_for = max(0, interval - elapsed)
-            try:
-                await asyncio.sleep(sleep_for)
-            except asyncio.CancelledError:
-                break
+        LOG.info(
+            "[benchmark] 开始 url=%s interval=%.2fs duration=%.0fs",
+            url, interval, duration,
+        )
+
+        # 整个循环包一层 try/except，保证哪怕中途异常也至少能给用户回个失败消息
+        bench_error: Optional[str] = None
+        try:
+            while _time.monotonic() < end:
+                iter_n += 1
+                t0 = _time.monotonic()
+                # 每个请求加硬超时（8s），防止 httpx 连接池抖动导致单次 get 永远不返回。
+                try:
+                    resp = await asyncio.wait_for(
+                        self.predict.client.get(
+                            url, params=params, headers=headers,
+                            timeout=httpx.Timeout(5),
+                        ),
+                        timeout=8.0,
+                    )
+                    rtt = (_time.monotonic() - t0) * 1000  # ms
+                    timings.append(rtt)
+                    if resp.status_code == 200:
+                        counts["200"] += 1
+                    elif resp.status_code == 429:
+                        counts["429"] += 1
+                    elif 500 <= resp.status_code < 600:
+                        counts["5xx"] += 1
+                    else:
+                        counts["4xx"] += 1
+                except asyncio.TimeoutError:
+                    counts["err"] += 1
+                    LOG.warning("[benchmark] iter %d 硬超时 8s", iter_n)
+                except Exception as exc:
+                    counts["err"] += 1
+                    LOG.warning("[benchmark] iter %d 异常: %s", iter_n, exc)
+
+                # 每 ~5 秒往日志写一行进度，方便用户在 Railway 日志里看是否在跑
+                if _time.monotonic() - last_log >= 5.0:
+                    last_log = _time.monotonic()
+                    elapsed_s = duration - (end - _time.monotonic())
+                    LOG.info(
+                        "[benchmark] 进度 %.0f/%.0fs · iter=%d · 200=%d 429=%d err=%d",
+                        elapsed_s, duration, iter_n,
+                        counts["200"], counts["429"], counts["err"],
+                    )
+
+                elapsed = _time.monotonic() - t0
+                sleep_for = max(0, interval - elapsed)
+                try:
+                    await asyncio.sleep(sleep_for)
+                except asyncio.CancelledError:
+                    LOG.info("[benchmark] 被取消，提前退出")
+                    break
+        except Exception as exc:
+            LOG.exception("[benchmark] 整体循环异常")
+            bench_error = str(exc)
+
+        LOG.info(
+            "[benchmark] 完成 iter=%d 200=%d 429=%d 5xx=%d 4xx=%d err=%d",
+            iter_n, counts["200"], counts["429"],
+            counts["5xx"], counts["4xx"], counts["err"],
+        )
 
         total = sum(counts.values())
         pct429 = (counts["429"] / total * 100) if total else 0
@@ -2040,7 +2080,9 @@ class TelegramBot:
             rtt_line = "(无成功响应)"
 
         # 建议
-        if pct429 < 1:
+        if total == 0:
+            suggestion = "❌ 一次请求都没成功。检查 PREDICT_API_BASE / API key / 网络。"
+        elif pct429 < 1:
             suggestion = (
                 f"✅ 当前间隔 <b>{interval}s</b> 表现良好（429 < 1%），"
                 f"可以把 <code>POLL_INTERVAL_SEC</code> 设到 <code>{interval}</code>。"
@@ -2059,7 +2101,7 @@ class TelegramBot:
         report = (
             "🏎 <b>速度测试结果</b>\n\n"
             f"间隔 <code>{interval}s</code> · 时长 <code>{duration}s</code> · 总计 <b>{total}</b> 次\n\n"
-            f"✓ 200: <b>{counts['200']}</b> ({counts['200'] / total * 100 if total else 0:.1f}%)\n"
+            f"✓ 200: <b>{counts['200']}</b> ({(counts['200'] / total * 100) if total else 0:.1f}%)\n"
             f"⚠️ 429: <b>{counts['429']}</b> ({pct429:.1f}%)\n"
         )
         if counts["5xx"]:
@@ -2067,10 +2109,25 @@ class TelegramBot:
         if counts["4xx"]:
             report += f"❓ 4xx: {counts['4xx']}\n"
         if counts["err"]:
-            report += f"❌ 网络异常: {counts['err']}\n"
+            report += f"❌ 网络/超时: {counts['err']}\n"
         report += f"\n响应：{rtt_line}\n\n{suggestion}"
+        if bench_error:
+            report += f"\n\n⚠️ 测试中途异常：<code>{html.escape(bench_error)}</code>"
 
-        await self.tg.send(report, chat_id=reply_chat_id)
+        try:
+            await self.tg.send(report, chat_id=reply_chat_id)
+            LOG.info("[benchmark] 报告已发出")
+        except Exception:
+            LOG.exception("[benchmark] 发送报告失败")
+            # 兜底：纯文本简化版
+            try:
+                fallback = (
+                    f"benchmark done: total={total} 200={counts['200']} "
+                    f"429={counts['429']} err={counts['err']}"
+                )
+                await self.tg.send(fallback, chat_id=reply_chat_id)
+            except Exception:
+                LOG.exception("[benchmark] 兜底报告也失败")
 
     async def _send_test_alert(self, *, reply_chat_id: Optional[Any] = None) -> None:
         """构造一笔假成交，按当前阈值/语言渲染一遍。用于验证消息样式 + 通道。

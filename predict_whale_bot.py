@@ -888,6 +888,22 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "btn_summary": "📊 摘要",
         "btn_pause": "⏸ 暂停",
         "btn_resume": "▶️ 恢复",
+        "btn_dfreq": "⏱ 汇总频率",
+        "btn_dfreq_back": "◀️ 返回",
+        "btn_dfreq_off": "关闭",
+        "btn_dfreq_30m": "30 分钟",
+        "btn_dfreq_1h": "1 小时",
+        "btn_dfreq_3h": "3 小时",
+        "btn_dfreq_6h": "6 小时",
+        "btn_dfreq_12h": "12 小时",
+        "btn_dfreq_24h": "24 小时",
+        "dfreq_title": "⏱ <b>汇总推送频率</b>",
+        "dfreq_hint": "每隔多久把这段时间内的大单聚合成一条摘要推给你？",
+        "dfreq_current_fmt": "当前：<b>{label}</b>",
+        "dfreq_off_label": "已关闭",
+        "dfreq_set_ok_fmt": "✅ 已设为每 <b>{label}</b> 推一次摘要",
+        "dfreq_set_off_ok": "✅ 已关闭自动汇总（仍可点 📊 摘要 手动看）",
+        "dfreq_short": "汇总频率",
         "btn_test": "🧪 测试推送",  # 保留键以备 _send_test_alert 调用，按钮已不挂菜单
         "implied_label": "隐含",
         "fee_label": "手续费",
@@ -942,17 +958,18 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "<b>主告警频道</b>：管理员才能改全局阈值。\n\n"
             "<b>菜单按钮</b>（/menu）\n"
             "💵 预设 $100/$300/$500/$1k · ✏️ 自定义（最低 $10）\n"
-            "🌐 中英 · 📊 摘要 · ⏸ 暂停/▶️ 恢复 · 🔄 刷新\n\n"
+            "📊 摘要 · ⏱ 汇总频率 · 🌐 中英 · ⏸ 暂停/▶️ 恢复 · 🔄 刷新\n\n"
             "<b>常用命令</b>\n"
-            "<code>/menu</code>  阈值 + 暂停 + 语言\n"
-            "<code>/summary</code>  当前窗口摘要\n"
+            "<code>/menu</code>  阈值 + 频率 + 暂停 + 语言\n"
+            "<code>/summary</code>  立刻看一次摘要\n"
+            "<code>/dfreq</code>  汇总推送频率（按钮选档位）\n"
             "<code>/pause</code> · <code>/resume</code>  暂停/恢复推送\n"
             "<code>/whoami</code> · <code>/lang zh|en</code>\n\n"
             "<b>进阶（输全名即可）</b>\n"
             "<code>/set_match 100</code>  改阈值（DM=自己，主频道要 admin）\n"
             "<code>/unsubscribe</code>  退订私聊\n"
             "<code>/label 0x… 别名</code> · <code>/labels</code> · <code>/unlabel 0x…</code>\n"
-            "<code>/set_summary 60</code> · <code>/subscribers</code>（admin）"
+            "<code>/subscribers</code>（admin）"
         ),
     },
     "en": {
@@ -980,6 +997,22 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "btn_summary": "📊 Summary",
         "btn_pause": "⏸ Pause",
         "btn_resume": "▶️ Resume",
+        "btn_dfreq": "⏱ Digest freq",
+        "btn_dfreq_back": "◀️ Back",
+        "btn_dfreq_off": "Off",
+        "btn_dfreq_30m": "30 min",
+        "btn_dfreq_1h": "1 hour",
+        "btn_dfreq_3h": "3 hours",
+        "btn_dfreq_6h": "6 hours",
+        "btn_dfreq_12h": "12 hours",
+        "btn_dfreq_24h": "24 hours",
+        "dfreq_title": "⏱ <b>Digest frequency</b>",
+        "dfreq_hint": "How often should I roll up the big trades in that window into one digest?",
+        "dfreq_current_fmt": "Current: <b>{label}</b>",
+        "dfreq_off_label": "Off",
+        "dfreq_set_ok_fmt": "✅ Digest will arrive every <b>{label}</b>",
+        "dfreq_set_off_ok": "✅ Auto-digest off (you can still tap 📊 Summary anytime)",
+        "dfreq_short": "Digest freq",
         "btn_test": "🧪 Test",
         "implied_label": "Implied",
         "fee_label": "Fee",
@@ -1033,17 +1066,18 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "<b>Main alert chat</b>: admin only for global controls.\n\n"
             "<b>Menu buttons</b> (/menu)\n"
             "💵 $100/$300/$500/$1k presets · ✏️ Custom (min $10)\n"
-            "🌐 zh/en · 📊 Summary · ⏸ Pause/▶️ Resume · 🔄 Refresh\n\n"
+            "📊 Summary · ⏱ Digest freq · 🌐 zh/en · ⏸ Pause/▶️ Resume · 🔄 Refresh\n\n"
             "<b>Common</b>\n"
-            "<code>/menu</code>  threshold + pause + language\n"
-            "<code>/summary</code>  current window summary\n"
+            "<code>/menu</code>  threshold + freq + pause + language\n"
+            "<code>/summary</code>  one-shot summary right now\n"
+            "<code>/dfreq</code>  digest push frequency (button picker)\n"
             "<code>/pause</code> · <code>/resume</code>  stop/start alerts\n"
             "<code>/whoami</code> · <code>/lang zh|en</code>\n\n"
             "<b>Advanced (type full name)</b>\n"
             "<code>/set_match 100</code>  threshold (DM = own; main = admin)\n"
             "<code>/unsubscribe</code>  stop DM alerts\n"
             "<code>/label 0x… name</code> · <code>/labels</code> · <code>/unlabel 0x…</code>\n"
-            "<code>/set_summary 60</code> · <code>/subscribers</code> (admin)"
+            "<code>/subscribers</code> (admin)"
         ),
     },
 }
@@ -1437,10 +1471,15 @@ def _menu_text(
         status_line = "\n⏸ <b>推送已暂停</b>" if lang == "zh" else "\n⏸ <b>Alerts paused</b>"
     else:
         status_line = ""
+    if state.summary_interval_sec <= 0:
+        dfreq_label = t(tmp_state, "dfreq_off_label")
+    else:
+        dfreq_label = _format_duration_label(state.summary_interval_sec, lang)
     return (
         f"{t(tmp_state, 'menu_title')}\n\n"
         f"{scope_hint}"
         f"💵 {t(tmp_state, 'match_short')} <b>${fmt_decimal(threshold, 2)} USDT</b>\n"
+        f"⏱ {t(tmp_state, 'dfreq_short')} <b>{dfreq_label}</b>\n"
         f"🌐 {lang_label}"
         f"{status_line}"
     )
@@ -1493,13 +1532,67 @@ def _menu_keyboard(state: RuntimeState, *, chat_id: Optional[Any] = None) -> Dic
         "inline_keyboard": [
             preset_row("match", "💵"),
             [
-                {"text": t(view, "btn_lang_switch"), "callback_data": "lang:toggle"},
                 {"text": t(view, "btn_summary"), "callback_data": "summary"},
+                {"text": t(view, "btn_dfreq"), "callback_data": "dfreq:open"},
+            ],
+            [
+                {"text": t(view, "btn_lang_switch"), "callback_data": "lang:toggle"},
                 {"text": t(view, pause_btn_key), "callback_data": "pause:toggle"},
                 {"text": t(view, "btn_refresh"), "callback_data": "refresh"},
             ],
         ]
     }
+
+
+# 汇总频率预设：(秒, 翻译键)。0 = 关闭。点开后用户从这里选一个，比手输 "/set_summary 60"
+# 友好得多。新增/删除档位时同步更新 i18n（btn_dfreq_*）。
+DIGEST_FREQ_PRESETS: List[Tuple[int, str]] = [
+    (0, "btn_dfreq_off"),
+    (1800, "btn_dfreq_30m"),
+    (3600, "btn_dfreq_1h"),
+    (10800, "btn_dfreq_3h"),
+    (21600, "btn_dfreq_6h"),
+    (43200, "btn_dfreq_12h"),
+    (86400, "btn_dfreq_24h"),
+]
+
+
+def _digest_freq_text(state: RuntimeState, *, chat_id: Optional[Any] = None) -> str:
+    """汇总频率子菜单的标题/说明 + 当前生效值。"""
+    lang = state.get_lang_for(chat_id) if chat_id is not None else state.lang
+    view = state if lang == state.lang else dataclass_replace_lang(state, lang)
+    cur_secs = state.summary_interval_sec
+    if cur_secs <= 0:
+        cur_label = t(view, "dfreq_off_label")
+    else:
+        cur_label = _format_duration_label(cur_secs, lang)
+    return (
+        f"{t(view, 'dfreq_title')}\n\n"
+        f"{t(view, 'dfreq_hint')}\n"
+        f"{t(view, 'dfreq_current_fmt').format(label=cur_label)}"
+    )
+
+
+def _digest_freq_keyboard(
+    state: RuntimeState, *, chat_id: Optional[Any] = None
+) -> Dict[str, Any]:
+    """子菜单按钮：7 个预设档（0 / 30m / 1h / 3h / 6h / 12h / 24h）+ 返回。
+    当前已选的档位前面加 ✓，给用户一眼反馈。"""
+    lang = state.get_lang_for(chat_id) if chat_id is not None else state.lang
+    view = state if lang == state.lang else dataclass_replace_lang(state, lang)
+    current = state.summary_interval_sec
+
+    def cell(secs: int, key: str) -> Dict[str, str]:
+        label = t(view, key)
+        if secs == current:
+            label = f"✓ {label}"
+        return {"text": label, "callback_data": f"dfreq:set:{secs}"}
+
+    # 4 + 3 双行布局
+    row1 = [cell(s, k) for s, k in DIGEST_FREQ_PRESETS[:4]]
+    row2 = [cell(s, k) for s, k in DIGEST_FREQ_PRESETS[4:]]
+    back_row = [{"text": t(view, "btn_dfreq_back"), "callback_data": "dfreq:back"}]
+    return {"inline_keyboard": [row1, row2, back_row]}
 
 
 # 自定义输入提示里的标记文字。_handle_message 通过 reply_to_message 检测到
@@ -1673,7 +1766,7 @@ class TelegramBot:
                     "commands": [
                         {"command": "menu", "description": "打开监控菜单"},
                         {"command": "summary", "description": "查看当前窗口摘要"},
-                        {"command": "set_summary", "description": "设置自动摘要间隔（如 60 / 2h / 0）"},
+                        {"command": "dfreq", "description": "汇总推送频率（点按钮选 30m / 1h / 关闭…）"},
                         {"command": "pause", "description": "暂停推送（DM 改自己 / 主频道 admin）"},
                         {"command": "resume", "description": "恢复推送"},
                         {"command": "whoami", "description": "查看自己的 user_id"},
@@ -1847,6 +1940,13 @@ class TelegramBot:
                 await self.tg.send("你当前没有订阅记录。", chat_id=src)
         elif cmd == "/summary":
             await self._send_summary(reply_chat_id=src)
+        elif cmd == "/dfreq":
+            # 直接弹汇总频率子菜单（用按钮选档位，不用记 /set_summary 语法）
+            await self.tg.send(
+                _digest_freq_text(self.state, chat_id=chat_id),
+                reply_markup=_digest_freq_keyboard(self.state, chat_id=chat_id),
+                chat_id=src,
+            )
         elif cmd == "/set_summary":
             await self._handle_set_summary(arg, reply_chat_id=src)
         elif cmd == "/subscribers":
@@ -1946,6 +2046,60 @@ class TelegramBot:
                 return
             await self.tg.answer_callback_query(cb_id, "✓")
             await self._send_test_alert(reply_chat_id=src)
+            return
+
+        # 汇总频率子菜单：打开 / 返回 任意人都可以；改值要 admin（这是全局设置）。
+        if data == "dfreq:open":
+            await self.tg.answer_callback_query(cb_id, "✓")
+            if message_id:
+                await self.tg.edit_message(
+                    message_id,
+                    _digest_freq_text(self.state, chat_id=chat_id),
+                    reply_markup=_digest_freq_keyboard(self.state, chat_id=chat_id),
+                    chat_id=src,
+                )
+            return
+        if data == "dfreq:back":
+            await self.tg.answer_callback_query(cb_id, "✓")
+            if message_id:
+                await self.tg.edit_message(
+                    message_id,
+                    _menu_text(self.state, chat_id=chat_id),
+                    reply_markup=_menu_keyboard(self.state, chat_id=chat_id),
+                    chat_id=src,
+                )
+            return
+        if data.startswith("dfreq:set:"):
+            # 全局设置 → 任意 chat 改都需要 admin（保持跟 /set_summary 一致）
+            if not self._is_admin(user_id):
+                await self.tg.answer_callback_query(cb_id, "⛔ 仅管理员可改汇总频率")
+                return
+            try:
+                secs = int(data.split(":", 2)[2])
+            except (ValueError, IndexError):
+                await self.tg.answer_callback_query(cb_id, "无效操作")
+                return
+            self.state.summary_interval_sec = secs
+            self.state.persist()
+            if secs == 0:
+                ack = t(self.state, "dfreq_set_off_ok")
+            else:
+                ack = t(self.state, "dfreq_set_ok_fmt").format(
+                    label=_format_duration_label(secs, self.state.lang),
+                )
+            LOG.info(
+                "[dfreq] summary_interval_sec → %ds by user=%s(id=%s)",
+                secs, user_label, user_id,
+            )
+            await self.tg.answer_callback_query(cb_id, "✓")
+            if message_id:
+                await self.tg.edit_message(
+                    message_id,
+                    _menu_text(self.state, chat_id=chat_id),
+                    reply_markup=_menu_keyboard(self.state, chat_id=chat_id),
+                    chat_id=src,
+                )
+            await self.tg.send(ack, chat_id=src)
             return
 
         # 暂停 / 恢复推送：主频道改全局（要 admin），DM 改自己（不要 admin）

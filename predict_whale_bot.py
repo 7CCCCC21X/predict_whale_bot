@@ -479,6 +479,26 @@ def _menu_keyboard() -> Dict[str, Any]:
     }
 
 
+def _persistent_keyboard() -> Dict[str, Any]:
+    """聊天框底部常驻按钮。点一下发送「菜单」，bot 当 /menu 处理。"""
+    return {
+        "keyboard": [[{"text": "菜单"}, {"text": "状态"}]],
+        "is_persistent": True,
+        "resize_keyboard": True,
+    }
+
+
+# 持久键盘按钮文本到内部命令的映射
+KEYBOARD_ALIASES = {
+    "菜单": "/menu",
+    "menu": "/menu",
+    "Menu": "/menu",
+    "状态": "/status",
+    "status": "/status",
+    "Status": "/status",
+}
+
+
 def _parse_amount(text: str) -> Optional[Decimal]:
     raw = text.strip().lstrip("$").replace(",", "").replace("_", "")
     if not raw:
@@ -629,6 +649,10 @@ class TelegramBot:
         chat_type = chat.get("type")
         text = (msg.get("text") or "").strip()
 
+        # 持久键盘按钮发回来的是纯文本（如「菜单」），转成对应命令处理。
+        if text in KEYBOARD_ALIASES:
+            text = KEYBOARD_ALIASES[text]
+
         if not self._allowed(chat_id):
             if text.startswith("/"):
                 LOG.warning(
@@ -648,10 +672,18 @@ class TelegramBot:
         cmd = head.split("@", 1)[0].lower()
         arg = tail.strip()
 
-        if cmd in {"/menu", "/start"}:
+        if cmd == "/start":
+            # /start 用持久键盘开场，让底部「菜单」按钮立刻就位。
+            await self.tg.send(
+                "👋 <b>欢迎</b>\n点底部「菜单」按钮或发 /menu 进入菜单。\n"
+                + _menu_text(self.state),
+                reply_markup=_persistent_keyboard(),
+            )
+        elif cmd == "/menu":
+            # /menu 用 inline 预设按钮，底部持久键盘不会被覆盖。
             await self.tg.send(_menu_text(self.state), reply_markup=_menu_keyboard())
         elif cmd == "/status":
-            await self.tg.send(_menu_text(self.state))
+            await self.tg.send(_menu_text(self.state), reply_markup=_persistent_keyboard())
         elif cmd == "/set_match":
             await self._set_threshold("match", arg)
         elif cmd == "/set_book":
@@ -659,10 +691,12 @@ class TelegramBot:
         elif cmd == "/help":
             await self.tg.send(
                 "命令列表：\n"
-                "<code>/menu</code> 打开菜单\n"
-                "<code>/status</code> 查看阈值\n"
+                "<code>/menu</code> 打开菜单（含快捷按钮）\n"
+                "<code>/status</code> 查看当前阈值\n"
                 "<code>/set_match 1000</code> 设置成交阈值（USDT）\n"
-                "<code>/set_book 1000</code> 设置盘口阈值（USDT）"
+                "<code>/set_book 1000</code> 设置盘口阈值（USDT）\n"
+                "底部「菜单」按钮 = /menu，「状态」按钮 = /status",
+                reply_markup=_persistent_keyboard(),
             )
 
     async def _handle_callback(self, cb: Dict[str, Any]) -> None:
@@ -852,8 +886,9 @@ async def monitor_matches(
         f"✅ <b>Predict 成交大单监控已启动</b>\n"
         f"阈值：<b>${fmt_decimal(state.threshold_usdt, 2)} USDT</b>\n"
         f"模式：<code>matches</code> ｜ 轮询：<code>{cfg.poll_interval_sec}s</code>\n"
-        f"用 /menu 调整阈值",
+        f"点底部「菜单」按钮或发 /menu 调整阈值",
         silent=True,
+        reply_markup=_persistent_keyboard(),
     )
 
     while not stop.is_set():
@@ -1094,8 +1129,9 @@ async def monitor_orderbook(
         f"✅ <b>Predict 盘口监控已启动</b>\n"
         f"阈值：<b>${fmt_decimal(state.orderbook_threshold_usdt, 2)} USDT</b>\n"
         f"模式：<code>orderbook</code>\n"
-        f"用 /menu 调整阈值",
+        f"点底部「菜单」按钮或发 /menu 调整阈值",
         silent=True,
+        reply_markup=_persistent_keyboard(),
     )
 
     backoff = 1

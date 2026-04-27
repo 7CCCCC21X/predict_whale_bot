@@ -618,11 +618,8 @@ def _menu_text(state: RuntimeState) -> str:
         "🐋 <b>Predict 监控菜单</b>\n"
         f"成交阈值：<b>${fmt_decimal(state.threshold_usdt, 2)} USDT</b>\n"
         f"盘口阈值：<b>${fmt_decimal(state.orderbook_threshold_usdt, 2)} USDT</b>\n\n"
-        "点击下方按钮快速设置，或自定义：\n"
-        "<code>/set_match 数额</code>  设置成交阈值\n"
-        "<code>/set_book 数额</code>  设置盘口阈值\n"
-        "<code>/status</code>  查看当前阈值\n"
-        "<code>/menu</code>  重新打开菜单"
+        "点预设按钮一键设置，或点 <b>🔧 自定义</b> 弹出输入框输入任意金额。\n"
+        "也可手动发：<code>/set_match 数额</code> / <code>/set_book 数额</code>"
     )
 
 
@@ -640,8 +637,25 @@ def _menu_keyboard() -> Dict[str, Any]:
         "inline_keyboard": [
             row("match", "成交"),
             row("book", "盘口"),
+            [
+                {"text": "🔧 自定义成交", "callback_data": "custom:match"},
+                {"text": "🔧 自定义盘口", "callback_data": "custom:book"},
+            ],
             [{"text": "🔄 刷新", "callback_data": "refresh"}],
         ]
+    }
+
+
+# 自定义输入提示里的标记文字。_handle_message 通过 reply_to_message 反查到
+# 这串里包含 "成交"/"盘口" 来判断要设的是哪个阈值，因此别随意改字面。
+CUSTOM_PROMPT_MARKER = "请输入自定义"
+
+
+def _custom_prompt_markup() -> Dict[str, Any]:
+    return {
+        "force_reply": True,
+        "input_field_placeholder": "如 2500",
+        "selective": True,
     }
 
 
@@ -815,10 +829,6 @@ class TelegramBot:
         chat_type = chat.get("type")
         text = (msg.get("text") or "").strip()
 
-        # 持久键盘按钮发回来的是纯文本（如「菜单」），转成对应命令处理。
-        if text in KEYBOARD_ALIASES:
-            text = KEYBOARD_ALIASES[text]
-
         if not self._allowed(chat_id):
             if text.startswith("/"):
                 LOG.warning(
@@ -827,6 +837,26 @@ class TelegramBot:
                     chat_id, chat_type, self._allowed_chat_id, text[:80],
                 )
             return
+
+        # 自定义阈值的 force_reply 回填：用户的消息是对 bot 之前的"请输入自定义"提示
+        # 的回复时，按提示里写的"成交"/"盘口"决定改哪个阈值。
+        reply_to = msg.get("reply_to_message")
+        if (
+            isinstance(reply_to, dict)
+            and (reply_to.get("from") or {}).get("is_bot")
+            and CUSTOM_PROMPT_MARKER in (reply_to.get("text") or "")
+            and not text.startswith("/")
+            and text not in KEYBOARD_ALIASES
+        ):
+            parent_text = reply_to.get("text") or ""
+            kind = "match" if "成交" in parent_text else ("book" if "盘口" in parent_text else None)
+            if kind:
+                await self._set_threshold(kind, text)
+                return
+
+        # 持久键盘按钮发回来的是纯文本（如「菜单」），转成对应命令处理。
+        if text in KEYBOARD_ALIASES:
+            text = KEYBOARD_ALIASES[text]
 
         if not text.startswith("/"):
             return
@@ -886,6 +916,19 @@ class TelegramBot:
                 await self.tg.edit_message(
                     message_id, _menu_text(self.state), reply_markup=_menu_keyboard()
                 )
+            return
+
+        if data in {"custom:match", "custom:book"}:
+            kind = data.split(":", 1)[1]
+            label = "成交" if kind == "match" else "盘口"
+            await self.tg.answer_callback_query(cb_id, f"输入{label}阈值")
+            await self.tg.send(
+                # 文案里必须含 CUSTOM_PROMPT_MARKER 和「成交」或「盘口」
+                # 字样，_handle_message 靠它反查。
+                f"💰 {CUSTOM_PROMPT_MARKER}<b>{label}</b>阈值（USDT 数字，如 2500）。\n"
+                "回复这条消息即可，发送 /menu 取消。",
+                reply_markup=_custom_prompt_markup(),
+            )
             return
 
         kind, _, raw_amount = data.partition(":")

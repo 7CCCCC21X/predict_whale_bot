@@ -63,8 +63,10 @@ class Config:
 
     poll_interval_sec: float
     matches_page_size: int
+    matches_max_pages: int
     alert_on_startup: bool
     max_seen_ids: int
+    seen_state_path: str
 
     market_refresh_sec: int
     orderbook_sub_batch: int
@@ -74,6 +76,11 @@ class Config:
 
     market_url_template: str
     tx_url_template: str
+    user_url_template: str
+
+    watch_new_markets: bool
+    new_markets_check_sec: int
+    seen_markets_path: str
 
     @property
     def threshold_usdt_wei(self) -> int:
@@ -108,10 +115,15 @@ class Config:
             threshold_usdt=env_decimal("THRESHOLD_USDT", "1000"),
             usdt_wei_decimals=int(os.getenv("USDT_WEI_DECIMALS", "18")),
 
-            poll_interval_sec=float(os.getenv("POLL_INTERVAL_SEC", "8")),
-            matches_page_size=int(os.getenv("MATCHES_PAGE_SIZE", "30")),
-            alert_on_startup=env_bool("ALERT_ON_STARTUP", False),
+            poll_interval_sec=float(os.getenv("POLL_INTERVAL_SEC", "3")),
+            matches_page_size=int(os.getenv("MATCHES_PAGE_SIZE", "100")),
+            matches_max_pages=int(os.getenv("MATCHES_MAX_PAGES", "5")),
+            # 默认开：seen 持久化后，重启不会重复推送，所以 startup 告警是安全的。
+            # 真正的"首次空 seen"会有特殊路径，不会刷屏。
+            alert_on_startup=env_bool("ALERT_ON_STARTUP", True),
             max_seen_ids=int(os.getenv("MAX_SEEN_IDS", "10000")),
+            # Railway 容器重启会丢 /tmp，要真正持久化请挂 volume 到这个路径。
+            seen_state_path=os.getenv("SEEN_STATE_PATH", "/tmp/predict_seen.json").strip(),
 
             market_refresh_sec=int(os.getenv("MARKET_REFRESH_SEC", "300")),
             orderbook_sub_batch=int(os.getenv("ORDERBOOK_SUB_BATCH", "80")),
@@ -122,10 +134,25 @@ class Config:
 
             request_timeout_sec=float(os.getenv("REQUEST_TIMEOUT_SEC", "12")),
 
-            # 可选：用 {id} / {slug} 拼成市场详情链接，例如 https://predict.fun/markets/{slug}
-            market_url_template=os.getenv("MARKET_URL_TEMPLATE", "").strip(),
-            # 可选：链上浏览器，例如 https://basescan.org/tx/{hash}
-            tx_url_template=os.getenv("TX_URL_TEMPLATE", "").strip(),
+            # 默认按 predict.fun 前端 + BNB Chain 浏览器拼接，覆盖默认即可换链或换路径。
+            market_url_template=os.getenv(
+                "MARKET_URL_TEMPLATE", "https://predict.fun/event/{slug}"
+            ).strip(),
+            tx_url_template=os.getenv(
+                "TX_URL_TEMPLATE", "https://bscscan.com/tx/{hash}"
+            ).strip(),
+            # 用户链接：默认指向 BscScan 钱包页（一定能打开）。
+            # 如果将来 predict.fun 有公开的用户主页，可以覆盖成 https://predict.fun/profile/{address}
+            # 模板可用占位符：{address} / {username}
+            user_url_template=os.getenv(
+                "USER_URL_TEMPLATE", "https://bscscan.com/address/{address}"
+            ).strip(),
+
+            watch_new_markets=env_bool("WATCH_NEW_MARKETS", True),
+            new_markets_check_sec=int(os.getenv("NEW_MARKETS_CHECK_SEC", "120")),
+            seen_markets_path=os.getenv(
+                "SEEN_MARKETS_PATH", "/tmp/predict_seen_markets.json"
+            ).strip(),
         )
 
 
@@ -196,6 +223,103 @@ def short_addr(addr: Any) -> str:
     if len(s) <= 14:
         return s or "-"
     return f"{s[:6]}…{s[-6:]}"
+
+
+def load_seen(path: str, max_size: int) -> "OrderedDict[str, None]":
+    """从磁盘加载 seen ID 列表，重启后用来过滤已推送过的事件。"""
+    seen: "OrderedDict[str, None]" = OrderedDict()
+    if not path or not os.path.exists(path):
+        return seen
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            ids = json.load(f)
+        if not isinstance(ids, list):
+            LOG.warning("seen 状态文件格式异常 (%s)，忽略", path)
+            return seen
+        for eid in ids[-max_size:]:
+            seen[str(eid)] = None
+        LOG.info("已从 %s 加载 %d 条 seen", path, len(seen))
+    except Exception as exc:
+        LOG.warning("加载 seen 状态失败 (%s): %s", path, exc)
+    return seen
+
+
+def save_seen(path: str, seen: "OrderedDict[str, None]") -> None:
+    """原子写 seen 列表。失败只 log，不影响监控。"""
+    if not path:
+        return
+    tmp = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(seen.keys()), f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as exc:
+        LOG.warning("保存 seen 状态失败 (%s): %s", path, exc)
+
+
+def load_seen_markets(path: str) -> Set[int]:
+    """已发过"新市场上线"告警的 market_id 集合。"""
+    if not path or not os.path.exists(path):
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            ids = json.load(f)
+        if not isinstance(ids, list):
+            return set()
+        out: Set[int] = set()
+        for x in ids:
+            try:
+                out.add(int(x))
+            except Exception:
+                pass
+        LOG.info("已从 %s 加载 %d 条已知市场 ID", path, len(out))
+        return out
+    except Exception as exc:
+        LOG.warning("加载已知市场列表失败 (%s): %s", path, exc)
+        return set()
+
+
+def save_seen_markets(path: str, ids: Set[int]) -> None:
+    if not path:
+        return
+    tmp = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sorted(ids), f)
+        os.replace(tmp, path)
+    except Exception as exc:
+        LOG.warning("保存已知市场列表失败 (%s): %s", path, exc)
+
+
+def extract_username(event: Dict[str, Any]) -> str:
+    """从 taker / event / user 嵌套字段里取 username，找不到返回空串。"""
+    taker = event.get("taker") if isinstance(event.get("taker"), dict) else {}
+    user = taker.get("user") if isinstance(taker.get("user"), dict) else {}
+    profile = taker.get("profile") if isinstance(taker.get("profile"), dict) else {}
+    candidates = (
+        taker.get("username"),
+        taker.get("name"),
+        taker.get("displayName"),
+        user.get("username"),
+        user.get("name"),
+        user.get("displayName"),
+        profile.get("username"),
+        profile.get("name"),
+        event.get("takerUsername"),
+    )
+    for c in candidates:
+        if c:
+            s = str(c).strip()
+            if s:
+                return s
+    return ""
+
+
+def extract_signer(event: Dict[str, Any]) -> str:
+    taker = event.get("taker") if isinstance(event.get("taker"), dict) else {}
+    return str(taker.get("signer") or event.get("signer") or "").strip()
 
 
 def extract_tx_hash(event: Dict[str, Any]) -> str:
@@ -385,22 +509,59 @@ class Predict:
 
         return data
 
-    async def fetch_matches(self, threshold_wei: int) -> List[Dict[str, Any]]:
-        data = await self.get(
-            "/v1/orders/matches",
-            params={
-                "first": self.cfg.matches_page_size,
-                "minValueUsdtWei": str(threshold_wei),
-            },
-        )
-        return list(data.get("data") or data.get("matches") or [])
+    async def fetch_new_matches(
+        self,
+        seen_ids: Set[str],
+        page_size: int,
+        max_pages: int,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """
+        从最新往旧翻页拉取成交，遇到已 seen 的事件即停止。
 
-    async def fetch_open_markets(self) -> Dict[int, str]:
+        不传 minValueUsdtWei：实测 Predict 这个参数是按"成交份额数"过滤的，
+        会把"低份额 × 高单价"的真大单（如 100 shares × $50 = $5000）一并丢掉。
+        因此服务端不过滤，全部交给客户端按 notional value 过滤。
+
+        返回 (按时间倒序排列的新事件, 是否翻满 max_pages 仍未追上)。
         """
-        分页拉取可见 OPEN 市场。
-        返回 market_id -> title/question。
+        out: List[Dict[str, Any]] = []
+        after: Optional[str] = None
+
+        for _ in range(max(1, max_pages)):
+            params: Dict[str, Any] = {"first": page_size}
+            if after:
+                params["after"] = after
+
+            data = await self.get("/v1/orders/matches", params=params)
+            rows = list(data.get("data") or data.get("matches") or [])
+            if not rows:
+                return out, False
+
+            for ev in rows:
+                if stable_event_id(ev) in seen_ids:
+                    return out, False
+                out.append(ev)
+
+            # 不到一页说明已经到尽头
+            if len(rows) < page_size:
+                return out, False
+
+            page_info = data.get("pageInfo") or {}
+            after = (
+                data.get("cursor")
+                or data.get("nextCursor")
+                or page_info.get("endCursor")
+            )
+            if not after:
+                return out, False
+
+        return out, True
+
+    async def fetch_open_markets(self) -> Dict[int, Dict[str, Any]]:
         """
-        markets: Dict[int, str] = {}
+        分页拉取可见 OPEN 市场。返回 market_id -> 原始市场对象（含 slug/category 等）。
+        """
+        markets: Dict[int, Dict[str, Any]] = {}
         after: Optional[str] = None
         pages = 0
 
@@ -424,9 +585,7 @@ class Predict:
                 trading_status = str(m.get("tradingStatus") or m.get("status") or "").upper()
 
                 if visible and (not trading_status or trading_status == "OPEN"):
-                    markets[mid] = str(
-                        m.get("title") or m.get("question") or m.get("name") or f"Market {mid}"
-                    )
+                    markets[mid] = m
 
             page_info = data.get("pageInfo") or {}
             after = (
@@ -440,6 +599,13 @@ class Predict:
                 break
 
         return markets
+
+
+def market_title_of(m: Dict[str, Any]) -> str:
+    mid = m.get("id") or m.get("marketId") or "?"
+    return str(
+        m.get("title") or m.get("question") or m.get("name") or f"Market {mid}"
+    )
 
 
 PRESET_AMOUNTS = (Decimal("500"), Decimal("1000"), Decimal("5000"), Decimal("10000"))
@@ -479,6 +645,26 @@ def _menu_keyboard() -> Dict[str, Any]:
     }
 
 
+def _persistent_keyboard() -> Dict[str, Any]:
+    """聊天框底部常驻按钮。点一下发送「菜单」，bot 当 /menu 处理。"""
+    return {
+        "keyboard": [[{"text": "菜单"}, {"text": "状态"}]],
+        "is_persistent": True,
+        "resize_keyboard": True,
+    }
+
+
+# 持久键盘按钮文本到内部命令的映射
+KEYBOARD_ALIASES = {
+    "菜单": "/menu",
+    "menu": "/menu",
+    "Menu": "/menu",
+    "状态": "/status",
+    "status": "/status",
+    "Status": "/status",
+}
+
+
 def _parse_amount(text: str) -> Optional[Decimal]:
     raw = text.strip().lstrip("$").replace(",", "").replace("_", "")
     if not raw:
@@ -511,6 +697,10 @@ class TelegramBot:
         self._allowed_chat_id = str(cfg.tg_chat_id)
 
     async def run(self, stop: asyncio.Event) -> None:
+        LOG.info("Telegram 命令机器人启动，allowed chat_id=%s", self._allowed_chat_id)
+
+        await self._prepare()
+
         offset = 0
         long_poll_timeout = 25
         # 长轮询要求 HTTP 超时大于 polling timeout
@@ -527,10 +717,40 @@ class TelegramBot:
                     },
                     timeout=http_timeout,
                 )
-                resp.raise_for_status()
-                payload = resp.json()
             except Exception as exc:
-                LOG.warning("Telegram getUpdates 失败: %s", exc)
+                LOG.warning("Telegram getUpdates 网络异常: %s", exc)
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=3)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            try:
+                payload = resp.json()
+            except Exception:
+                LOG.warning(
+                    "Telegram getUpdates 返回非 JSON status=%s body=%s",
+                    resp.status_code,
+                    resp.text[:300],
+                )
+                await asyncio.sleep(3)
+                continue
+
+            if not payload.get("ok"):
+                code = payload.get("error_code")
+                desc = payload.get("description", "")
+                if code == 409:
+                    LOG.warning(
+                        "Telegram getUpdates 冲突 409：另一个实例占着轮询，或 webhook 还在生效。"
+                        "正在重新尝试 deleteWebhook。详情：%s",
+                        desc,
+                    )
+                    await self._delete_webhook()
+                elif code == 401:
+                    LOG.error("Telegram token 无效（401），命令机器人退出。检查 TG_BOT_TOKEN。")
+                    return
+                else:
+                    LOG.warning("Telegram getUpdates 错误 %s: %s", code, desc)
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=3)
                 except asyncio.TimeoutError:
@@ -544,6 +764,42 @@ class TelegramBot:
                 except Exception:
                     LOG.exception("处理 Telegram update 出错")
 
+    async def _prepare(self) -> None:
+        # webhook 和 getUpdates 互斥。bot 之前设过 webhook 会让 getUpdates 一直 409。
+        await self._delete_webhook()
+
+        # 在 Telegram 里登记命令，输入 / 时会有补全提示，新用户更容易发现菜单。
+        try:
+            resp = await self.client.post(
+                f"{self.base}/setMyCommands",
+                json={
+                    "commands": [
+                        {"command": "menu", "description": "打开监控菜单"},
+                        {"command": "status", "description": "查看当前阈值"},
+                        {"command": "set_match", "description": "设置成交阈值 (USDT)"},
+                        {"command": "set_book", "description": "设置盘口阈值 (USDT)"},
+                        {"command": "help", "description": "查看帮助"},
+                    ]
+                },
+                timeout=httpx.Timeout(10),
+            )
+            if resp.status_code == 200 and resp.json().get("ok"):
+                LOG.info("Telegram 命令列表已注册（/menu /status /set_match /set_book /help）")
+        except Exception as exc:
+            LOG.warning("setMyCommands 失败（不影响功能）: %s", exc)
+
+    async def _delete_webhook(self) -> None:
+        try:
+            resp = await self.client.post(
+                f"{self.base}/deleteWebhook",
+                json={"drop_pending_updates": False},
+                timeout=httpx.Timeout(10),
+            )
+            if resp.status_code == 200 and resp.json().get("ok"):
+                LOG.info("Telegram webhook 已清空（如有）")
+        except Exception as exc:
+            LOG.warning("deleteWebhook 失败（可忽略）: %s", exc)
+
     def _allowed(self, chat_id: Any) -> bool:
         return str(chat_id) == self._allowed_chat_id
 
@@ -554,23 +810,46 @@ class TelegramBot:
             await self._handle_callback(update["callback_query"])
 
     async def _handle_message(self, msg: Dict[str, Any]) -> None:
-        chat_id = (msg.get("chat") or {}).get("id")
+        chat = msg.get("chat") or {}
+        chat_id = chat.get("id")
+        chat_type = chat.get("type")
+        text = (msg.get("text") or "").strip()
+
+        # 持久键盘按钮发回来的是纯文本（如「菜单」），转成对应命令处理。
+        if text in KEYBOARD_ALIASES:
+            text = KEYBOARD_ALIASES[text]
+
         if not self._allowed(chat_id):
+            if text.startswith("/"):
+                LOG.warning(
+                    "收到未授权 chat 的命令 chat_id=%s type=%s 期望 %s text=%r — 忽略。"
+                    "如需用此 chat 控制 bot，请把 TG_CHAT_ID 改成它，或在期望的 chat 里发送命令。",
+                    chat_id, chat_type, self._allowed_chat_id, text[:80],
+                )
             return
 
-        text = (msg.get("text") or "").strip()
         if not text.startswith("/"):
             return
+
+        LOG.info("收到命令 chat=%s type=%s text=%r", chat_id, chat_type, text[:80])
 
         head, _, tail = text.partition(" ")
         # 兼容 "/set_match@MyBot 1000"
         cmd = head.split("@", 1)[0].lower()
         arg = tail.strip()
 
-        if cmd in {"/menu", "/start"}:
+        if cmd == "/start":
+            # /start 用持久键盘开场，让底部「菜单」按钮立刻就位。
+            await self.tg.send(
+                "👋 <b>欢迎</b>\n点底部「菜单」按钮或发 /menu 进入菜单。\n"
+                + _menu_text(self.state),
+                reply_markup=_persistent_keyboard(),
+            )
+        elif cmd == "/menu":
+            # /menu 用 inline 预设按钮，底部持久键盘不会被覆盖。
             await self.tg.send(_menu_text(self.state), reply_markup=_menu_keyboard())
         elif cmd == "/status":
-            await self.tg.send(_menu_text(self.state))
+            await self.tg.send(_menu_text(self.state), reply_markup=_persistent_keyboard())
         elif cmd == "/set_match":
             await self._set_threshold("match", arg)
         elif cmd == "/set_book":
@@ -578,10 +857,12 @@ class TelegramBot:
         elif cmd == "/help":
             await self.tg.send(
                 "命令列表：\n"
-                "<code>/menu</code> 打开菜单\n"
-                "<code>/status</code> 查看阈值\n"
+                "<code>/menu</code> 打开菜单（含快捷按钮）\n"
+                "<code>/status</code> 查看当前阈值\n"
                 "<code>/set_match 1000</code> 设置成交阈值（USDT）\n"
-                "<code>/set_book 1000</code> 设置盘口阈值（USDT）"
+                "<code>/set_book 1000</code> 设置盘口阈值（USDT）\n"
+                "底部「菜单」按钮 = /menu，「状态」按钮 = /status",
+                reply_markup=_persistent_keyboard(),
             )
 
     async def _handle_callback(self, cb: Dict[str, Any]) -> None:
@@ -589,6 +870,10 @@ class TelegramBot:
         chat_id = ((cb.get("message") or {}).get("chat") or {}).get("id")
 
         if not self._allowed(chat_id):
+            LOG.warning(
+                "未授权回调 chat_id=%s 期望 %s data=%r",
+                chat_id, self._allowed_chat_id, cb.get("data"),
+            )
             await self.tg.answer_callback_query(cb_id, "无权限")
             return
 
@@ -668,11 +953,18 @@ def event_value_usdt(event: Dict[str, Any], cfg: Config) -> Decimal:
 
 
 def _render_template(template: str, **kwargs: Any) -> str:
-    """安全的字符串模板渲染：缺字段或异常时返回空串。"""
+    """
+    安全的字符串模板渲染：
+    - 模板里出现的占位符必须有非空值，否则返回空串（避免拼出 .../event/ 这种半截链接）
+    - 异常一律返回空串
+    """
     if not template:
         return ""
+    for key, value in kwargs.items():
+        if ("{" + key + "}") in template and not str(value):
+            return ""
     try:
-        return template.format(**kwargs)
+        return template.format(**{k: str(v) for k, v in kwargs.items()})
     except Exception:
         return ""
 
@@ -692,7 +984,14 @@ def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
     )
     mid = market.get("id") or event.get("marketId")
     mid_str = str(mid) if mid is not None else ""
-    slug = market.get("slug") or market.get("urlSlug") or ""
+    # categorySlug 在 Predict 的实际响应里通常就是市场专属 slug（例如
+    # "bitcoin-up-or-down-april-26-2026-8pm-et"），故作为兜底。
+    slug = (
+        market.get("slug")
+        or market.get("urlSlug")
+        or market.get("categorySlug")
+        or ""
+    )
 
     # 标题缺失时不再显示 "-"，回退到 Market #<id>，确保"成交的市场"始终可见。
     if not raw_title:
@@ -705,7 +1004,8 @@ def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
     notional = event_value_usdt(event, cfg)
 
     fee_amount = to_decimal(fee.get("amount"), cfg.usdt_wei_decimals)
-    signer = taker.get("signer") or event.get("signer") or "-"
+    signer = extract_signer(event) or "-"
+    username = extract_username(event)
     makers = event.get("makers") or []
     tx = extract_tx_hash(event)
     executed_at = event.get("executedAt") or event.get("createdAt") or "-"
@@ -716,6 +1016,16 @@ def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
         title_html = f'<a href="{html.escape(market_link, quote=True)}">{title_safe}</a>'
     else:
         title_html = title_safe
+
+    # Taker 显示：优先用户名，否则截短地址。一律链接到模板（默认 BscScan 地址页）。
+    taker_label = normalize_text(username) if username else html.escape(short_addr(signer))
+    user_link = _render_template(
+        cfg.user_url_template, address=signer if signer != "-" else "", username=username
+    )
+    if user_link:
+        taker_html = f'<a href="{html.escape(user_link, quote=True)}">{taker_label}</a>'
+    else:
+        taker_html = taker_label
 
     lines = [
         "🚨 <b>Predict 成交大单</b>",
@@ -731,7 +1041,7 @@ def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
     lines.extend(
         [
             f"Market ID：<code>{html.escape(mid_str or '-')}</code> ｜ 分类：<code>{html.escape(str(category))}</code>",
-            f"Taker：<code>{html.escape(short_addr(signer))}</code> ｜ Makers：<code>{len(makers)}</code>",
+            f"Taker：{taker_html} <code>{html.escape(short_addr(signer))}</code> ｜ Makers：<code>{len(makers)}</code>",
             f"方向字段：<code>{html.escape(str(taker.get('quoteType', event.get('quoteType', '-'))))}</code> ｜ Outcome：<b>{normalize_text(outcome.get('name') if isinstance(outcome, dict) else outcome)}</b>",
             f"份额数量：<code>{fmt_decimal(amount, 4)}</code> ｜ 价格：<code>{fmt_decimal(price, 6)}</code>",
             f"手续费：<code>{fmt_decimal(fee_amount, 6)}</code> <code>{html.escape(str(fee.get('type') or ''))}</code>",
@@ -753,6 +1063,77 @@ def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
     return "\n".join(lines)
 
 
+def format_new_market_alert(market: Dict[str, Any], cfg: Config) -> str:
+    mid = market.get("id") or market.get("marketId")
+    mid_str = str(mid) if mid is not None else ""
+    slug = market.get("slug") or market.get("urlSlug") or market.get("categorySlug") or ""
+    title = market_title_of(market)
+    category = market.get("categorySlug") or market.get("category") or "-"
+    end_date = (
+        market.get("endDate")
+        or market.get("expiresAt")
+        or market.get("closesAt")
+        or market.get("resolutionTime")
+        or "-"
+    )
+
+    title_safe = normalize_text(title)
+    link = _render_template(cfg.market_url_template, id=mid_str, slug=slug, title=title)
+    title_html = (
+        f'<a href="{html.escape(link, quote=True)}">{title_safe}</a>' if link else title_safe
+    )
+
+    return "\n".join(
+        [
+            "🆕 <b>Predict 新市场上线</b>",
+            f"市场：<b>{title_html}</b>",
+            f"Market ID：<code>{html.escape(mid_str or '-')}</code> ｜ 分类：<code>{html.escape(str(category))}</code>",
+            f"截止：<code>{html.escape(str(end_date))}</code>",
+        ]
+    )
+
+
+async def watch_new_markets(
+    cfg: Config,
+    predict: Predict,
+    tg: Telegram,
+    stop: asyncio.Event,
+) -> None:
+    """每 NEW_MARKETS_CHECK_SEC 秒拉一次 OPEN 市场，对没见过的市场发"上线"告警。"""
+    seen_ids = load_seen_markets(cfg.seen_markets_path)
+    # 没磁盘记录 = 全新部署。第一次只 seed，不要把现有几百个市场全推送。
+    bootstrap = not seen_ids
+
+    while not stop.is_set():
+        try:
+            markets = await predict.fetch_open_markets()
+            current_ids = set(markets.keys())
+
+            new_ids = sorted(current_ids - seen_ids)
+
+            if bootstrap:
+                LOG.info(
+                    "首次启动：seed %d 个已上线市场，不推送上线告警", len(current_ids)
+                )
+                seen_ids = current_ids
+                bootstrap = False
+                save_seen_markets(cfg.seen_markets_path, seen_ids)
+            elif new_ids:
+                LOG.info("发现 %d 个新市场", len(new_ids))
+                for mid in new_ids:
+                    await tg.send(format_new_market_alert(markets[mid], cfg))
+                seen_ids.update(new_ids)
+                save_seen_markets(cfg.seen_markets_path, seen_ids)
+
+        except Exception:
+            LOG.exception("新市场监控失败")
+
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=cfg.new_markets_check_sec)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def monitor_matches(
     cfg: Config,
     state: RuntimeState,
@@ -760,49 +1141,71 @@ async def monitor_matches(
     tg: Telegram,
     stop: asyncio.Event,
 ) -> None:
-    seen: "OrderedDict[str, None]" = OrderedDict()
+    seen: "OrderedDict[str, None]" = load_seen(cfg.seen_state_path, cfg.max_seen_ids)
+    # 从磁盘加载到了 seen，说明这是重启续跑（不是空白首次部署）。续跑场景下
+    # 历史事件已经在 seen 里了，"新事件"自然就是上次保存之后才发生的，可以直接告警。
+    resumed_from_disk = bool(seen)
     startup = True
 
     await tg.send(
         f"✅ <b>Predict 成交大单监控已启动</b>\n"
         f"阈值：<b>${fmt_decimal(state.threshold_usdt, 2)} USDT</b>\n"
         f"模式：<code>matches</code> ｜ 轮询：<code>{cfg.poll_interval_sec}s</code>\n"
-        f"用 /menu 调整阈值",
+        f"点底部「菜单」按钮或发 /menu 调整阈值",
         silent=True,
+        reply_markup=_persistent_keyboard(),
     )
 
     while not stop.is_set():
         try:
-            events = await predict.fetch_matches(state.threshold_usdt_wei)
+            # 首次启动且 seen 为空时，只拉一页 seed，避免 fetch_new_matches 因为
+            # 没有"已知"事件而连翻 max_pages 把全站历史都拉下来。
+            max_pages = 1 if (startup and not resumed_from_disk) else cfg.matches_max_pages
 
-            # 客户端兜底：阈值是"成交价值"（USDT notional），不是份额数量。
-            # 即便 API 漏过了低价值事件，也会被这里过滤掉。
+            events, hit_max = await predict.fetch_new_matches(
+                seen_ids=set(seen.keys()),
+                page_size=cfg.matches_page_size,
+                max_pages=max_pages,
+            )
+
+            if hit_max:
+                LOG.warning(
+                    "fetch_new_matches 翻满 %d 页仍未追上 seen — "
+                    "成交速率高于轮询能力，考虑减小 POLL_INTERVAL_SEC 或增大 MATCHES_MAX_PAGES",
+                    max_pages,
+                )
+
+            # 客户端按 notional value 过滤（API 不靠谱，见 fetch_new_matches 注释）。
             threshold = state.threshold_usdt
             events = [ev for ev in events if event_value_usdt(ev, cfg) >= threshold]
 
             fresh: List[Dict[str, Any]] = []
-
             for ev in events:
                 eid = stable_event_id(ev)
-
                 if eid in seen:
                     continue
-
                 seen[eid] = None
                 fresh.append(ev)
 
             while len(seen) > cfg.max_seen_ids:
                 seen.popitem(last=False)
 
-            if startup and not cfg.alert_on_startup:
-                LOG.info("启动时已记录 %d 条历史成交，不发送历史告警", len(fresh))
-                startup = False
-            else:
-                startup = False
+            should_alert = resumed_from_disk or not startup or cfg.alert_on_startup
 
+            if fresh and not should_alert:
+                LOG.info(
+                    "首次启动且未启用 ALERT_ON_STARTUP，已记录 %d 条历史成交不告警",
+                    len(fresh),
+                )
+            elif fresh:
                 # 接口通常按 executedAt DESC 排序，反转后按时间先后发送。
                 for ev in reversed(fresh):
                     await tg.send(format_match_alert(ev, cfg))
+
+            startup = False
+
+            if fresh:
+                save_seen(cfg.seen_state_path, seen)
 
         except Exception as exc:
             LOG.exception("监控成交大单出错")
@@ -978,8 +1381,8 @@ async def market_refresher(
                     market_titles.pop(mid, None)
 
             # 标题可能更新（重命名），用最新值刷新
-            for mid, title in markets.items():
-                market_titles[mid] = title
+            for mid, m in markets.items():
+                market_titles[mid] = market_title_of(m)
 
             if new_ids or stale_ids:
                 LOG.info(
@@ -1009,8 +1412,9 @@ async def monitor_orderbook(
         f"✅ <b>Predict 盘口监控已启动</b>\n"
         f"阈值：<b>${fmt_decimal(state.orderbook_threshold_usdt, 2)} USDT</b>\n"
         f"模式：<code>orderbook</code>\n"
-        f"用 /menu 调整阈值",
+        f"点底部「菜单」按钮或发 /menu 调整阈值",
         silent=True,
+        reply_markup=_persistent_keyboard(),
     )
 
     backoff = 1
@@ -1203,6 +1607,10 @@ async def main() -> None:
 
         # 菜单/命令处理任务，与监控任务并行。
         tasks.append(asyncio.create_task(bot.run(stop)))
+
+        # 新市场上线告警，独立任务，跟 mode 解耦。
+        if cfg.watch_new_markets:
+            tasks.append(asyncio.create_task(watch_new_markets(cfg, predict, tg, stop)))
 
         await stop.wait()
 

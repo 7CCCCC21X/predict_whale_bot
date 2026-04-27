@@ -96,10 +96,6 @@ class Config:
     default_lang: str
     user_url_template: str
 
-    watch_new_markets: bool
-    new_markets_check_sec: int
-    seen_markets_path: str
-
     # 每小时摘要：默认 3600s（1 小时），运行期可用 /set_summary 改并持久化。
     # 设成 0 = 关掉自动摘要（仍可 /summary 手动查）
     summary_interval_sec: int
@@ -178,12 +174,6 @@ class Config:
             user_url_template=os.getenv(
                 "USER_URL_TEMPLATE",
                 "https://predict.fun/zh-cn/portfolio/{address}?ref=B00EA",
-            ).strip(),
-
-            watch_new_markets=env_bool("WATCH_NEW_MARKETS", True),
-            new_markets_check_sec=int(os.getenv("NEW_MARKETS_CHECK_SEC", "30")),
-            seen_markets_path=os.getenv(
-                "SEEN_MARKETS_PATH", "/data/predict_seen_markets.json"
             ).strip(),
 
             summary_interval_sec=int(os.getenv("SUMMARY_INTERVAL_SEC", "3600")),
@@ -695,41 +685,6 @@ def save_seen(path: str, seen: "OrderedDict[str, None]") -> None:
         LOG.warning("保存 seen 状态失败 (%s): %s", path, exc)
 
 
-def load_seen_markets(path: str) -> Set[int]:
-    """已发过"新市场上线"告警的 market_id 集合。"""
-    if not path or not os.path.exists(path):
-        return set()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            ids = json.load(f)
-        if not isinstance(ids, list):
-            return set()
-        out: Set[int] = set()
-        for x in ids:
-            try:
-                out.add(int(x))
-            except Exception:
-                pass
-        LOG.info("已从 %s 加载 %d 条已知市场 ID", path, len(out))
-        return out
-    except Exception as exc:
-        LOG.warning("加载已知市场列表失败 (%s): %s", path, exc)
-        return set()
-
-
-def save_seen_markets(path: str, ids: Set[int]) -> None:
-    if not path:
-        return
-    tmp = f"{path}.tmp"
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(sorted(ids), f)
-        os.replace(tmp, path)
-    except Exception as exc:
-        LOG.warning("保存已知市场列表失败 (%s): %s", path, exc)
-
-
 def extract_username(event: Dict[str, Any]) -> str:
     """从 taker / event / user 嵌套字段里取 username，找不到返回空串。
 
@@ -890,7 +845,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "view_tx": "🔗 交易哈希",
         "anon_wallet": "匿名钱包",
         "match_started": "✅ <b>Predict 成交大单监控已启动</b>",
-        "newm_started": "🆕 <b>Predict 新市场监控已启动</b>",
         "threshold": "阈值",
         "interval": "检查间隔",
         "open_menu_hint": "点底部「菜单」或发 /menu 调阈值",
@@ -980,7 +934,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "view_tx": "🔗 Tx Hash",
         "anon_wallet": "Anon wallet",
         "match_started": "✅ <b>Predict match monitor started</b>",
-        "newm_started": "🆕 <b>Predict new-market watcher started</b>",
         "threshold": "Threshold",
         "interval": "Check interval",
         "open_menu_hint": "Tap “Menu” or send /menu to change thresholds",
@@ -1410,81 +1363,6 @@ class Predict:
                 return out, False
 
         return out, True
-
-    async def fetch_open_markets(self) -> Dict[int, Dict[str, Any]]:
-        """
-        分页拉取尚未结束的市场。返回 market_id -> 原始市场对象。
-
-        过滤策略：只显式排除"已知关闭/已结算"的状态，未知状态默认收下。
-        Predict 的状态字段实际是什么值（OPEN/ACTIVE/LIVE/TRADING/...）不一定，
-        只信白名单会把没见过的状态全部丢掉，导致新市场永远不被发现。
-        """
-        markets: Dict[int, Dict[str, Any]] = {}
-        after: Optional[str] = None
-        pages = 0
-        status_counts: Dict[str, int] = {}
-        skipped_invisible = 0
-        skipped_closed = 0
-
-        while True:
-            pages += 1
-            params: Dict[str, Any] = {"first": 100}
-
-            if after:
-                params["after"] = after
-
-            data = await self.get("/v1/markets", params=params)
-            rows = data.get("data") or data.get("markets") or []
-
-            for m in rows:
-                try:
-                    mid = int(m.get("id") or m.get("marketId"))
-                except Exception:
-                    continue
-
-                visible = m.get("isVisible", True)
-                trading_status = str(m.get("tradingStatus") or m.get("status") or "").upper()
-                status_counts[trading_status or "(none)"] = status_counts.get(trading_status or "(none)", 0) + 1
-
-                if not visible:
-                    skipped_invisible += 1
-                    continue
-
-                if trading_status in CLOSED_LIKE_STATUSES:
-                    skipped_closed += 1
-                    continue
-
-                markets[mid] = m
-
-            page_info = data.get("pageInfo") or {}
-            after = (
-                data.get("cursor")
-                or data.get("nextCursor")
-                or page_info.get("endCursor")
-            )
-            has_next = bool(data.get("hasNextPage") or page_info.get("hasNextPage") or after)
-
-            if not has_next or not after or pages >= 100:
-                break
-
-        LOG.info(
-            "fetch_open_markets: 收 %d 个开放市场 (扫 %d 页，按 tradingStatus 分布 %s，跳过不可见 %d，跳过已结束 %d)",
-            len(markets), pages, status_counts, skipped_invisible, skipped_closed,
-        )
-        return markets
-
-
-# 显式排除的"已结束"状态。其它任何状态（OPEN/ACTIVE/LIVE/TRADING/PENDING/...）都收。
-CLOSED_LIKE_STATUSES = {
-    "CLOSED", "CLOSE",
-    "RESOLVED", "RESOLVING",
-    "CANCELLED", "CANCELED",
-    "EXPIRED",
-    "SETTLED", "SETTLING",
-    "ENDED",
-    "ARCHIVED",
-}
-
 
 def market_title_of(m: Dict[str, Any]) -> str:
     mid = m.get("id") or m.get("marketId") or "?"
@@ -2754,181 +2632,6 @@ def format_match_alert(
     return text, markup
 
 
-def format_new_market_alert(
-    market: Dict[str, Any], cfg: Config, state: "RuntimeState"
-) -> Tuple[str, Optional[Dict[str, Any]]]:
-    mid = market.get("id") or market.get("marketId")
-    mid_str = str(mid) if mid is not None else ""
-    slug = market.get("slug") or market.get("urlSlug") or market.get("categorySlug") or ""
-    title = market_title_of(market)
-    category = market.get("categorySlug") or market.get("category") or "-"
-    end_date = (
-        market.get("endDate")
-        or market.get("expiresAt")
-        or market.get("closesAt")
-        or market.get("resolutionTime")
-        or "-"
-    )
-
-    title_safe = normalize_text(title)
-    link = _render_template(cfg.market_url_template, id=mid_str, slug=slug, title=title)
-    title_html = (
-        f'<a href="{html.escape(link, quote=True)}">{title_safe}</a>' if link else title_safe
-    )
-
-    if state.lang == "en":
-        header = "🆕 <b>New Predict market</b>"
-        market_label = "Market"
-        id_label = "ID"
-        cat_label = "Category"
-        end_label = "Closes"
-    else:
-        header = "🆕 <b>Predict 新市场上线</b>"
-        market_label = "市场"
-        id_label = "Market ID"
-        cat_label = "分类"
-        end_label = "截止"
-
-    text = "\n".join([
-        header,
-        f"{market_label}：<b>{title_html}</b>",
-        f"{id_label}：<code>{html.escape(mid_str or '-')}</code> ｜ {cat_label}：<code>{html.escape(str(category))}</code>",
-        f"{end_label}：<code>{html.escape(str(end_date))}</code>",
-    ])
-
-    markup: Optional[Dict[str, Any]] = None
-    if link:
-        markup = {"inline_keyboard": [[
-            {"text": t(state, "view_market"), "url": link},
-        ]]}
-
-    return text, markup
-
-
-async def watch_new_markets(
-    cfg: Config,
-    state: RuntimeState,
-    predict: Predict,
-    tg: Telegram,
-    stop: asyncio.Event,
-) -> None:
-    """每 NEW_MARKETS_CHECK_SEC 秒拉一次开放市场，对没见过的市场发"上线"告警。"""
-    seen_ids = load_seen_markets(cfg.seen_markets_path)
-    bootstrap = not seen_ids
-    iteration = 0
-    BURST_THRESHOLD = 20  # 单轮发现 >N 新市场 → 大概率是 seen 状态丢了；只发摘要
-
-    # 启动诊断：show seen 范围 + 最大 ID（便于人眼对照 predict.fun 上的最新市场）
-    if seen_ids:
-        sids = sorted(seen_ids)
-        LOG.info(
-            "[watch_new_markets] 启动: 已加载 %d 个 seen 市场 ID，范围 [%d..%d]，"
-            "尾部 5 个 = %s",
-            len(seen_ids), sids[0], sids[-1], sids[-5:],
-        )
-    else:
-        LOG.info("[watch_new_markets] 启动: 无 seen 文件，第一轮将 seed 不告警")
-
-    if state.lang == "en":
-        seeded_msg = (
-            f"Tracking <b>{len(seen_ids)}</b> known markets, max ID <code>{max(seen_ids)}</code>"
-            if seen_ids
-            else "First launch — seeding now, no alerts on this pass"
-        )
-    else:
-        seeded_msg = (
-            f"已记忆 <b>{len(seen_ids)}</b> 个市场，最大 ID <code>{max(seen_ids)}</code>"
-            if seen_ids
-            else "首次启动，第一轮 seed 不告警"
-        )
-
-    await tg.send(
-        f"{t(state, 'newm_started')}\n"
-        f"{t(state, 'interval')}: <code>{cfg.new_markets_check_sec}s</code>\n"
-        + seeded_msg,
-        silent=True,
-    )
-
-    while not stop.is_set():
-        iteration += 1
-        try:
-            markets = await predict.fetch_open_markets()
-            current_ids = set(markets.keys())
-
-            # 关键防御：API 临时返回 0 时不要把 seen 清空、也不要"伪 seed"，
-            # 否则下一轮恢复会把所有市场当成新市场刷屏。
-            if not current_ids:
-                LOG.warning(
-                    "[watch_new_markets] iter=%d: API 返回 0 个开放市场，本轮跳过", iteration
-                )
-            elif bootstrap:
-                LOG.info(
-                    "[watch_new_markets] iter=%d: 首次 seed %d 个已开放市场（不推送）"
-                    " 最大 ID=%d 最小 ID=%d",
-                    iteration, len(current_ids), max(current_ids), min(current_ids),
-                )
-                seen_ids = current_ids
-                bootstrap = False
-                save_seen_markets(cfg.seen_markets_path, seen_ids)
-            else:
-                new_ids = sorted(current_ids - seen_ids)
-                if new_ids:
-                    titles = [market_title_of(markets[mid]) for mid in new_ids[:5]]
-                    LOG.info(
-                        "[watch_new_markets] iter=%d: 🆕 发现 %d 个新市场, IDs=%s 标题样本=%s",
-                        iteration, len(new_ids), new_ids[:10], titles,
-                    )
-
-                    if state.paused:
-                        # 暂停时仍把新市场加进 seen — 解除暂停后不会回放，只看新增
-                        LOG.info(
-                            "[watch_new_markets] iter=%d: 主频道已暂停，%d 个新市场静默 seed",
-                            iteration, len(new_ids),
-                        )
-                    elif len(new_ids) > BURST_THRESHOLD:
-                        # 大概率 seen 文件丢了 / 被 reset；不要刷屏，只发个摘要
-                        LOG.warning(
-                            "[watch_new_markets] iter=%d: 异常 burst（%d 个新市场），"
-                            "可能 seen 状态丢失。只发摘要 + 头 5 个，其余静默 seed。",
-                            iteration, len(new_ids),
-                        )
-                        burst_msg = (
-                            f"⚠️ 一次发现 <b>{len(new_ids)}</b> 个"
-                            f"新市场（异常多，可能持久化丢失）。\n"
-                            f"只推前 5 个，其余 <b>{len(new_ids) - 5}</b> 个静默 seed。"
-                            if state.lang == "zh"
-                            else f"⚠️ Detected <b>{len(new_ids)}</b> new markets in one "
-                            f"pass (unusually many — likely a persistence loss).\n"
-                            f"Showing top 5; the other <b>{len(new_ids) - 5}</b> seed silently."
-                        )
-                        await tg.send(burst_msg, silent=True)
-                        for mid in new_ids[:5]:
-                            text, markup = format_new_market_alert(markets[mid], cfg, state)
-                            await tg.send(text, reply_markup=markup)
-                    else:
-                        for mid in new_ids:
-                            text, markup = format_new_market_alert(markets[mid], cfg, state)
-                            await tg.send(text, reply_markup=markup)
-
-                    seen_ids.update(new_ids)
-                    save_seen_markets(cfg.seen_markets_path, seen_ids)
-                else:
-                    # 每 5 轮（~150s）发心跳，便于核对监控是否还活
-                    if iteration % 5 == 1:
-                        LOG.info(
-                            "[watch_new_markets] iter=%d: 无新市场（已知 %d，最大 ID=%d）",
-                            iteration, len(seen_ids), max(seen_ids) if seen_ids else 0,
-                        )
-
-        except Exception:
-            LOG.exception("[watch_new_markets] iter=%d: 失败", iteration)
-
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=cfg.new_markets_check_sec)
-        except asyncio.TimeoutError:
-            pass
-
-
 async def _dispatch_match(
     ev: Dict[str, Any],
     cfg: Config,
@@ -3408,10 +3111,6 @@ async def main() -> None:
 
         # 菜单/命令处理任务，与监控任务并行。
         tasks.append(asyncio.create_task(bot.run(stop)))
-
-        # 新市场上线告警，独立任务。
-        if cfg.watch_new_markets:
-            tasks.append(asyncio.create_task(watch_new_markets(cfg, state, predict, tg, stop)))
 
         # 每 N 秒推一次摘要。state.summary_interval_sec=0 时任务空转直到被打开。
         tasks.append(asyncio.create_task(summary_runner(cfg, state, tg, stop)))

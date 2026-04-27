@@ -76,6 +76,11 @@ class Config:
 
     market_url_template: str
     tx_url_template: str
+    user_url_template: str
+
+    watch_new_markets: bool
+    new_markets_check_sec: int
+    seen_markets_path: str
 
     @property
     def threshold_usdt_wei(self) -> int:
@@ -135,6 +140,18 @@ class Config:
             ).strip(),
             tx_url_template=os.getenv(
                 "TX_URL_TEMPLATE", "https://bscscan.com/tx/{hash}"
+            ).strip(),
+            # 用户链接：默认指向 BscScan 钱包页（一定能打开）。
+            # 如果将来 predict.fun 有公开的用户主页，可以覆盖成 https://predict.fun/profile/{address}
+            # 模板可用占位符：{address} / {username}
+            user_url_template=os.getenv(
+                "USER_URL_TEMPLATE", "https://bscscan.com/address/{address}"
+            ).strip(),
+
+            watch_new_markets=env_bool("WATCH_NEW_MARKETS", True),
+            new_markets_check_sec=int(os.getenv("NEW_MARKETS_CHECK_SEC", "120")),
+            seen_markets_path=os.getenv(
+                "SEEN_MARKETS_PATH", "/tmp/predict_seen_markets.json"
             ).strip(),
         )
 
@@ -239,6 +256,70 @@ def save_seen(path: str, seen: "OrderedDict[str, None]") -> None:
         os.replace(tmp, path)
     except Exception as exc:
         LOG.warning("保存 seen 状态失败 (%s): %s", path, exc)
+
+
+def load_seen_markets(path: str) -> Set[int]:
+    """已发过"新市场上线"告警的 market_id 集合。"""
+    if not path or not os.path.exists(path):
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            ids = json.load(f)
+        if not isinstance(ids, list):
+            return set()
+        out: Set[int] = set()
+        for x in ids:
+            try:
+                out.add(int(x))
+            except Exception:
+                pass
+        LOG.info("已从 %s 加载 %d 条已知市场 ID", path, len(out))
+        return out
+    except Exception as exc:
+        LOG.warning("加载已知市场列表失败 (%s): %s", path, exc)
+        return set()
+
+
+def save_seen_markets(path: str, ids: Set[int]) -> None:
+    if not path:
+        return
+    tmp = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sorted(ids), f)
+        os.replace(tmp, path)
+    except Exception as exc:
+        LOG.warning("保存已知市场列表失败 (%s): %s", path, exc)
+
+
+def extract_username(event: Dict[str, Any]) -> str:
+    """从 taker / event / user 嵌套字段里取 username，找不到返回空串。"""
+    taker = event.get("taker") if isinstance(event.get("taker"), dict) else {}
+    user = taker.get("user") if isinstance(taker.get("user"), dict) else {}
+    profile = taker.get("profile") if isinstance(taker.get("profile"), dict) else {}
+    candidates = (
+        taker.get("username"),
+        taker.get("name"),
+        taker.get("displayName"),
+        user.get("username"),
+        user.get("name"),
+        user.get("displayName"),
+        profile.get("username"),
+        profile.get("name"),
+        event.get("takerUsername"),
+    )
+    for c in candidates:
+        if c:
+            s = str(c).strip()
+            if s:
+                return s
+    return ""
+
+
+def extract_signer(event: Dict[str, Any]) -> str:
+    taker = event.get("taker") if isinstance(event.get("taker"), dict) else {}
+    return str(taker.get("signer") or event.get("signer") or "").strip()
 
 
 def extract_tx_hash(event: Dict[str, Any]) -> str:
@@ -476,12 +557,11 @@ class Predict:
 
         return out, True
 
-    async def fetch_open_markets(self) -> Dict[int, str]:
+    async def fetch_open_markets(self) -> Dict[int, Dict[str, Any]]:
         """
-        分页拉取可见 OPEN 市场。
-        返回 market_id -> title/question。
+        分页拉取可见 OPEN 市场。返回 market_id -> 原始市场对象（含 slug/category 等）。
         """
-        markets: Dict[int, str] = {}
+        markets: Dict[int, Dict[str, Any]] = {}
         after: Optional[str] = None
         pages = 0
 
@@ -505,9 +585,7 @@ class Predict:
                 trading_status = str(m.get("tradingStatus") or m.get("status") or "").upper()
 
                 if visible and (not trading_status or trading_status == "OPEN"):
-                    markets[mid] = str(
-                        m.get("title") or m.get("question") or m.get("name") or f"Market {mid}"
-                    )
+                    markets[mid] = m
 
             page_info = data.get("pageInfo") or {}
             after = (
@@ -521,6 +599,13 @@ class Predict:
                 break
 
         return markets
+
+
+def market_title_of(m: Dict[str, Any]) -> str:
+    mid = m.get("id") or m.get("marketId") or "?"
+    return str(
+        m.get("title") or m.get("question") or m.get("name") or f"Market {mid}"
+    )
 
 
 PRESET_AMOUNTS = (Decimal("500"), Decimal("1000"), Decimal("5000"), Decimal("10000"))
@@ -919,7 +1004,8 @@ def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
     notional = event_value_usdt(event, cfg)
 
     fee_amount = to_decimal(fee.get("amount"), cfg.usdt_wei_decimals)
-    signer = taker.get("signer") or event.get("signer") or "-"
+    signer = extract_signer(event) or "-"
+    username = extract_username(event)
     makers = event.get("makers") or []
     tx = extract_tx_hash(event)
     executed_at = event.get("executedAt") or event.get("createdAt") or "-"
@@ -930,6 +1016,16 @@ def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
         title_html = f'<a href="{html.escape(market_link, quote=True)}">{title_safe}</a>'
     else:
         title_html = title_safe
+
+    # Taker 显示：优先用户名，否则截短地址。一律链接到模板（默认 BscScan 地址页）。
+    taker_label = normalize_text(username) if username else html.escape(short_addr(signer))
+    user_link = _render_template(
+        cfg.user_url_template, address=signer if signer != "-" else "", username=username
+    )
+    if user_link:
+        taker_html = f'<a href="{html.escape(user_link, quote=True)}">{taker_label}</a>'
+    else:
+        taker_html = taker_label
 
     lines = [
         "🚨 <b>Predict 成交大单</b>",
@@ -945,7 +1041,7 @@ def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
     lines.extend(
         [
             f"Market ID：<code>{html.escape(mid_str or '-')}</code> ｜ 分类：<code>{html.escape(str(category))}</code>",
-            f"Taker：<code>{html.escape(short_addr(signer))}</code> ｜ Makers：<code>{len(makers)}</code>",
+            f"Taker：{taker_html} <code>{html.escape(short_addr(signer))}</code> ｜ Makers：<code>{len(makers)}</code>",
             f"方向字段：<code>{html.escape(str(taker.get('quoteType', event.get('quoteType', '-'))))}</code> ｜ Outcome：<b>{normalize_text(outcome.get('name') if isinstance(outcome, dict) else outcome)}</b>",
             f"份额数量：<code>{fmt_decimal(amount, 4)}</code> ｜ 价格：<code>{fmt_decimal(price, 6)}</code>",
             f"手续费：<code>{fmt_decimal(fee_amount, 6)}</code> <code>{html.escape(str(fee.get('type') or ''))}</code>",
@@ -965,6 +1061,77 @@ def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
         lines.append("Tx：<code>-</code>")
 
     return "\n".join(lines)
+
+
+def format_new_market_alert(market: Dict[str, Any], cfg: Config) -> str:
+    mid = market.get("id") or market.get("marketId")
+    mid_str = str(mid) if mid is not None else ""
+    slug = market.get("slug") or market.get("urlSlug") or market.get("categorySlug") or ""
+    title = market_title_of(market)
+    category = market.get("categorySlug") or market.get("category") or "-"
+    end_date = (
+        market.get("endDate")
+        or market.get("expiresAt")
+        or market.get("closesAt")
+        or market.get("resolutionTime")
+        or "-"
+    )
+
+    title_safe = normalize_text(title)
+    link = _render_template(cfg.market_url_template, id=mid_str, slug=slug, title=title)
+    title_html = (
+        f'<a href="{html.escape(link, quote=True)}">{title_safe}</a>' if link else title_safe
+    )
+
+    return "\n".join(
+        [
+            "🆕 <b>Predict 新市场上线</b>",
+            f"市场：<b>{title_html}</b>",
+            f"Market ID：<code>{html.escape(mid_str or '-')}</code> ｜ 分类：<code>{html.escape(str(category))}</code>",
+            f"截止：<code>{html.escape(str(end_date))}</code>",
+        ]
+    )
+
+
+async def watch_new_markets(
+    cfg: Config,
+    predict: Predict,
+    tg: Telegram,
+    stop: asyncio.Event,
+) -> None:
+    """每 NEW_MARKETS_CHECK_SEC 秒拉一次 OPEN 市场，对没见过的市场发"上线"告警。"""
+    seen_ids = load_seen_markets(cfg.seen_markets_path)
+    # 没磁盘记录 = 全新部署。第一次只 seed，不要把现有几百个市场全推送。
+    bootstrap = not seen_ids
+
+    while not stop.is_set():
+        try:
+            markets = await predict.fetch_open_markets()
+            current_ids = set(markets.keys())
+
+            new_ids = sorted(current_ids - seen_ids)
+
+            if bootstrap:
+                LOG.info(
+                    "首次启动：seed %d 个已上线市场，不推送上线告警", len(current_ids)
+                )
+                seen_ids = current_ids
+                bootstrap = False
+                save_seen_markets(cfg.seen_markets_path, seen_ids)
+            elif new_ids:
+                LOG.info("发现 %d 个新市场", len(new_ids))
+                for mid in new_ids:
+                    await tg.send(format_new_market_alert(markets[mid], cfg))
+                seen_ids.update(new_ids)
+                save_seen_markets(cfg.seen_markets_path, seen_ids)
+
+        except Exception:
+            LOG.exception("新市场监控失败")
+
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=cfg.new_markets_check_sec)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def monitor_matches(
@@ -1214,8 +1381,8 @@ async def market_refresher(
                     market_titles.pop(mid, None)
 
             # 标题可能更新（重命名），用最新值刷新
-            for mid, title in markets.items():
-                market_titles[mid] = title
+            for mid, m in markets.items():
+                market_titles[mid] = market_title_of(m)
 
             if new_ids or stale_ids:
                 LOG.info(
@@ -1440,6 +1607,10 @@ async def main() -> None:
 
         # 菜单/命令处理任务，与监控任务并行。
         tasks.append(asyncio.create_task(bot.run(stop)))
+
+        # 新市场上线告警，独立任务，跟 mode 解耦。
+        if cfg.watch_new_markets:
+            tasks.append(asyncio.create_task(watch_new_markets(cfg, predict, tg, stop)))
 
         await stop.wait()
 

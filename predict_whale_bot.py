@@ -204,6 +204,9 @@ class RuntimeState:
     cumulative_trades: "OrderedDict[str, int]" = field(default_factory=OrderedDict)
     # 滚动窗口：最近被告警过的成交，用于摘要聚合。重启清零（短窗口数据，不需持久化）。
     recent_matches: List[Dict[str, Any]] = field(default_factory=list)
+    # /diag 用：monitor_matches 每轮把最新一轮的统计放这里，让 /diag 一眼看到
+    # bot 是不是在工作 / 哪里把告警吞掉了。重启清零，不持久化。
+    last_iter_stats: Dict[str, Any] = field(default_factory=dict)
     _path: str = ""  # 仅内部用，不参与持久化
 
     _CUMULATIVE_CAP = 5000
@@ -443,6 +446,24 @@ def save_runtime_state(path: str, data: Dict[str, Any]) -> None:
         os.replace(tmp, path)
     except Exception as exc:
         LOG.warning("保存 runtime state 失败 (%s): %s", path, exc)
+
+
+def check_persistence_writable(cfg: "Config") -> bool:
+    """启动时探测一次 RUNTIME_STATE_PATH 是否真的可写。Railway 没挂 volume
+    时这里会失败，让 main() 决定是否打告警。"""
+    path = cfg.runtime_state_path
+    if not path:
+        return True  # 用户主动关了持久化
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        probe = f"{path}.probe"
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except Exception as exc:
+        LOG.warning("[persistence] %s 不可写: %s", path, exc)
+        return False
 
 
 def to_decimal(value: Any, decimals: int = 18, *, wei_hint: bool = True) -> Decimal:
@@ -1547,6 +1568,7 @@ class TelegramBot:
                         {"command": "set_summary", "description": "设置自动摘要间隔（如 60 / 2h / 0）"},
                         {"command": "unsubscribe", "description": "退订私聊推送"},
                         {"command": "speed", "description": "查看当前 API 占用"},
+                        {"command": "diag", "description": "全状态诊断快照"},
                         {"command": "benchmark", "description": "速度压测（admin）"},
                         {"command": "ramp", "description": "阶梯压测找最稳定 interval（admin）"},
                         {"command": "subscribers", "description": "列出订阅者（admin）"},
@@ -1731,6 +1753,8 @@ class TelegramBot:
             await self._send_subscriber_list(reply_chat_id=src)
         elif cmd == "/speed":
             await self._send_speed_status(reply_chat_id=src)
+        elif cmd == "/diag":
+            await self._send_diag(reply_chat_id=src, asking_chat_id=chat_id, is_admin=is_admin)
         elif cmd == "/benchmark":
             await self._run_benchmark(arg, reply_chat_id=src)
         elif cmd == "/ramp":
@@ -1971,6 +1995,130 @@ class TelegramBot:
             f"<code>{bar}</code>\n\n"
             f"当前 POLL_INTERVAL_SEC = <code>{self.cfg.poll_interval_sec}s</code>"
         )
+        await self.tg.send(msg, chat_id=reply_chat_id)
+
+    async def _send_diag(
+        self,
+        *,
+        reply_chat_id: Optional[Any] = None,
+        asking_chat_id: Optional[Any] = None,
+        is_admin: bool = False,
+    ) -> None:
+        """全状态快照。任何人都能用，但只有 admin 能看到所有订阅者明细。"""
+        import time as _time
+
+        is_main = self.state.is_main_chat(asking_chat_id) if asking_chat_id is not None else False
+        my_threshold = (
+            self.state.threshold_usdt if is_main
+            else self.state.get_threshold_for(asking_chat_id) if asking_chat_id is not None
+            else self.state.threshold_usdt
+        )
+
+        # 持久化文件状态
+        def _file_status(path: str) -> str:
+            if not path:
+                return "(未配置)"
+            if not os.path.exists(path):
+                return f"<code>{html.escape(path)}</code> ❌ 不存在（Railway volume 没挂！）"
+            try:
+                size = os.path.getsize(path)
+                return f"<code>{html.escape(path)}</code> ✅ {size:,} bytes"
+            except Exception:
+                return f"<code>{html.escape(path)}</code> ⚠️ 无法读"
+
+        # API 占用
+        now = _time.monotonic()
+        recent = [t for t in self.predict._request_log if t >= now - 60]
+        api_count = len(recent)
+        api_pct = api_count * 100 // Predict.RATE_LIMIT_PER_MIN
+
+        # 上一轮 monitor_matches 统计
+        last = self.state.last_iter_stats
+        last_iter = "(尚未跑过一轮)"
+        if last:
+            last_iter = (
+                f"fetched=<b>{last.get('fetched', '?')}</b> · "
+                f"filtered=<b>{last.get('filtered', '?')}</b>"
+                f"(min_th=$<b>{last.get('min_threshold', '?')}</b>) · "
+                f"fresh=<b>{last.get('fresh', '?')}</b>\n"
+                f"→ main=<b>{last.get('sent_main', '?')}</b> · "
+                f"subs=<b>{last.get('sent_subs', '?')}</b> · "
+                f"@ <code>{html.escape(str(last.get('ts', '?'))[:19])}</code>"
+            )
+
+        # 最近一笔被推送的成交（从 recent_matches 取最后一条）
+        last_alert = "(本会话尚无)"
+        if self.state.recent_matches:
+            m = self.state.recent_matches[-1]
+            ago_secs = (datetime.now(timezone.utc) - m["ts"]).total_seconds()
+            if ago_secs < 60:
+                ago = f"{int(ago_secs)}秒前"
+            elif ago_secs < 3600:
+                ago = f"{int(ago_secs / 60)}分钟前"
+            else:
+                ago = f"{int(ago_secs / 3600)}小时前"
+            last_alert = f"${fmt_decimal(m['value'], 2)} · {normalize_text(m['title'])[:40]} · {ago}"
+
+        # 订阅者列表
+        sub_count = len(self.state.subscribers)
+        if is_admin:
+            if sub_count == 0:
+                sub_lines = "(无)"
+            else:
+                rows = []
+                for cid, info in sorted(self.state.subscribers.items()):
+                    try:
+                        amt = Decimal(str(info.get("threshold_usdt", "0")))
+                    except Exception:
+                        amt = Decimal("0")
+                    rows.append(
+                        f"  • <code>{html.escape(cid)}</code> · ${fmt_decimal(amt, 0)} · "
+                        f"{info.get('lang', '?')}"
+                    )
+                sub_lines = "\n".join(rows[:10])
+                if len(rows) > 10:
+                    sub_lines += f"\n  …还有 {len(rows) - 10} 个"
+        else:
+            # 非 admin：只暴露数量 + 自己的 entry
+            sub_lines = "(完整列表仅 admin 可见)"
+            if asking_chat_id is not None:
+                my_info = self.state.subscribers.get(str(asking_chat_id))
+                if my_info:
+                    try:
+                        amt = Decimal(str(my_info.get("threshold_usdt", "0")))
+                    except Exception:
+                        amt = Decimal("0")
+                    sub_lines += (
+                        f"\n  你：${fmt_decimal(amt, 0)} · "
+                        f"{my_info.get('lang', '?')}"
+                    )
+
+        scope_label = (
+            "主告警频道（你看到的是全局值）" if is_main
+            else "私聊订阅模式（你看到的是你自己的）"
+        )
+
+        msg = (
+            "🔧 <b>当前状态诊断</b>\n\n"
+            f"<b>本 chat 视角</b>：{scope_label}\n"
+            f"  你的有效阈值：<b>${fmt_decimal(my_threshold, 2)} USDT</b>\n\n"
+            f"<b>全局配置</b>\n"
+            f"  主告警 chat_id：<code>{html.escape(self.state.main_chat_id)}</code>\n"
+            f"  全局阈值：<b>${fmt_decimal(self.state.threshold_usdt, 2)} USDT</b>\n"
+            f"  POLL_INTERVAL_SEC：<code>{self.cfg.poll_interval_sec}s</code>\n"
+            f"  默认语言：<code>{self.state.lang}</code>\n\n"
+            f"<b>持久化文件</b>\n"
+            f"  runtime_state：{_file_status(self.cfg.runtime_state_path)}\n"
+            f"  seen 事件：{_file_status(self.cfg.seen_state_path)}\n"
+            f"  seen 市场：{_file_status(self.cfg.seen_markets_path)}\n\n"
+            f"<b>订阅者：{sub_count} 个</b>\n{sub_lines}\n\n"
+            f"<b>监控状态</b>\n"
+            f"  最近 60s API：<b>{api_count}</b> 次（{api_pct}% 预算）\n"
+            f"  最后一轮 monitor_matches：{last_iter}\n"
+            f"  最后一笔已推送告警：{last_alert}\n"
+            f"  内存 seen：<b>{len(self.state.recent_matches)}</b> 笔窗口缓存\n"
+        )
+
         await self.tg.send(msg, chat_id=reply_chat_id)
 
     async def _benchmark_loop(
@@ -2433,10 +2581,34 @@ def event_value_usdt(event: Dict[str, Any], cfg: Config) -> Decimal:
         if event.get(key) is not None:
             return to_decimal(event.get(key), cfg.usdt_wei_decimals)
 
-    # (4) 兜底：放弃 amount × priceExecuted 这条死路，记 warning
+    # (4) 兜底：amount × priceExecuted。曾经因为某些市场算出 6.88e16 的天文数字
+    # 被禁用，但禁用后没有 valueUsdt / takerAmountFilled 的事件会被静默过滤掉，
+    # 整个 bot 沉默。这里加一道"合理范围"护栏：
+    #  - 单笔 < 1B USDT 才用兜底（trump-china 那种 6.88e16 会被拦下）
+    #  - 用了兜底就 LOG 一条，方便排查
+    amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.shares_wei_decimals)
+    price = to_decimal(event.get("priceExecuted") or taker.get("price"), cfg.usdt_wei_decimals)
+    if amount > 0 and price > 0:
+        fallback_notional = amount * price
+        if 0 < fallback_notional < Decimal("1000000000"):
+            LOG.info(
+                "[notional fallback] %s × %s = $%s (event keys=%s)",
+                amount, price, fallback_notional, sorted(event.keys()),
+            )
+            return fallback_notional
+        else:
+            LOG.warning(
+                "[notional rejected] amount × price = %s 超出合理范围（>1B），"
+                "可能是 priceExecuted 编码异常。event keys=%s",
+                fallback_notional, sorted(event.keys()),
+            )
+
+    # 真正都拿不到才返回 0；附完整字段名便于定位
     LOG.warning(
-        "event_value_usdt 找不到 USDT 字段；不再用 amount×price 兜底。事件 keys=%s",
+        "[notional=0] event keys=%s taker keys=%s — alert 会被过滤掉，"
+        "请把这些字段名贴出来调整 event_value_usdt",
         sorted(event.keys()),
+        sorted(taker.keys()) if taker else [],
     )
     return Decimal("0")
 
@@ -2864,6 +3036,91 @@ async def watch_new_markets(
             pass
 
 
+async def _dispatch_match(
+    ev: Dict[str, Any],
+    cfg: Config,
+    state: "RuntimeState",
+    tg: "Telegram",
+) -> Tuple[bool, int]:
+    """
+    分发一笔成交告警：主频道（过全局阈值）+ 私聊订阅者（按各自门槛）。
+    单笔的所有副作用都封装在这里，让 monitor_matches 干净。
+    返回 (是否发到主频道, 发到几个订阅者)。
+    """
+    signer = extract_signer(ev) or ""
+    n = state.bump_cumulative(signer) if signer else 0
+    notional = event_value_usdt(ev, cfg)
+
+    sent_main = False
+    sent_subs = 0
+
+    # 主告警频道：过全局阈值才发
+    if notional >= state.threshold_usdt:
+        text, markup = format_match_alert(ev, cfg, state, cumulative=n)
+        await tg.send(text, reply_markup=markup)
+        sent_main = True
+
+    # 私聊订阅者：按各自门槛分发
+    for sub_chat_id, info in list(state.subscribers.items()):
+        try:
+            sub_threshold = Decimal(str(info.get("threshold_usdt", "0")))
+        except (InvalidOperation, ValueError, TypeError):
+            continue
+        if notional < sub_threshold:
+            continue
+        sub_lang = info.get("lang", state.lang)
+        view = (
+            state if sub_lang == state.lang
+            else dataclass_replace_lang(state, sub_lang)
+        )
+        text, markup = format_match_alert(ev, cfg, view, cumulative=n)
+        try:
+            mid = await tg.send(text, reply_markup=markup, chat_id=sub_chat_id)
+            if mid is not None:
+                sent_subs += 1
+            else:
+                LOG.warning(
+                    "[fanout] 发给 chat %s 失败（4xx/timeout）— bot 可能被 block 或 chat 失效",
+                    sub_chat_id,
+                )
+        except Exception as exc:
+            LOG.warning("[fanout] 发给 chat %s 异常: %s", sub_chat_id, exc)
+
+    # 记入摘要滚动窗口（聚合用），不影响 alert 发送
+    if notional > 0:
+        try:
+            market = ev.get("market") or {}
+            mid_id = market.get("id") or ev.get("marketId") or ""
+            slug = (
+                market.get("slug")
+                or market.get("urlSlug")
+                or market.get("categorySlug")
+                or ""
+            )
+            title = market_title_of(market) if isinstance(market, dict) else "?"
+            ts_raw = ev.get("executedAt") or ev.get("createdAt") or ""
+            ts: datetime = datetime.now(timezone.utc)
+            if ts_raw:
+                try:
+                    ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                except Exception:
+                    pass
+            state.add_match_for_summary(
+                market_title=title,
+                market_slug=slug,
+                market_id=str(mid_id),
+                value=notional,
+                signer=signer,
+                timestamp=ts,
+            )
+        except Exception:
+            LOG.exception("[summary] add_match_for_summary 异常（忽略）")
+
+    return sent_main, sent_subs
+
+
 async def monitor_matches(
     cfg: Config,
     state: RuntimeState,
@@ -2927,6 +3184,7 @@ async def monitor_matches(
 
             # 客户端按 notional value 过滤。门槛取"全局 + 所有订阅者中最低值"，
             # 让每个订阅者都能拿到 ≥ 自己门槛的成交。后续在分发处再按各自门槛二次筛。
+            fetched_n = len(events)
             min_threshold = state.threshold_usdt
             for _info in state.subscribers.values():
                 try:
@@ -2936,6 +3194,7 @@ async def monitor_matches(
                 except (InvalidOperation, ValueError, TypeError):
                     continue
             events = [ev for ev in events if event_value_usdt(ev, cfg) >= min_threshold]
+            filtered_n = len(events)
 
             fresh: List[Dict[str, Any]] = []
             for ev in events:
@@ -2950,6 +3209,9 @@ async def monitor_matches(
 
             should_alert = resumed_from_disk or not startup or cfg.alert_on_startup
 
+            sent_main = 0
+            sent_subs = 0
+
             if fresh and not should_alert:
                 LOG.info(
                     "首次启动且未启用 ALERT_ON_STARTUP，已记录 %d 条历史成交不告警",
@@ -2958,88 +3220,36 @@ async def monitor_matches(
             elif fresh:
                 # 接口通常按 executedAt DESC 排序，反转后按时间先后发送。
                 for ev in reversed(fresh):
-                    # 只对实际告警的事件累加计数（去重 + 阈值过滤后），保证
-                    # "本轮第 N 笔" 只反映被推送的大单。
-                    signer = extract_signer(ev) or ""
-                    n = state.bump_cumulative(signer) if signer else 0
-                    notional_for_filter = event_value_usdt(ev, cfg)
-
-                    # 主告警频道：过全局阈值才发
-                    if notional_for_filter >= state.threshold_usdt:
-                        text, markup = format_match_alert(ev, cfg, state, cumulative=n)
-                        await tg.send(text, reply_markup=markup)
-
-                    # 私聊订阅者：按各自门槛分发；删掉一份 snapshot 防止迭代时
-                    # remove_subscriber 改字典报错。
-                    fanout_failed: List[str] = []
-                    for sub_chat_id, info in list(state.subscribers.items()):
-                        try:
-                            sub_threshold = Decimal(str(info.get("threshold_usdt", "0")))
-                        except (InvalidOperation, ValueError, TypeError):
-                            continue
-                        if notional_for_filter < sub_threshold:
-                            continue
-                        # 用订阅者各自的语言渲染
-                        sub_lang = info.get("lang", state.lang)
-                        view = (
-                            state if sub_lang == state.lang
-                            else dataclass_replace_lang(state, sub_lang)
-                        )
-                        text, markup = format_match_alert(ev, cfg, view, cumulative=n)
-                        try:
-                            mid = await tg.send(
-                                text, reply_markup=markup, chat_id=sub_chat_id,
-                            )
-                            # mid is None ⇒ 4xx (typically 403 = bot blocked)。
-                            # 不立刻删，万一是临时错误；连续多笔失败再考虑清理。
-                            if mid is None:
-                                fanout_failed.append(sub_chat_id)
-                        except Exception as exc:
-                            LOG.warning(
-                                "[fanout] 发给 chat %s 异常: %s",
-                                sub_chat_id, exc,
-                            )
-                    # 简化策略：只 log 失败的 chat，不自动删除（避免误伤临时网络异常）
-                    if fanout_failed:
-                        LOG.info(
-                            "[fanout] 本轮 %d 个订阅者推送失败（4xx），稍后人工 /subscribers 清理",
-                            len(fanout_failed),
-                        )
-
-                    # 同步记入摘要滚动窗口（聚合用），不影响 alert 发送。
                     try:
-                        notional = event_value_usdt(ev, cfg)
-                        if notional > 0:
-                            market = ev.get("market") or {}
-                            mid = market.get("id") or ev.get("marketId") or ""
-                            slug = (
-                                market.get("slug")
-                                or market.get("urlSlug")
-                                or market.get("categorySlug")
-                                or ""
-                            )
-                            title = market_title_of(market) if isinstance(market, dict) else "?"
-                            ts_raw = ev.get("executedAt") or ev.get("createdAt") or ""
-                            ts: datetime = datetime.now(timezone.utc)
-                            if ts_raw:
-                                try:
-                                    ts = datetime.fromisoformat(
-                                        str(ts_raw).replace("Z", "+00:00")
-                                    )
-                                    if ts.tzinfo is None:
-                                        ts = ts.replace(tzinfo=timezone.utc)
-                                except Exception:
-                                    pass
-                            state.add_match_for_summary(
-                                market_title=title,
-                                market_slug=slug,
-                                market_id=str(mid),
-                                value=notional,
-                                signer=signer,
-                                timestamp=ts,
-                            )
+                        sent_to_main, sent_to_subs = await _dispatch_match(
+                            ev, cfg, state, tg,
+                        )
+                        sent_main += int(sent_to_main)
+                        sent_subs += sent_to_subs
                     except Exception:
-                        LOG.exception("[summary] add_match_for_summary 异常（忽略）")
+                        LOG.exception(
+                            "[matches] 单笔事件分发异常 tx=%s — 继续下一笔",
+                            extract_tx_hash(ev)[:16],
+                        )
+
+            # 每轮总结：写一行 INFO 日志 + 把统计写到 state.last_iter_stats 让 /diag 读
+            iter_stats = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "fetched": fetched_n,
+                "filtered": filtered_n,
+                "min_threshold": str(min_threshold),
+                "fresh": len(fresh),
+                "subs_count": len(state.subscribers),
+                "sent_main": sent_main,
+                "sent_subs": sent_subs,
+                "global_threshold": str(state.threshold_usdt),
+            }
+            state.last_iter_stats = iter_stats
+            LOG.info(
+                "[matches] fetched=%d filtered=%d(min_th=$%s) fresh=%d → main=%d subs=%d/%d",
+                fetched_n, filtered_n, min_threshold, len(fresh),
+                sent_main, sent_subs, len(state.subscribers),
+            )
 
             startup = False
 
@@ -3222,7 +3432,20 @@ async def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    LOG.info("启动配置: threshold=%s poll=%ss", cfg.threshold_usdt, cfg.poll_interval_sec)
+    LOG.info(
+        "启动配置: threshold=%s poll=%ss subscribers=%d",
+        cfg.threshold_usdt, cfg.poll_interval_sec, len(state.subscribers),
+    )
+
+    # 持久化路径自检：试着原子写一个 probe 文件。Railway 没挂 volume 时会失败，
+    # 提早报警避免静默丢订阅者/seen/阈值。
+    persist_ok = check_persistence_writable(cfg)
+    if not persist_ok:
+        LOG.error(
+            "⚠️⚠️ 持久化路径不可写（%s）。Railway → Settings → Volumes "
+            "挂个 1GB 到 /data 才能跨重启留住订阅者/seen/阈值。",
+            cfg.runtime_state_path,
+        )
 
     stop = asyncio.Event()
 

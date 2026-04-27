@@ -559,11 +559,18 @@ class Predict:
 
     async def fetch_open_markets(self) -> Dict[int, Dict[str, Any]]:
         """
-        分页拉取可见 OPEN 市场。返回 market_id -> 原始市场对象（含 slug/category 等）。
+        分页拉取尚未结束的市场。返回 market_id -> 原始市场对象。
+
+        过滤策略：只显式排除"已知关闭/已结算"的状态，未知状态默认收下。
+        Predict 的状态字段实际是什么值（OPEN/ACTIVE/LIVE/TRADING/...）不一定，
+        只信白名单会把没见过的状态全部丢掉，导致新市场永远不被发现。
         """
         markets: Dict[int, Dict[str, Any]] = {}
         after: Optional[str] = None
         pages = 0
+        status_counts: Dict[str, int] = {}
+        skipped_invisible = 0
+        skipped_closed = 0
 
         while True:
             pages += 1
@@ -583,9 +590,17 @@ class Predict:
 
                 visible = m.get("isVisible", True)
                 trading_status = str(m.get("tradingStatus") or m.get("status") or "").upper()
+                status_counts[trading_status or "(none)"] = status_counts.get(trading_status or "(none)", 0) + 1
 
-                if visible and (not trading_status or trading_status == "OPEN"):
-                    markets[mid] = m
+                if not visible:
+                    skipped_invisible += 1
+                    continue
+
+                if trading_status in CLOSED_LIKE_STATUSES:
+                    skipped_closed += 1
+                    continue
+
+                markets[mid] = m
 
             page_info = data.get("pageInfo") or {}
             after = (
@@ -598,7 +613,23 @@ class Predict:
             if not has_next or not after or pages >= 100:
                 break
 
+        LOG.info(
+            "fetch_open_markets: 收 %d 个开放市场 (扫 %d 页，按 tradingStatus 分布 %s，跳过不可见 %d，跳过已结束 %d)",
+            len(markets), pages, status_counts, skipped_invisible, skipped_closed,
+        )
         return markets
+
+
+# 显式排除的"已结束"状态。其它任何状态（OPEN/ACTIVE/LIVE/TRADING/PENDING/...）都收。
+CLOSED_LIKE_STATUSES = {
+    "CLOSED", "CLOSE",
+    "RESOLVED", "RESOLVING",
+    "CANCELLED", "CANCELED",
+    "EXPIRED",
+    "SETTLED", "SETTLING",
+    "ENDED",
+    "ARCHIVED",
+}
 
 
 def market_title_of(m: Dict[str, Any]) -> str:
@@ -618,11 +649,8 @@ def _menu_text(state: RuntimeState) -> str:
         "🐋 <b>Predict 监控菜单</b>\n"
         f"成交阈值：<b>${fmt_decimal(state.threshold_usdt, 2)} USDT</b>\n"
         f"盘口阈值：<b>${fmt_decimal(state.orderbook_threshold_usdt, 2)} USDT</b>\n\n"
-        "点击下方按钮快速设置，或自定义：\n"
-        "<code>/set_match 数额</code>  设置成交阈值\n"
-        "<code>/set_book 数额</code>  设置盘口阈值\n"
-        "<code>/status</code>  查看当前阈值\n"
-        "<code>/menu</code>  重新打开菜单"
+        "点预设按钮一键设置，或点 <b>🔧 自定义</b> 弹出输入框输入任意金额。\n"
+        "也可手动发：<code>/set_match 数额</code> / <code>/set_book 数额</code>"
     )
 
 
@@ -640,8 +668,25 @@ def _menu_keyboard() -> Dict[str, Any]:
         "inline_keyboard": [
             row("match", "成交"),
             row("book", "盘口"),
+            [
+                {"text": "🔧 自定义成交", "callback_data": "custom:match"},
+                {"text": "🔧 自定义盘口", "callback_data": "custom:book"},
+            ],
             [{"text": "🔄 刷新", "callback_data": "refresh"}],
         ]
+    }
+
+
+# 自定义输入提示里的标记文字。_handle_message 通过 reply_to_message 反查到
+# 这串里包含 "成交"/"盘口" 来判断要设的是哪个阈值，因此别随意改字面。
+CUSTOM_PROMPT_MARKER = "请输入自定义"
+
+
+def _custom_prompt_markup() -> Dict[str, Any]:
+    return {
+        "force_reply": True,
+        "input_field_placeholder": "如 2500",
+        "selective": True,
     }
 
 
@@ -815,10 +860,6 @@ class TelegramBot:
         chat_type = chat.get("type")
         text = (msg.get("text") or "").strip()
 
-        # 持久键盘按钮发回来的是纯文本（如「菜单」），转成对应命令处理。
-        if text in KEYBOARD_ALIASES:
-            text = KEYBOARD_ALIASES[text]
-
         if not self._allowed(chat_id):
             if text.startswith("/"):
                 LOG.warning(
@@ -827,6 +868,26 @@ class TelegramBot:
                     chat_id, chat_type, self._allowed_chat_id, text[:80],
                 )
             return
+
+        # 自定义阈值的 force_reply 回填：用户的消息是对 bot 之前的"请输入自定义"提示
+        # 的回复时，按提示里写的"成交"/"盘口"决定改哪个阈值。
+        reply_to = msg.get("reply_to_message")
+        if (
+            isinstance(reply_to, dict)
+            and (reply_to.get("from") or {}).get("is_bot")
+            and CUSTOM_PROMPT_MARKER in (reply_to.get("text") or "")
+            and not text.startswith("/")
+            and text not in KEYBOARD_ALIASES
+        ):
+            parent_text = reply_to.get("text") or ""
+            kind = "match" if "成交" in parent_text else ("book" if "盘口" in parent_text else None)
+            if kind:
+                await self._set_threshold(kind, text)
+                return
+
+        # 持久键盘按钮发回来的是纯文本（如「菜单」），转成对应命令处理。
+        if text in KEYBOARD_ALIASES:
+            text = KEYBOARD_ALIASES[text]
 
         if not text.startswith("/"):
             return
@@ -886,6 +947,19 @@ class TelegramBot:
                 await self.tg.edit_message(
                     message_id, _menu_text(self.state), reply_markup=_menu_keyboard()
                 )
+            return
+
+        if data in {"custom:match", "custom:book"}:
+            kind = data.split(":", 1)[1]
+            label = "成交" if kind == "match" else "盘口"
+            await self.tg.answer_callback_query(cb_id, f"输入{label}阈值")
+            await self.tg.send(
+                # 文案里必须含 CUSTOM_PROMPT_MARKER 和「成交」或「盘口」
+                # 字样，_handle_message 靠它反查。
+                f"💰 {CUSTOM_PROMPT_MARKER}<b>{label}</b>阈值（USDT 数字，如 2500）。\n"
+                "回复这条消息即可，发送 /menu 取消。",
+                reply_markup=_custom_prompt_markup(),
+            )
             return
 
         kind, _, raw_amount = data.partition(":")
@@ -1099,34 +1173,65 @@ async def watch_new_markets(
     tg: Telegram,
     stop: asyncio.Event,
 ) -> None:
-    """每 NEW_MARKETS_CHECK_SEC 秒拉一次 OPEN 市场，对没见过的市场发"上线"告警。"""
+    """每 NEW_MARKETS_CHECK_SEC 秒拉一次开放市场，对没见过的市场发"上线"告警。"""
     seen_ids = load_seen_markets(cfg.seen_markets_path)
-    # 没磁盘记录 = 全新部署。第一次只 seed，不要把现有几百个市场全推送。
+    # 没磁盘记录 = 全新部署。第一轮只 seed，不要把现有几百个市场全推送。
     bootstrap = not seen_ids
+    iteration = 0
+
+    await tg.send(
+        "🆕 <b>Predict 新市场监控已启动</b>\n"
+        f"检查间隔：<code>{cfg.new_markets_check_sec}s</code>\n"
+        + (
+            f"已记忆 <b>{len(seen_ids)}</b> 个市场，新上线即推送"
+            if seen_ids
+            else "首次启动，第一轮 seed 不告警"
+        ),
+        silent=True,
+    )
 
     while not stop.is_set():
+        iteration += 1
         try:
             markets = await predict.fetch_open_markets()
             current_ids = set(markets.keys())
 
-            new_ids = sorted(current_ids - seen_ids)
-
-            if bootstrap:
+            # 关键防御：API 临时返回 0 时不要把 seen 清空、也不要"伪 seed"，
+            # 否则下一轮恢复会把所有市场当成新市场刷屏。
+            if not current_ids:
+                LOG.warning(
+                    "[watch_new_markets] iter=%d: API 返回 0 个开放市场，本轮跳过", iteration
+                )
+            elif bootstrap:
                 LOG.info(
-                    "首次启动：seed %d 个已上线市场，不推送上线告警", len(current_ids)
+                    "[watch_new_markets] iter=%d: 首次 seed %d 个已开放市场（不推送）",
+                    iteration, len(current_ids),
                 )
                 seen_ids = current_ids
                 bootstrap = False
                 save_seen_markets(cfg.seen_markets_path, seen_ids)
-            elif new_ids:
-                LOG.info("发现 %d 个新市场", len(new_ids))
-                for mid in new_ids:
-                    await tg.send(format_new_market_alert(markets[mid], cfg))
-                seen_ids.update(new_ids)
-                save_seen_markets(cfg.seen_markets_path, seen_ids)
+            else:
+                new_ids = sorted(current_ids - seen_ids)
+                if new_ids:
+                    titles = [market_title_of(markets[mid]) for mid in new_ids[:5]]
+                    LOG.info(
+                        "[watch_new_markets] iter=%d: 发现 %d 个新市场，IDs=%s 标题样本=%s",
+                        iteration, len(new_ids), new_ids[:10], titles,
+                    )
+                    for mid in new_ids:
+                        await tg.send(format_new_market_alert(markets[mid], cfg))
+                    seen_ids.update(new_ids)
+                    save_seen_markets(cfg.seen_markets_path, seen_ids)
+                else:
+                    # 每 10 轮（~20min）汇报一次心跳，便于排查
+                    if iteration % 10 == 1:
+                        LOG.info(
+                            "[watch_new_markets] iter=%d: 本轮无新市场，已知 %d 个",
+                            iteration, len(seen_ids),
+                        )
 
         except Exception:
-            LOG.exception("新市场监控失败")
+            LOG.exception("[watch_new_markets] iter=%d: 失败", iteration)
 
         try:
             await asyncio.wait_for(stop.wait(), timeout=cfg.new_markets_check_sec)

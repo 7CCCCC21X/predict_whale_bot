@@ -63,8 +63,10 @@ class Config:
 
     poll_interval_sec: float
     matches_page_size: int
+    matches_max_pages: int
     alert_on_startup: bool
     max_seen_ids: int
+    seen_state_path: str
 
     market_refresh_sec: int
     orderbook_sub_batch: int
@@ -108,10 +110,15 @@ class Config:
             threshold_usdt=env_decimal("THRESHOLD_USDT", "1000"),
             usdt_wei_decimals=int(os.getenv("USDT_WEI_DECIMALS", "18")),
 
-            poll_interval_sec=float(os.getenv("POLL_INTERVAL_SEC", "8")),
-            matches_page_size=int(os.getenv("MATCHES_PAGE_SIZE", "30")),
-            alert_on_startup=env_bool("ALERT_ON_STARTUP", False),
+            poll_interval_sec=float(os.getenv("POLL_INTERVAL_SEC", "3")),
+            matches_page_size=int(os.getenv("MATCHES_PAGE_SIZE", "100")),
+            matches_max_pages=int(os.getenv("MATCHES_MAX_PAGES", "5")),
+            # 默认开：seen 持久化后，重启不会重复推送，所以 startup 告警是安全的。
+            # 真正的"首次空 seen"会有特殊路径，不会刷屏。
+            alert_on_startup=env_bool("ALERT_ON_STARTUP", True),
             max_seen_ids=int(os.getenv("MAX_SEEN_IDS", "10000")),
+            # Railway 容器重启会丢 /tmp，要真正持久化请挂 volume 到这个路径。
+            seen_state_path=os.getenv("SEEN_STATE_PATH", "/tmp/predict_seen.json").strip(),
 
             market_refresh_sec=int(os.getenv("MARKET_REFRESH_SEC", "300")),
             orderbook_sub_batch=int(os.getenv("ORDERBOOK_SUB_BATCH", "80")),
@@ -199,6 +206,39 @@ def short_addr(addr: Any) -> str:
     if len(s) <= 14:
         return s or "-"
     return f"{s[:6]}…{s[-6:]}"
+
+
+def load_seen(path: str, max_size: int) -> "OrderedDict[str, None]":
+    """从磁盘加载 seen ID 列表，重启后用来过滤已推送过的事件。"""
+    seen: "OrderedDict[str, None]" = OrderedDict()
+    if not path or not os.path.exists(path):
+        return seen
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            ids = json.load(f)
+        if not isinstance(ids, list):
+            LOG.warning("seen 状态文件格式异常 (%s)，忽略", path)
+            return seen
+        for eid in ids[-max_size:]:
+            seen[str(eid)] = None
+        LOG.info("已从 %s 加载 %d 条 seen", path, len(seen))
+    except Exception as exc:
+        LOG.warning("加载 seen 状态失败 (%s): %s", path, exc)
+    return seen
+
+
+def save_seen(path: str, seen: "OrderedDict[str, None]") -> None:
+    """原子写 seen 列表。失败只 log，不影响监控。"""
+    if not path:
+        return
+    tmp = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(seen.keys()), f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as exc:
+        LOG.warning("保存 seen 状态失败 (%s): %s", path, exc)
 
 
 def extract_tx_hash(event: Dict[str, Any]) -> str:
@@ -388,15 +428,53 @@ class Predict:
 
         return data
 
-    async def fetch_matches(self, threshold_wei: int) -> List[Dict[str, Any]]:
-        data = await self.get(
-            "/v1/orders/matches",
-            params={
-                "first": self.cfg.matches_page_size,
-                "minValueUsdtWei": str(threshold_wei),
-            },
-        )
-        return list(data.get("data") or data.get("matches") or [])
+    async def fetch_new_matches(
+        self,
+        seen_ids: Set[str],
+        page_size: int,
+        max_pages: int,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """
+        从最新往旧翻页拉取成交，遇到已 seen 的事件即停止。
+
+        不传 minValueUsdtWei：实测 Predict 这个参数是按"成交份额数"过滤的，
+        会把"低份额 × 高单价"的真大单（如 100 shares × $50 = $5000）一并丢掉。
+        因此服务端不过滤，全部交给客户端按 notional value 过滤。
+
+        返回 (按时间倒序排列的新事件, 是否翻满 max_pages 仍未追上)。
+        """
+        out: List[Dict[str, Any]] = []
+        after: Optional[str] = None
+
+        for _ in range(max(1, max_pages)):
+            params: Dict[str, Any] = {"first": page_size}
+            if after:
+                params["after"] = after
+
+            data = await self.get("/v1/orders/matches", params=params)
+            rows = list(data.get("data") or data.get("matches") or [])
+            if not rows:
+                return out, False
+
+            for ev in rows:
+                if stable_event_id(ev) in seen_ids:
+                    return out, False
+                out.append(ev)
+
+            # 不到一页说明已经到尽头
+            if len(rows) < page_size:
+                return out, False
+
+            page_info = data.get("pageInfo") or {}
+            after = (
+                data.get("cursor")
+                or data.get("nextCursor")
+                or page_info.get("endCursor")
+            )
+            if not after:
+                return out, False
+
+        return out, True
 
     async def fetch_open_markets(self) -> Dict[int, str]:
         """
@@ -896,7 +974,10 @@ async def monitor_matches(
     tg: Telegram,
     stop: asyncio.Event,
 ) -> None:
-    seen: "OrderedDict[str, None]" = OrderedDict()
+    seen: "OrderedDict[str, None]" = load_seen(cfg.seen_state_path, cfg.max_seen_ids)
+    # 从磁盘加载到了 seen，说明这是重启续跑（不是空白首次部署）。续跑场景下
+    # 历史事件已经在 seen 里了，"新事件"自然就是上次保存之后才发生的，可以直接告警。
+    resumed_from_disk = bool(seen)
     startup = True
 
     await tg.send(
@@ -910,36 +991,54 @@ async def monitor_matches(
 
     while not stop.is_set():
         try:
-            events = await predict.fetch_matches(state.threshold_usdt_wei)
+            # 首次启动且 seen 为空时，只拉一页 seed，避免 fetch_new_matches 因为
+            # 没有"已知"事件而连翻 max_pages 把全站历史都拉下来。
+            max_pages = 1 if (startup and not resumed_from_disk) else cfg.matches_max_pages
 
-            # 客户端兜底：阈值是"成交价值"（USDT notional），不是份额数量。
-            # 即便 API 漏过了低价值事件，也会被这里过滤掉。
+            events, hit_max = await predict.fetch_new_matches(
+                seen_ids=set(seen.keys()),
+                page_size=cfg.matches_page_size,
+                max_pages=max_pages,
+            )
+
+            if hit_max:
+                LOG.warning(
+                    "fetch_new_matches 翻满 %d 页仍未追上 seen — "
+                    "成交速率高于轮询能力，考虑减小 POLL_INTERVAL_SEC 或增大 MATCHES_MAX_PAGES",
+                    max_pages,
+                )
+
+            # 客户端按 notional value 过滤（API 不靠谱，见 fetch_new_matches 注释）。
             threshold = state.threshold_usdt
             events = [ev for ev in events if event_value_usdt(ev, cfg) >= threshold]
 
             fresh: List[Dict[str, Any]] = []
-
             for ev in events:
                 eid = stable_event_id(ev)
-
                 if eid in seen:
                     continue
-
                 seen[eid] = None
                 fresh.append(ev)
 
             while len(seen) > cfg.max_seen_ids:
                 seen.popitem(last=False)
 
-            if startup and not cfg.alert_on_startup:
-                LOG.info("启动时已记录 %d 条历史成交，不发送历史告警", len(fresh))
-                startup = False
-            else:
-                startup = False
+            should_alert = resumed_from_disk or not startup or cfg.alert_on_startup
 
+            if fresh and not should_alert:
+                LOG.info(
+                    "首次启动且未启用 ALERT_ON_STARTUP，已记录 %d 条历史成交不告警",
+                    len(fresh),
+                )
+            elif fresh:
                 # 接口通常按 executedAt DESC 排序，反转后按时间先后发送。
                 for ev in reversed(fresh):
                     await tg.send(format_match_alert(ev, cfg))
+
+            startup = False
+
+            if fresh:
+                save_seen(cfg.seen_state_path, seen)
 
         except Exception as exc:
             LOG.exception("监控成交大单出错")

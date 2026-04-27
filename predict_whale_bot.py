@@ -1362,11 +1362,26 @@ def _render_template(template: str, **kwargs: Any) -> str:
         return ""
 
 
-def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
+def format_match_alert(
+    event: Dict[str, Any], cfg: Config
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """
+    巨鲸提醒风格的成交告警。返回 (text, reply_markup)。
+
+    设计目标：一眼看清"谁在哪里以多少价格做了什么"，省略 Market ID / 手续费 /
+    完整时间戳 / Tx hash 等次要信息（这些通过底部按钮跳到 predict.fun 和钱包
+    主页就能查到）。
+    """
     market = event.get("market") or {}
-    taker = event.get("taker") or {}
-    outcome = taker.get("outcome") or event.get("outcome") or {}
-    fee = taker.get("fee") or event.get("fee") or {}
+    taker = event.get("taker") if isinstance(event.get("taker"), dict) else {}
+
+    outcome_raw = taker.get("outcome") or event.get("outcome")
+    if isinstance(outcome_raw, dict):
+        outcome_name = str(outcome_raw.get("name") or "-")
+    elif outcome_raw:
+        outcome_name = str(outcome_raw)
+    else:
+        outcome_name = "-"
 
     raw_title = (
         market.get("title")
@@ -1377,83 +1392,79 @@ def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
     )
     mid = market.get("id") or event.get("marketId")
     mid_str = str(mid) if mid is not None else ""
-    # categorySlug 在 Predict 的实际响应里通常就是市场专属 slug（例如
-    # "bitcoin-up-or-down-april-26-2026-8pm-et"），故作为兜底。
     slug = (
         market.get("slug")
         or market.get("urlSlug")
         or market.get("categorySlug")
         or ""
     )
-
-    # 标题缺失时不再显示 "-"，回退到 Market #<id>，确保"成交的市场"始终可见。
     if not raw_title:
         raw_title = f"Market #{mid_str}" if mid_str else "Unknown market"
-
-    category = market.get("categorySlug") or market.get("category") or "-"
 
     amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.shares_wei_decimals)
     price = to_decimal(event.get("priceExecuted") or taker.get("price"), cfg.usdt_wei_decimals)
     notional = event_value_usdt(event, cfg)
 
-    fee_amount = to_decimal(fee.get("amount"), cfg.shares_wei_decimals)
-    signer = extract_signer(event) or "-"
-    username = extract_username(event)
-    makers = event.get("makers") or []
-    tx = extract_tx_hash(event)
-    executed_at = event.get("executedAt") or event.get("createdAt") or "-"
+    # 方向：Ask = 卖出（红），Bid = 买入（绿）
+    quote_type = str(taker.get("quoteType") or event.get("quoteType") or "").strip().lower()
+    if quote_type in {"bid", "buy"}:
+        action_label = "买入"
+        action_emoji = "🟢"
+    elif quote_type in {"ask", "sell"}:
+        action_label = "卖出"
+        action_emoji = "🔴"
+    else:
+        action_label = "成交"
+        action_emoji = "⚪"
+
+    signer = extract_signer(event) or ""
+    username_raw = extract_username(event)
+    # 没有 username 就用截短地址；都没有则匿名
+    if not username_raw:
+        username_raw = short_addr(signer) if signer else "匿名钱包"
+
+    market_link = _render_template(cfg.market_url_template, id=mid_str, slug=slug, title=raw_title)
+    user_link = (
+        _render_template(cfg.user_url_template, address=signer, username=username_raw)
+        if signer
+        else ""
+    )
 
     title_safe = normalize_text(raw_title)
-    market_link = _render_template(cfg.market_url_template, id=mid_str, slug=slug, title=raw_title)
-    if market_link:
-        title_html = f'<a href="{html.escape(market_link, quote=True)}">{title_safe}</a>'
-    else:
-        title_html = title_safe
+    outcome_safe = normalize_text(outcome_name)
+    username_safe = normalize_text(username_raw)
 
-    # Taker 显示：优先用户名，否则截短地址。一律链接到模板（默认 BscScan 地址页）。
-    taker_label = normalize_text(username) if username else html.escape(short_addr(signer))
-    user_link = _render_template(
-        cfg.user_url_template, address=signer if signer != "-" else "", username=username
-    )
-    if user_link:
-        taker_html = f'<a href="{html.escape(user_link, quote=True)}">{taker_label}</a>'
-    else:
-        taker_html = taker_label
+    # 价格按 image 1 风格用美分（× 100），主体金额保持 USD 美元
+    price_cents = price * Decimal("100")
 
     lines = [
-        "🚨 <b>Predict 成交大单</b>",
-        f"市场：<b>{title_html}</b>",
+        "🐳 <b>巨鲸提醒</b>",
+        "",
+        f"<b>{username_safe}</b> 进行了一笔交易：",
+        "",
+        f"📊 <b>{title_safe}</b> — <b>{outcome_safe}</b>",
+        "",
+        (
+            f"{action_emoji} <b>{action_label}</b> "
+            f"${fmt_decimal(notional, 2)} @ {fmt_decimal(price_cents, 1)}¢ · "
+            f"{fmt_decimal(amount, 1)} 股"
+        ),
     ]
 
-    # 成交价值最重要，紧跟市场显示。
-    if notional > 0:
-        lines.append(f"成交价值：<b>${fmt_decimal(notional, 2)} USDT</b>")
-    else:
-        lines.append("成交价值：<b>-</b>")
+    text = "\n".join(lines)
 
-    lines.extend(
-        [
-            f"Market ID：<code>{html.escape(mid_str or '-')}</code> ｜ 分类：<code>{html.escape(str(category))}</code>",
-            f"Taker：{taker_html} <code>{html.escape(short_addr(signer))}</code> ｜ Makers：<code>{len(makers)}</code>",
-            f"方向字段：<code>{html.escape(str(taker.get('quoteType', event.get('quoteType', '-'))))}</code> ｜ Outcome：<b>{normalize_text(outcome.get('name') if isinstance(outcome, dict) else outcome)}</b>",
-            f"份额数量：<code>{fmt_decimal(amount, 4)}</code> ｜ 价格：<code>{fmt_decimal(price, 6)}</code>",
-            f"手续费：<code>{fmt_decimal(fee_amount, 6)}</code> <code>{html.escape(str(fee.get('type') or ''))}</code>",
-            f"时间：<code>{html.escape(str(executed_at))}</code>",
-        ]
+    # 底部 inline 按钮：查看市场 + 查看钱包
+    button_row: List[Dict[str, str]] = []
+    if market_link:
+        button_row.append({"text": "📊 查看市场", "url": market_link})
+    if user_link:
+        button_row.append({"text": "👤 查看钱包", "url": user_link})
+
+    markup: Optional[Dict[str, Any]] = (
+        {"inline_keyboard": [button_row]} if button_row else None
     )
 
-    if tx:
-        tx_url = _render_template(cfg.tx_url_template, hash=tx)
-        if tx_url:
-            lines.append(
-                f'Tx：<a href="{html.escape(tx_url, quote=True)}"><code>{html.escape(tx)}</code></a>'
-            )
-        else:
-            lines.append(f"Tx：<code>{html.escape(tx)}</code>")
-    else:
-        lines.append("Tx：<code>-</code>")
-
-    return "\n".join(lines)
+    return text, markup
 
 
 def format_new_market_alert(market: Dict[str, Any], cfg: Config) -> str:
@@ -1644,7 +1655,8 @@ async def monitor_matches(
             elif fresh:
                 # 接口通常按 executedAt DESC 排序，反转后按时间先后发送。
                 for ev in reversed(fresh):
-                    await tg.send(format_match_alert(ev, cfg))
+                    text, markup = format_match_alert(ev, cfg)
+                    await tg.send(text, reply_markup=markup)
 
             startup = False
 

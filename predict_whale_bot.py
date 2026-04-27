@@ -587,6 +587,26 @@ def fmt_money(x: Decimal) -> str:
     return f"${fmt_decimal(x, 2)}"
 
 
+def fmt_money_full(x: Decimal) -> str:
+    """钱的精确格式（带千分位 + 固定 2 位小数）：$1,948.00 / $480.97。
+    巨鲸卡片用，跟 flamy.gg 风格一致。"""
+    if x <= 0:
+        return "-"
+    q = x.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    return f"${q:,.2f}"
+
+
+def fmt_qty(x: Decimal) -> str:
+    """股数自适应：整数则无小数（2,000），有小数则保留 2 位（484.36）。
+    带千分位。"""
+    if x <= 0:
+        return "0"
+    integer_part = x.to_integral_value(rounding=ROUND_DOWN)
+    if x == integer_part:
+        return f"{int(integer_part):,}"
+    return f"{x.quantize(Decimal('0.01'), rounding=ROUND_DOWN):,.2f}"
+
+
 def fmt_compact_qty(x: Decimal) -> str:
     """股数紧凑展示：529 → "529"，3,624 → "3.6K"，1,200,000 → "1.2M"。"""
     n = abs(x)
@@ -867,7 +887,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "shares": "股",
         "view_market": "📊 查看市场",
         "view_wallet": "👤 查看钱包",
-        "view_tx": "🔗 查看交易",
+        "view_tx": "🔗 交易哈希",
         "anon_wallet": "匿名钱包",
         "match_started": "✅ <b>Predict 成交大单监控已启动</b>",
         "newm_started": "🆕 <b>Predict 新市场监控已启动</b>",
@@ -957,7 +977,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "shares": "shares",
         "view_market": "📊 Market",
         "view_wallet": "👤 Wallet",
-        "view_tx": "🔗 Tx",
+        "view_tx": "🔗 Tx Hash",
         "anon_wallet": "Anon wallet",
         "match_started": "✅ <b>Predict match monitor started</b>",
         "newm_started": "🆕 <b>Predict new-market watcher started</b>",
@@ -2548,17 +2568,18 @@ def format_match_alert(
     cumulative: int = 0,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """
-    成交大单告警。卡片式布局：
-        🔴 $12,480 成交 ｜ YES @ 62.0¢
-        Lakers vs Warriors
+    flamy.gg 风格的巨鲸告警卡片，紧凑：
 
-        方向：BUY YES
-        数量：20,129 shares
-        价格：62.0¢
-        交易者：0x1234…abcd
-        时间：2026-04-27 16:42:31 UTC
+        🐳 <b>巨鲸提醒</b>
+        <b>ioup</b> 进行了一笔交易：
 
-    标题 emoji 按金额分级。底部按钮：查看市场 / 查看钱包 / 查看交易。
+        📊 <b>La Liga Winner</b>
+        Real Madrid — No
+
+        🟢 <b>买入 $480.97 @ 99.3¢</b> · 484.36 股
+        <i>20:14:15 · 延迟 1.4s</i>
+
+    底部按钮：查看市场 / 查看钱包。
     """
     market = event.get("market") or {}
     taker = event.get("taker") if isinstance(event.get("taker"), dict) else {}
@@ -2589,30 +2610,65 @@ def format_match_alert(
     if not raw_title:
         raw_title = f"Market #{mid_str}" if mid_str else "Unknown market"
 
-    # 标题逻辑：title 信息量足够 → 单行；title 太短/全是符号（如 "↓ 30,000" /
-    # "$4B"）→ 加 slug 转的"父问题"作为上下文
-    title_safe = normalize_text(raw_title)
-    title_letters = sum(1 for c in raw_title if c.isalpha())
-    informative = len(raw_title) >= 12 and title_letters >= 4
-    if informative:
-        market_line = f"<b>{title_safe}</b>"
-    else:
-        parent = slug_to_label(slug)
-        norm_title = re.sub(r"[\s\-_]+", "", raw_title.lower())
-        norm_parent = re.sub(r"[\s\-_]+", "", parent.lower()) if parent else ""
-        if parent and norm_parent != norm_title:
-            market_line = (
-                f"<b>{normalize_text(parent)}</b>\n"
-                f"<i>{title_safe}</i>"
-            )
+    # 父市场推断：slug 转标题，再把尾部的 raw_title 切掉。
+    # 例：slug=la-liga-winner-real-madrid + title=Real Madrid → parent=La Liga Winner
+    # 单结果市场（slug 整个就是 title）→ 不显示父，直接显示 title。
+    parent_full = slug_to_label(slug)
+    parent_clean = ""
+    if parent_full and raw_title:
+        # 词级正则切尾
+        m = re.search(
+            r"\s+" + re.escape(raw_title) + r"$", parent_full, re.IGNORECASE
+        )
+        if m:
+            parent_clean = parent_full[: m.start()].rstrip()
         else:
-            market_line = f"<b>{title_safe}</b>"
+            # norm 比较：去掉所有标点空格后字符相同 = 同一个市场
+            def _norm(s: str) -> str:
+                return re.sub(r"[^0-9a-z]", "", s.lower())
+            norm_p, norm_t = _norm(parent_full), _norm(raw_title)
+            if norm_p and norm_p == norm_t:
+                parent_clean = ""  # 单结果市场，title 已完整
+            elif norm_p and norm_t and norm_p.endswith(norm_t):
+                # 字符层匹配但词层正则没匹上（标点不同）。按 norm_t 长度反推切点。
+                cut = len(parent_full)
+                acc = 0
+                # 从右往左累计 alnum 字符直到等于 norm_t 长度，记录下切点
+                for i in range(len(parent_full) - 1, -1, -1):
+                    if parent_full[i].isalnum():
+                        acc += 1
+                    if acc >= len(norm_t):
+                        cut = i
+                        break
+                parent_clean = parent_full[:cut].rstrip(" -_")
+            else:
+                parent_clean = parent_full
+    elif parent_full:
+        parent_clean = parent_full
+
+    # 市场两行：父市场（粗体） + 子标题（outcome 或 raw_title — outcome）
+    title_safe = normalize_text(raw_title)
+    outcome_safe = normalize_text(outcome_name)
+    has_outcome = outcome_name and outcome_name != "-"
+    if parent_clean:
+        market_top = f"📊 <b>{normalize_text(parent_clean)}</b>"
+        if has_outcome:
+            market_sub = f"{title_safe} — {outcome_safe}"
+        else:
+            market_sub = title_safe
+        market_block = f"{market_top}\n{market_sub}"
+    else:
+        market_top = f"📊 <b>{title_safe}</b>"
+        if has_outcome:
+            market_block = f"{market_top}\n{outcome_safe}"
+        else:
+            market_block = market_top
 
     amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.shares_wei_decimals)
     notional = event_value_usdt(event, cfg)
     price = event_price_usdt(event, notional, amount)
 
-    # 方向：Ask = SELL，Bid = BUY
+    # 方向：Ask = SELL → 红，Bid = BUY → 绿
     quote_type = str(taker.get("quoteType") or event.get("quoteType") or "").strip().lower()
     if quote_type in {"bid", "buy"}:
         action_key = "buy"
@@ -2621,17 +2677,18 @@ def format_match_alert(
     else:
         action_key = "trade"
     action_label = t(state, action_key)
+    dir_emoji = "🟢" if action_key == "buy" else "🔴" if action_key == "sell" else "⚪️"
 
     signer = extract_signer(event) or ""
     username_raw = extract_username(event)
     short = short_addr(signer) if signer else ""
-    # 用户别名 > 链上 username > 短地址。
+    # 用户别名 > 链上 username > 短地址
     label = state.address_labels.get(signer.lower()) if signer else ""
-    display_name = label or username_raw
+    display_name = (label or username_raw or "").strip()
+    if not display_name and short:
+        display_name = short
 
-    fee = event_fee_usdt(event, cfg)
     tx = extract_tx_hash(event)
-
     market_link = _render_template(cfg.market_url_template, id=mid_str, slug=slug, title=raw_title)
     user_link = (
         _render_template(cfg.user_url_template, address=signer, username=username_raw)
@@ -2640,79 +2697,48 @@ def format_match_alert(
     )
     tx_link = _render_template(cfg.tx_url_template, hash=tx) if tx else ""
 
-    # ---- 第一行：方向色点 + 金额 + outcome + 价格 ----
-    # 🟢 = 买入，🔴 = 卖出，⚪️ = 未知方向。size-tier emoji 改放在金额前不显眼了，
-    # 用户更关心买/卖方向（红/绿）一眼可辨，跟交易软件一致
-    dir_emoji = "🟢" if action_key == "buy" else "🔴" if action_key == "sell" else "⚪️"
-    price_cents = price * Decimal("100")
-    notional_str = fmt_money(notional)
-    price_str = f"{fmt_decimal(price_cents, 1)}¢" if price > 0 else "-"
-    outcome_safe = normalize_text(outcome_name)
-
-    title_line = (
-        f"{dir_emoji} <b>{notional_str} {t(state, 'card_traded')}</b>"
-        f" ｜ {outcome_safe} @ {price_str}"
-    )
-
-    # ---- 卡片正文：方向 / 数量 / 价格 / 交易者 / 时间 ----
-    side_line = f"{t(state, 'card_side')}：<b>{action_label} {outcome_safe}</b>"
-    amount_line = (
-        f"{t(state, 'card_amount')}：<code>{fmt_decimal(amount, 0)}</code>"
-        f" {t(state, 'shares')}"
-    )
-    price_body_line = f"{t(state, 'card_price')}：<code>{price_str}</code>"
-
-    # 交易者：用户别名 > username > 短地址；任意一种情况下都包成可点 portfolio 链接
-    if display_name and display_name != short:
-        name_clean = display_name.strip()
-        # ASCII handle 才补 @ 前缀；中文/空格名（"巨鲸 A"、"Péter Magyar"）保留原样
-        is_handle = bool(re.fullmatch(r"[A-Za-z0-9_.\-]{2,}", name_clean))
-        if is_handle and not name_clean.startswith("@"):
-            name_clean = "@" + name_clean
-        name_html = f"<b>{normalize_text(name_clean)}</b>"
+    # ---- 抬头：交易者名称（点开钱包链接） + 「进行了一笔交易：」 ----
+    if display_name:
+        name_html = f"<b>{normalize_text(display_name)}</b>"
         if user_link:
             name_html = (
                 f'<a href="{html.escape(user_link, quote=True)}">{name_html}</a>'
             )
-        if short:
-            trader_html = f"{name_html} · <code>{html.escape(short)}</code>"
-        else:
-            trader_html = name_html
-    elif short:
-        code_html = f"<code>{html.escape(short)}</code>"
-        if user_link:
-            code_html = f'<a href="{html.escape(user_link, quote=True)}">{code_html}</a>'
-        trader_html = code_html
     else:
-        trader_html = t(state, "card_anon_wallet")
-    trader_line = f"{t(state, 'card_trader')}：{trader_html}"
+        name_html = f"<b>{t(state, 'card_anon_wallet')}</b>"
+    subject_line = f"{name_html} {t(state, 'made_trade')}"
 
-    # 时间：全日期 + DISPLAY_TZ + UTC offset 后缀 + 延迟。延迟 = now - executedAt。
+    # ---- 动作行：方向色点 + 动作 + 金额 + 价格 + 数量 ----
+    notional_str = fmt_money_full(notional)
+    price_cents = price * Decimal("100")
+    price_str = f"{fmt_decimal(price_cents, 1)}¢" if price > 0 else "-"
+    qty_str = fmt_qty(amount)
+    action_line = (
+        f"{dir_emoji} <b>{action_label} {notional_str} @ {price_str}</b>"
+        f" · {qty_str} {t(state, 'shares')}"
+    )
+
+    # ---- Footer：本地时间 + 延迟（小字斜体，不抢戏）----
     tzinfo, _tz_label = get_display_tz(cfg.display_tz)
     ts_dt = parse_iso_ts(event.get("executedAt") or event.get("createdAt"))
     if ts_dt is None:
         ts_dt = datetime.now(timezone.utc)
     local_dt = ts_dt.astimezone(tzinfo)
-    offset = local_dt.utcoffset() or timedelta(0)
-    total_minutes = int(offset.total_seconds() / 60)
-    if total_minutes == 0:
-        tz_suffix = "UTC"
-    else:
-        sign = "+" if total_minutes > 0 else "-"
-        hours, mins = divmod(abs(total_minutes), 60)
-        tz_suffix = f"UTC{sign}{hours}" + (f":{mins:02d}" if mins else "")
-    ts_str = local_dt.strftime("%Y-%m-%d %H:%M:%S") + " " + tz_suffix
     delay_secs = max(0.0, (datetime.now(timezone.utc) - ts_dt).total_seconds())
     delay_str = t(state, "card_delay_fmt").format(n=f"{delay_secs:.1f}")
-    time_line = (
-        f"{t(state, 'card_time')}：<code>{html.escape(ts_str)}</code>"
-        f" · {delay_str}"
-    )
+    footer = f"<i>{local_dt.strftime('%H:%M:%S')} · {delay_str}</i>"
 
-    body_lines = [side_line, amount_line, price_body_line, trader_line, time_line]
-    text = "\n".join([title_line, market_line, ""] + body_lines)
+    text = "\n".join([
+        t(state, "whale_title"),
+        subject_line,
+        "",
+        market_block,
+        "",
+        action_line,
+        footer,
+    ])
 
-    # ---- 按钮：单行三连（查看市场 / 查看钱包 / 查看交易），保持原版布局 ----
+    # 三个按钮：市场 / 钱包 / 交易哈希
     buttons: List[Dict[str, str]] = []
     if market_link:
         buttons.append({"text": t(state, "view_market"), "url": market_link})

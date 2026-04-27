@@ -133,10 +133,12 @@ class Config:
             # 实测是 18 位小数（份额 × 1e18），跟 USDT 一样。
             shares_wei_decimals=int(os.getenv("SHARES_WEI_DECIMALS", "18")),
 
-            # 0.5s 轮询：参考 Predict API 通用限速（~10 req/s），matches 单端
-            # 占 2 req/s + 新市场 ~0.03 req/s + 翻页保险 ~1 req/s 仍在容忍内。
-            # 端到端检测延迟中位数 ~0.5s。被限流时 get() 会自动退避并重试。
-            poll_interval_sec=float(os.getenv("POLL_INTERVAL_SEC", "0.5")),
+            # 0.4s 轮询。Predict 官方限速 240 req/min = 4 RPS。
+            # 0.4s × matches = 2.5 RPS = 150/min（占预算 63%）。
+            # 剩 90/min 给：新市场（2/min）+ 翻页保险（fetch_new_matches 遇 seen
+            # 就停，正常 1 页/轮）+ 偶发 /summary。429 时 get() 自动退避 + 重试。
+            # 想进一步压可以 0.3（83%）但翻页冲突会更易触发 429。
+            poll_interval_sec=float(os.getenv("POLL_INTERVAL_SEC", "0.4")),
             matches_page_size=int(os.getenv("MATCHES_PAGE_SIZE", "100")),
             matches_max_pages=int(os.getenv("MATCHES_MAX_PAGES", "5")),
             # 默认开：seen 持久化后，重启不会重复推送，所以 startup 告警是安全的。
@@ -958,15 +960,39 @@ class Telegram:
 
 
 class Predict:
+    # Predict 官方限速：240 req/min = 4 RPS（mainnet 默认 / testnet）
+    RATE_LIMIT_PER_MIN = 240
+
     def __init__(self, cfg: Config, client: httpx.AsyncClient) -> None:
         self.cfg = cfg
         self.client = client
+        # 滑动窗口：API 请求时间戳，用来周期性报实际 req/min
+        self._request_log: List[float] = []
+        self._rate_log_last = 0.0
 
     @property
     def headers(self) -> Dict[str, str]:
         if self.cfg.predict_api_key:
             return {"x-api-key": self.cfg.predict_api_key}
         return {}
+
+    def _record_request(self) -> None:
+        """记录一次 API 调用，每 5 分钟把窗口内总数 + 平均 RPS 写一条日志。"""
+        import time as _time
+        now = _time.monotonic()
+        self._request_log.append(now)
+        # 只保留最近 60 秒
+        cutoff = now - 60
+        self._request_log = [t for t in self._request_log if t >= cutoff]
+        # 每 300 秒报一次
+        if now - self._rate_log_last >= 300:
+            self._rate_log_last = now
+            count_60s = len(self._request_log)
+            pct = count_60s * 100 // self.RATE_LIMIT_PER_MIN
+            LOG.info(
+                "[predict-api] 最近 60s = %d 次调用（限速 %d/min，占用 %d%%）",
+                count_60s, self.RATE_LIMIT_PER_MIN, pct,
+            )
 
     async def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
@@ -980,6 +1006,7 @@ class Predict:
         url = f"{self.cfg.predict_api_base}{path}"
         last_exc: Optional[BaseException] = None
         max_attempts = max(1, self.cfg.api_max_retries)
+        self._record_request()
 
         for attempt in range(max_attempts):
             try:

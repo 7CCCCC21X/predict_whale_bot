@@ -122,10 +122,13 @@ class Config:
 
             request_timeout_sec=float(os.getenv("REQUEST_TIMEOUT_SEC", "12")),
 
-            # 可选：用 {id} / {slug} 拼成市场详情链接，例如 https://predict.fun/markets/{slug}
-            market_url_template=os.getenv("MARKET_URL_TEMPLATE", "").strip(),
-            # 可选：链上浏览器，例如 https://basescan.org/tx/{hash}
-            tx_url_template=os.getenv("TX_URL_TEMPLATE", "").strip(),
+            # 默认按 predict.fun 前端 + BNB Chain 浏览器拼接，覆盖默认即可换链或换路径。
+            market_url_template=os.getenv(
+                "MARKET_URL_TEMPLATE", "https://predict.fun/event/{slug}"
+            ).strip(),
+            tx_url_template=os.getenv(
+                "TX_URL_TEMPLATE", "https://bscscan.com/tx/{hash}"
+            ).strip(),
         )
 
 
@@ -787,11 +790,18 @@ def event_value_usdt(event: Dict[str, Any], cfg: Config) -> Decimal:
 
 
 def _render_template(template: str, **kwargs: Any) -> str:
-    """安全的字符串模板渲染：缺字段或异常时返回空串。"""
+    """
+    安全的字符串模板渲染：
+    - 模板里出现的占位符必须有非空值，否则返回空串（避免拼出 .../event/ 这种半截链接）
+    - 异常一律返回空串
+    """
     if not template:
         return ""
+    for key, value in kwargs.items():
+        if ("{" + key + "}") in template and not str(value):
+            return ""
     try:
-        return template.format(**kwargs)
+        return template.format(**{k: str(v) for k, v in kwargs.items()})
     except Exception:
         return ""
 
@@ -811,7 +821,14 @@ def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
     )
     mid = market.get("id") or event.get("marketId")
     mid_str = str(mid) if mid is not None else ""
-    slug = market.get("slug") or market.get("urlSlug") or ""
+    # categorySlug 在 Predict 的实际响应里通常就是市场专属 slug（例如
+    # "bitcoin-up-or-down-april-26-2026-8pm-et"），故作为兜底。
+    slug = (
+        market.get("slug")
+        or market.get("urlSlug")
+        or market.get("categorySlug")
+        or ""
+    )
 
     # 标题缺失时不再显示 "-"，回退到 Market #<id>，确保"成交的市场"始终可见。
     if not raw_title:

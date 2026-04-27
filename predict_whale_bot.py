@@ -104,6 +104,12 @@ class Config:
     # 没设或解析失败默认 UTC。Telegram 自带消息时间戳，这里只显示 HH:MM:SS。
     display_tz: str
 
+    # 标题中文化：开关 + 翻译缓存路径 + Anthropic API key（Stage 2 用）。
+    # 默认开 = 内置词典即时生效；没 API key 就只用词典，0 配置可跑。
+    translation_enabled: bool
+    market_translations_path: str
+    anthropic_api_key: str
+
     @property
     def threshold_usdt_wei(self) -> int:
         scale = Decimal(10) ** self.usdt_wei_decimals
@@ -181,6 +187,12 @@ class Config:
             # 默认走上海时区（用户在国内）。海外用户可设 DISPLAY_TZ=America/New_York
             # 等任意 IANA 名；解析失败 get_display_tz 会 fallback 到 UTC + 写 warning。
             display_tz=(os.getenv("DISPLAY_TZ") or "Asia/Shanghai").strip() or "Asia/Shanghai",
+
+            translation_enabled=env_bool("TRANSLATION_ENABLED", True),
+            market_translations_path=os.getenv(
+                "MARKET_TRANSLATIONS_PATH", "/data/market_translations.json"
+            ).strip(),
+            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),
         )
 
 
@@ -293,6 +305,36 @@ class RuntimeState:
             "top_markets": top,
             "window_seconds": window_seconds,
         }
+
+    def count_signer_alerts(self, signer: str, hours: int = 1) -> int:
+        """近 N 小时内该 signer 触发过几次告警（含当前这笔，所以 +1）。
+        当前这笔在 format_match_alert 渲染时还没 add_match_for_summary，所以补 1。"""
+        if not signer:
+            return 0
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        sig_lower = signer.lower()
+        n = sum(
+            1 for m in self.recent_matches
+            if m["ts"] >= cutoff and str(m.get("signer", "")).lower() == sig_lower
+        )
+        return n + 1
+
+    def count_market_alerts(
+        self, slug: str = "", market_id: str = "", hours: int = 1
+    ) -> int:
+        """近 N 小时该 market 触发过几次告警。优先用 slug 比对，缺 slug 用 market_id。"""
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        slug_lower = (slug or "").lower()
+        mid_str = str(market_id or "")
+        n = 0
+        for m in self.recent_matches:
+            if m["ts"] < cutoff:
+                continue
+            if slug_lower and str(m.get("slug", "")).lower() == slug_lower:
+                n += 1
+            elif not slug_lower and mid_str and str(m.get("mid", "")) == mid_str:
+                n += 1
+        return n + 1
 
     @property
     def threshold_usdt_wei(self) -> int:
@@ -832,6 +874,131 @@ def normalize_text(s: Any, limit: int = 180) -> str:
     return html.escape(text)
 
 
+# 内置高频市场名 → 中文。覆盖最常见的市场分类，命中率 >70%。
+# 长尾未命中时，MarketTranslator 会回退原文，并交给后台 Claude API worker 翻译。
+# Key 全部小写匹配；值是已翻译的中文。
+BUILTIN_MARKET_DICT_ZH: Dict[str, str] = {
+    # 通用 outcome 词
+    "yes": "是",
+    "no": "否",
+    "up": "涨",
+    "down": "跌",
+    "other": "其它",
+    "true": "是",
+    "false": "否",
+    "win": "赢",
+    "lose": "输",
+    # 体育联赛
+    "la liga winner": "西甲冠军",
+    "english premier league winner": "英超冠军",
+    "premier league winner": "英超冠军",
+    "champions league winner": "欧冠冠军",
+    "world cup winner": "世界杯冠军",
+    "fifa world cup winner": "世界杯冠军",
+    "2026 fifa world cup winner": "2026 世界杯冠军",
+    "euros winner": "欧洲杯冠军",
+    "serie a winner": "意甲冠军",
+    "bundesliga winner": "德甲冠军",
+    "ligue 1 winner": "法甲冠军",
+    "match winner": "比赛获胜者",
+    "nba champion": "NBA 总冠军",
+    "nfl champion": "NFL 总冠军",
+    "super bowl winner": "超级碗冠军",
+    "stanley cup winner": "斯坦利杯冠军",
+    "world series winner": "世界大赛冠军",
+    # 加密 / 金融
+    "bitcoin up or down": "比特币涨跌",
+    "ethereum up or down": "以太坊涨跌",
+    "fed rate cuts": "美联储降息",
+    "fed rate hike": "美联储加息",
+    "recession": "经济衰退",
+    "inflation": "通胀",
+    # 政治
+    "presidential election": "总统大选",
+    "us presidential election": "美国大选",
+    "election winner": "选举获胜者",
+}
+
+
+class MarketTranslator:
+    """市场标题/outcome 翻译器。
+
+    设计原则：
+    - 热路径（`format_match_alert`）只查内存 dict，永远不阻塞。
+    - 优先级：disk cache > 内置高频词典 > 原文。
+    - Stage 1（本提交）：纯内置词典 + disk 持久化（cache 由人工 / 未来 worker 写入）。
+    - Stage 2（待加）：后台 worker 用 Claude Haiku 4.5 批量翻译长尾市场名，
+      结果写回内存 dict 和 disk cache。
+    """
+
+    def __init__(self, cache_path: str = "") -> None:
+        self.cache_path = cache_path
+        self._dict_zh: Dict[str, str] = dict(BUILTIN_MARKET_DICT_ZH)
+        self._load_disk_cache()
+
+    def _load_disk_cache(self) -> None:
+        if not self.cache_path or not os.path.exists(self.cache_path):
+            return
+        try:
+            with open(self.cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            zh = data.get("zh") if isinstance(data, dict) else None
+            if isinstance(zh, dict):
+                # disk cache 覆盖内置词典（用户手工修正可能更准）
+                for k, v in zh.items():
+                    if k and v:
+                        self._dict_zh[str(k).lower()] = str(v)
+                LOG.info(
+                    "[translator] 已加载 %d 条 disk 翻译缓存（自 %s）",
+                    len(zh), self.cache_path,
+                )
+        except Exception as exc:
+            LOG.warning("[translator] 加载缓存失败 (%s): %s", self.cache_path, exc)
+
+    def _save_disk_cache(self) -> None:
+        if not self.cache_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.cache_path) or ".", exist_ok=True)
+            tmp = f"{self.cache_path}.tmp"
+            # 只把"非内置"部分（即新学到的）写盘，避免下次重载时覆盖未来的词典升级
+            learned = {
+                k: v for k, v in self._dict_zh.items()
+                if BUILTIN_MARKET_DICT_ZH.get(k) != v
+            }
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"zh": learned}, f, ensure_ascii=False)
+            os.replace(tmp, self.cache_path)
+        except Exception as exc:
+            LOG.warning("[translator] 保存缓存失败 (%s): %s", self.cache_path, exc)
+
+    def translate(self, text: str, lang: str) -> str:
+        """查 dict；命中返回译文，未命中返回原文。lang != "zh" 直接原文。"""
+        if not text or lang != "zh":
+            return text
+        key = text.strip().lower()
+        return self._dict_zh.get(key, text)
+
+    def learn(self, text_en: str, text_zh: str) -> None:
+        """运行期添加新翻译（Stage 2 后台 worker 用）。立即生效，定期写盘。"""
+        if not text_en or not text_zh:
+            return
+        self._dict_zh[text_en.strip().lower()] = text_zh.strip()
+
+
+# 全局单例。main() 启动时初始化，format_match_alert 直接调。
+# 在没初始化前用 _NoopTranslator 作 stub，避免 None 检查。
+class _NoopTranslator:
+    def translate(self, text: str, lang: str) -> str:
+        return text
+
+    def learn(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+
+TRANSLATOR: Any = _NoopTranslator()
+
+
 TRANSLATIONS: Dict[str, Dict[str, str]] = {
     "zh": {
         "whale_title": "🐳 <b>巨鲸提醒</b>",
@@ -881,6 +1048,9 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "signal_bearish": "看空",
         "card_delay_fmt": "延迟 {n}s",
         "card_anon_wallet": "匿名钱包",
+        "count_signer_fmt": "👤 钱包出现次数：近 {window} {n} 次",
+        "count_market_fmt": "📊 市场大额次数：近 {window} {n} 笔",
+        "window_1h": "1H",
         "tier_super": "超级鲸鱼单",
         "tier_big": "大鲸鱼单",
         "tier_mid": "中型鲸鱼单",
@@ -969,6 +1139,9 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "signal_bearish": "bearish",
         "card_delay_fmt": "delay {n}s",
         "card_anon_wallet": "Anon wallet",
+        "count_signer_fmt": "👤 Wallet hits last {window}: {n}",
+        "count_market_fmt": "📊 Market hits last {window}: {n}",
+        "window_1h": "1H",
         "tier_super": "Super whale",
         "tier_big": "Big whale",
         "tier_mid": "Mid whale",
@@ -2524,9 +2697,20 @@ def format_match_alert(
     elif parent_full:
         parent_clean = parent_full
 
+    # 按 view.lang 翻译市场标题 / 父市场 / outcome（仅在 view.lang == "zh" 且开启了
+    # 翻译时生效；未命中词典就保持原文，不阻塞热路径）。
+    if cfg.translation_enabled:
+        raw_title_disp = TRANSLATOR.translate(raw_title, state.lang)
+        outcome_disp = TRANSLATOR.translate(outcome_name, state.lang)
+        if parent_clean:
+            parent_clean = TRANSLATOR.translate(parent_clean, state.lang)
+    else:
+        raw_title_disp = raw_title
+        outcome_disp = outcome_name
+
     # 市场两行：父市场（粗体） + 子标题（outcome 或 raw_title — outcome）
-    title_safe = normalize_text(raw_title)
-    outcome_safe = normalize_text(outcome_name)
+    title_safe = normalize_text(raw_title_disp)
+    outcome_safe = normalize_text(outcome_disp)
     has_outcome = outcome_name and outcome_name != "-"
     if parent_clean:
         market_top = f"📊 <b>{normalize_text(parent_clean)}</b>"
@@ -2604,17 +2788,31 @@ def format_match_alert(
     local_dt = ts_dt.astimezone(tzinfo)
     delay_secs = max(0.0, (datetime.now(timezone.utc) - ts_dt).total_seconds())
     delay_str = t(state, "card_delay_fmt").format(n=f"{delay_secs:.1f}")
-    footer = f"<i>{local_dt.strftime('%H:%M:%S')} · {delay_str}</i>"
+    time_footer = f"<i>{local_dt.strftime('%H:%M:%S')} · {delay_str}</i>"
 
-    text = "\n".join([
+    # 频次脚注：近 1H 该 signer / 该市场 触发了几次告警。recent_matches 是内存窗口，
+    # 遍历 ≤5000 项几十微秒，对热路径无影响。signer 缺失时跳过 signer 行避免显示
+    # "0 次" 误导。
+    window_label = t(state, "window_1h")
+    market_count = state.count_market_alerts(slug=slug, market_id=mid_str, hours=1)
+    count_market_line = t(state, "count_market_fmt").format(
+        window=window_label, n=market_count,
+    )
+    body_lines: List[str] = [
         t(state, "whale_title"),
         subject_line,
         "",
         market_block,
         "",
         action_line,
-        footer,
-    ])
+    ]
+    if signer:
+        signer_count = state.count_signer_alerts(signer, hours=1)
+        body_lines.append(
+            t(state, "count_signer_fmt").format(window=window_label, n=signer_count)
+        )
+    body_lines.extend([count_market_line, time_footer])
+    text = "\n".join(body_lines)
 
     # 三个按钮：市场 / 钱包 / 交易哈希
     buttons: List[Dict[str, str]] = []
@@ -3034,6 +3232,122 @@ async def summary_runner(
             LOG.exception("[summary] iter=%d 失败", iteration)
 
 
+# 后台翻译 worker：定期扫描 state.recent_matches，把未翻译的英文标题/outcome
+# 批量丢给 Claude Haiku 4.5 翻译，结果写入 TRANSLATOR + disk cache。
+TRANSLATION_WORKER_INTERVAL_SEC = 30 * 60  # 每 30 分钟批量翻一次
+TRANSLATION_BATCH_MAX = 50  # 单次最多翻 50 条，防止 prompt 过大
+TRANSLATION_MODEL = "claude-haiku-4-5-20251001"
+
+
+async def translation_worker(
+    cfg: Config,
+    state: "RuntimeState",
+    stop: asyncio.Event,
+) -> None:
+    """后台批量翻译。永远不阻塞热路径（format_match_alert 只查内存 dict）。
+
+    需要 TRANSLATION_ENABLED=true + ANTHROPIC_API_KEY；任意一个缺失就退出。
+    没装 anthropic SDK 时打 warning，告警继续工作但只用内置词典。
+    """
+    if not (cfg.translation_enabled and cfg.anthropic_api_key):
+        LOG.info("[translator] worker 不启动（TRANSLATION_ENABLED=%s, KEY 已设=%s）",
+                 cfg.translation_enabled, bool(cfg.anthropic_api_key))
+        return
+    try:
+        from anthropic import AsyncAnthropic  # type: ignore
+    except ImportError:
+        LOG.warning(
+            "[translator] anthropic SDK 没装，worker 退出。pip install anthropic 后重启可启用"
+        )
+        return
+
+    client = AsyncAnthropic(api_key=cfg.anthropic_api_key)
+    LOG.info("[translator] worker 启动，间隔 %ds", TRANSLATION_WORKER_INTERVAL_SEC)
+
+    iteration = 0
+    while not stop.is_set():
+        iteration += 1
+        try:
+            # 收集 recent_matches 里所有未翻译的 title / slug-derived parent / outcome
+            candidates: List[str] = []
+            seen: Set[str] = set()
+            for m in state.recent_matches:
+                title = str(m.get("title") or "").strip()
+                slug = str(m.get("slug") or "")
+                parent = slug_to_label(slug) if slug else ""
+                # 词典已经覆盖的不要再翻
+                for s in (title, parent):
+                    if not s:
+                        continue
+                    key = s.lower()
+                    if key in seen or key in TRANSLATOR._dict_zh:
+                        continue
+                    seen.add(key)
+                    candidates.append(s)
+                    if len(candidates) >= TRANSLATION_BATCH_MAX:
+                        break
+                if len(candidates) >= TRANSLATION_BATCH_MAX:
+                    break
+
+            if candidates:
+                LOG.info("[translator] iter=%d 待翻 %d 条", iteration, len(candidates))
+                await _translate_batch(client, candidates)
+                TRANSLATOR._save_disk_cache()
+            else:
+                LOG.debug("[translator] iter=%d 无新词", iteration)
+        except Exception:
+            LOG.exception("[translator] iter=%d 失败（继续轮询）", iteration)
+
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=TRANSLATION_WORKER_INTERVAL_SEC)
+            return  # stop set
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _translate_batch(client: Any, items: List[str]) -> None:
+    """单次 API 调用翻译多条；解析 JSON 返回，写入 TRANSLATOR。
+    任何错误都吞掉只写日志，绝不影响告警热路径。"""
+    if not items:
+        return
+    # 用 numbered list 让模型按顺序输出 JSON 数组
+    numbered = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(items))
+    prompt = (
+        "把下面这些 Predict.fun 预测市场标题翻译成简体中文。规则：\n"
+        "- 保留专有名词原文（人名、球队名、加密货币如 Bitcoin/ETH、缩写如 NBA/NFL）。\n"
+        "- 通用词翻译：League → 联赛, Winner → 冠军, Champion → 冠军, Up/Down → 涨跌, Yes/No → 是/否。\n"
+        "- 只输出一个 JSON 数组，每个元素是字符串，按输入顺序对应。不要任何解释。\n\n"
+        f"待翻译：\n{numbered}"
+    )
+    try:
+        # prompt caching：把指令固化为 system，每次复用降本
+        resp = await client.messages.create(
+            model=TRANSLATION_MODEL,
+            max_tokens=2000,
+            system=[{"type": "text", "text": "你是一个简洁、忠实的预测市场标题翻译器。",
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text_out = resp.content[0].text if resp.content else ""
+        # 提取 JSON 数组
+        m = re.search(r"\[.*\]", text_out, re.DOTALL)
+        if not m:
+            LOG.warning("[translator] 模型没返回 JSON 数组：%r", text_out[:200])
+            return
+        translations = json.loads(m.group(0))
+        if not isinstance(translations, list) or len(translations) != len(items):
+            LOG.warning(
+                "[translator] 翻译数量不匹配 期望 %d 实得 %d", len(items), len(translations)
+            )
+            return
+        for src, dst in zip(items, translations):
+            if isinstance(dst, str) and dst.strip() and dst.strip().lower() != src.lower():
+                TRANSLATOR.learn(src, dst.strip())
+        LOG.info("[translator] 已学到 %d 条新翻译", len(items))
+    except Exception:
+        LOG.exception("[translator] API 调用失败")
+
+
 async def main() -> None:
     cfg = Config.from_env()
     state = RuntimeState.from_config(cfg)
@@ -3042,6 +3356,15 @@ async def main() -> None:
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    # 初始化翻译器单例（开关 / 路径来自 cfg）。即使 disabled 也用 noop，避免 None 检查
+    if cfg.translation_enabled:
+        global TRANSLATOR
+        TRANSLATOR = MarketTranslator(cache_path=cfg.market_translations_path)
+        LOG.info(
+            "[translator] 已启用，词典 %d 条（含 disk 缓存）",
+            len(TRANSLATOR._dict_zh),
+        )
 
     LOG.info(
         "启动配置: threshold=%s poll=%ss subscribers=%d",
@@ -3114,6 +3437,10 @@ async def main() -> None:
 
         # 每 N 秒推一次摘要。state.summary_interval_sec=0 时任务空转直到被打开。
         tasks.append(asyncio.create_task(summary_runner(cfg, state, tg, stop)))
+
+        # 后台翻译 worker（开关：cfg.translation_enabled + cfg.anthropic_api_key）。
+        # 没开 / 没装 anthropic SDK 都会优雅退出，告警继续工作。
+        tasks.append(asyncio.create_task(translation_worker(cfg, state, stop)))
 
         await stop.wait()
 

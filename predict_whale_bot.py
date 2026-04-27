@@ -188,7 +188,9 @@ class Config:
 
             summary_interval_sec=int(os.getenv("SUMMARY_INTERVAL_SEC", "3600")),
 
-            display_tz=(os.getenv("DISPLAY_TZ") or "UTC").strip() or "UTC",
+            # 默认走上海时区（用户在国内）。海外用户可设 DISPLAY_TZ=America/New_York
+            # 等任意 IANA 名；解析失败 get_display_tz 会 fallback 到 UTC + 写 warning。
+            display_tz=(os.getenv("DISPLAY_TZ") or "Asia/Shanghai").strip() or "Asia/Shanghai",
         )
 
 

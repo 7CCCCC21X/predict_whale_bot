@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 """
-Predict.fun 大额订单 / 大额成交 Telegram 监控机器人
+Predict.fun 大额成交 / 大额盘口 Telegram 监控机器人。
 
-默认监控成交大单：
-  REST /v1/orders/matches?minValueUsdtWei=...
+Railway 部署：
+  startCommand = "python -u predict_whale_bot.py"
 
-可选监控盘口大挂单：
-  WebSocket predictOrderbook/{marketId}
-
-运行：
-  cp .env.example .env
-  pip install -r requirements.txt
-  python predict_whale_bot.py
+推荐先用 MODE=matches，只监控真实成交大单。
 """
 
 from __future__ import annotations
@@ -24,6 +18,7 @@ import logging
 import os
 import signal
 import sys
+from collections import OrderedDict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from itertools import count
@@ -62,7 +57,7 @@ class Config:
     tg_bot_token: str
     tg_chat_id: str
 
-    mode: str  # matches / orderbook / both
+    mode: str
     threshold_usdt: Decimal
     usdt_wei_decimals: int
 
@@ -90,9 +85,9 @@ class Config:
         chat_id = os.getenv("TG_CHAT_ID", "").strip()
 
         if not token:
-            raise RuntimeError("缺少 TG_BOT_TOKEN。请先在 .env 里填写 Telegram Bot Token。")
+            raise RuntimeError("缺少 TG_BOT_TOKEN。请在 Railway Variables 里填写。")
         if not chat_id:
-            raise RuntimeError("缺少 TG_CHAT_ID。请先在 .env 里填写目标群/频道/个人 chat_id。")
+            raise RuntimeError("缺少 TG_CHAT_ID。请在 Railway Variables 里填写。")
 
         mode = os.getenv("MODE", "matches").strip().lower()
         if mode not in {"matches", "orderbook", "both"}:
@@ -126,13 +121,13 @@ class Config:
         )
 
 
-def d(value: Any, decimals: int = 18, *, wei_hint: bool = True) -> Decimal:
+def to_decimal(value: Any, decimals: int = 18, *, wei_hint: bool = True) -> Decimal:
     """
-    把 API 里的字符串数字转成 Decimal。
+    把 API 里的数字转成 Decimal。
 
-    - 123.45 直接作为 Decimal
+    - "123.45" 直接作为 Decimal
     - 很大的整数字符串按 wei / 1e18 处理
-    - 空值返回 0
+    - 空值或异常值返回 0
     """
     if value is None:
         return Decimal("0")
@@ -153,7 +148,7 @@ def d(value: Any, decimals: int = 18, *, wei_hint: bool = True) -> Decimal:
     except InvalidOperation:
         return Decimal("0")
 
-    # Predict 的金额参数叫 minValueUsdtWei，通常用 1e18 精度。
+    # Predict 的金额参数叫 minValueUsdtWei，通常是整数 wei。
     # 对没有小数点且数量级很大的值做自动缩放。
     if wei_hint and "." not in s and abs(out) >= Decimal(10) ** max(decimals - 2, 1):
         out = out / (Decimal(10) ** decimals)
@@ -175,11 +170,11 @@ def short_addr(addr: Any) -> str:
 
 
 def stable_event_id(event: Dict[str, Any]) -> str:
-    tx = event.get("transactionHash")
-    executed = event.get("executedAt")
-    market = (event.get("market") or {}).get("id")
-    amount = event.get("amountFilled")
-    signer = ((event.get("taker") or {}).get("signer"))
+    tx = event.get("transactionHash") or event.get("txHash")
+    executed = event.get("executedAt") or event.get("createdAt")
+    market = (event.get("market") or {}).get("id") or event.get("marketId")
+    amount = event.get("amountFilled") or event.get("amount")
+    signer = ((event.get("taker") or {}).get("signer")) or event.get("signer")
 
     if tx:
         return f"{tx}:{executed}:{market}:{amount}:{signer}"
@@ -202,7 +197,6 @@ class Telegram:
         self.base = f"https://api.telegram.org/bot{cfg.tg_bot_token}"
 
     async def send(self, text: str, *, silent: bool = False) -> None:
-        # Telegram 文本限制 4096 字符；这里留一点余量。
         chunks = [text[i: i + 3900] for i in range(0, len(text), 3900)] or [text]
 
         for chunk in chunks:
@@ -244,6 +238,9 @@ class Predict:
         if isinstance(data, dict) and data.get("success") is False:
             raise RuntimeError(f"Predict API 返回失败: {data}")
 
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Predict API 返回格式不是 dict: {type(data)}")
+
         return data
 
     async def fetch_matches(self) -> List[Dict[str, Any]]:
@@ -254,7 +251,7 @@ class Predict:
                 "minValueUsdtWei": str(self.cfg.threshold_usdt_wei),
             },
         )
-        return list(data.get("data") or [])
+        return list(data.get("data") or data.get("matches") or [])
 
     async def fetch_open_markets(self) -> Dict[int, str]:
         """
@@ -273,60 +270,96 @@ class Predict:
                 params["after"] = after
 
             data = await self.get("/v1/markets", params=params)
+            rows = data.get("data") or data.get("markets") or []
 
-            for m in data.get("data") or []:
+            for m in rows:
                 try:
-                    mid = int(m.get("id"))
+                    mid = int(m.get("id") or m.get("marketId"))
                 except Exception:
                     continue
 
                 visible = m.get("isVisible", True)
-                trading_status = str(m.get("tradingStatus", "")).upper()
+                trading_status = str(m.get("tradingStatus") or m.get("status") or "").upper()
 
-                if visible and trading_status == "OPEN":
+                if visible and (not trading_status or trading_status == "OPEN"):
                     markets[mid] = str(
-                        m.get("title") or m.get("question") or f"Market {mid}"
+                        m.get("title") or m.get("question") or m.get("name") or f"Market {mid}"
                     )
 
-            after = data.get("cursor")
+            page_info = data.get("pageInfo") or {}
+            after = (
+                data.get("cursor")
+                or data.get("nextCursor")
+                or page_info.get("endCursor")
+            )
+            has_next = bool(data.get("hasNextPage") or page_info.get("hasNextPage") or after)
 
-            if not after or pages >= 100:
+            if not has_next or not after or pages >= 100:
                 break
 
         return markets
 
 
+def event_value_usdt(event: Dict[str, Any], cfg: Config) -> Decimal:
+    # 优先使用 API 里可能直接给出的成交额字段。
+    for key in (
+        "valueUsdt",
+        "valueUSDT",
+        "valueUsdtWei",
+        "notionalUsdt",
+        "notionalUsdtWei",
+        "totalValueUsdt",
+        "totalValueUsdtWei",
+    ):
+        if event.get(key) is not None:
+            return to_decimal(event.get(key), cfg.usdt_wei_decimals)
+
+    taker = event.get("taker") or {}
+    for key in (
+        "valueUsdt",
+        "valueUSDT",
+        "valueUsdtWei",
+        "notionalUsdt",
+        "notionalUsdtWei",
+    ):
+        if taker.get(key) is not None:
+            return to_decimal(taker.get(key), cfg.usdt_wei_decimals)
+
+    amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.usdt_wei_decimals)
+    price = to_decimal(event.get("priceExecuted") or taker.get("price"), cfg.usdt_wei_decimals)
+    return amount * price if amount and price else Decimal("0")
+
+
 def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
     market = event.get("market") or {}
     taker = event.get("taker") or {}
-    outcome = taker.get("outcome") or {}
-    fee = taker.get("fee") or {}
+    outcome = taker.get("outcome") or event.get("outcome") or {}
+    fee = taker.get("fee") or event.get("fee") or {}
 
-    title = market.get("title") or market.get("question") or "-"
-    mid = market.get("id", "-")
-    category = market.get("categorySlug") or "-"
+    title = market.get("title") or market.get("question") or event.get("marketTitle") or "-"
+    mid = market.get("id") or event.get("marketId") or "-"
+    category = market.get("categorySlug") or market.get("category") or "-"
 
-    amount = d(event.get("amountFilled") or taker.get("amount"), cfg.usdt_wei_decimals)
-    price = d(event.get("priceExecuted") or taker.get("price"), cfg.usdt_wei_decimals)
-    notional = amount * price if amount and price else Decimal("0")
+    amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.usdt_wei_decimals)
+    price = to_decimal(event.get("priceExecuted") or taker.get("price"), cfg.usdt_wei_decimals)
+    notional = event_value_usdt(event, cfg)
 
-    fee_amount = d(fee.get("amount"), cfg.usdt_wei_decimals)
-    signer = taker.get("signer") or "-"
+    fee_amount = to_decimal(fee.get("amount"), cfg.usdt_wei_decimals)
+    signer = taker.get("signer") or event.get("signer") or "-"
     makers = event.get("makers") or []
-    tx = event.get("transactionHash") or "-"
-    executed_at = event.get("executedAt") or "-"
+    tx = event.get("transactionHash") or event.get("txHash") or "-"
+    executed_at = event.get("executedAt") or event.get("createdAt") or "-"
 
-    # 不假定 quoteType 就是买/卖，只展示 API 原字段，避免方向误判。
     lines = [
         "🚨 <b>Predict 成交大单</b>",
         f"市场：<b>{normalize_text(title)}</b>",
         f"Market ID：<code>{html.escape(str(mid))}</code> ｜ 分类：<code>{html.escape(str(category))}</code>",
         f"Taker：<code>{html.escape(short_addr(signer))}</code> ｜ Makers：<code>{len(makers)}</code>",
-        f"方向字段：<code>{html.escape(str(taker.get('quoteType', '-')))}</code> ｜ Outcome：<b>{normalize_text(outcome.get('name') or '-')}</b>",
+        f"方向字段：<code>{html.escape(str(taker.get('quoteType', event.get('quoteType', '-'))))}</code> ｜ Outcome：<b>{normalize_text(outcome.get('name') if isinstance(outcome, dict) else outcome)}</b>",
     ]
 
     if notional > 0:
-        lines.append(f"估算成交额：<b>${fmt_decimal(notional, 2)} USDT</b>")
+        lines.append(f"成交额：<b>${fmt_decimal(notional, 2)} USDT</b>")
 
     lines.extend(
         [
@@ -346,7 +379,7 @@ async def monitor_matches(
     tg: Telegram,
     stop: asyncio.Event,
 ) -> None:
-    seen: Set[str] = set()
+    seen: "OrderedDict[str, None]" = OrderedDict()
     startup = True
 
     await tg.send(
@@ -367,22 +400,21 @@ async def monitor_matches(
                 if eid in seen:
                     continue
 
-                seen.add(eid)
+                seen[eid] = None
                 fresh.append(ev)
 
+            while len(seen) > cfg.max_seen_ids:
+                seen.popitem(last=False)
+
             if startup and not cfg.alert_on_startup:
-                LOG.info("启动时已种子化 %d 条历史成交，不发送历史告警", len(seen))
+                LOG.info("启动时已记录 %d 条历史成交，不发送历史告警", len(fresh))
                 startup = False
             else:
                 startup = False
 
-                # 接口按 executedAt DESC 排序，反转后按时间先后发送。
+                # 接口通常按 executedAt DESC 排序，反转后按时间先后发送。
                 for ev in reversed(fresh):
                     await tg.send(format_match_alert(ev, cfg))
-
-            if len(seen) > cfg.max_seen_ids:
-                # set 无序，简单裁剪；生产上可换成 OrderedDict/LRU。
-                seen = set(list(seen)[-cfg.max_seen_ids // 2:])
 
         except Exception as exc:
             LOG.exception("监控成交大单出错")
@@ -393,7 +425,7 @@ async def monitor_matches(
                 silent=True,
             )
 
-            await asyncio.sleep(min(30, cfg.poll_interval_sec * 2))
+            await asyncio.sleep(min(30, max(1, cfg.poll_interval_sec * 2)))
 
         try:
             await asyncio.wait_for(stop.wait(), timeout=cfg.poll_interval_sec)
@@ -424,8 +456,8 @@ def parse_level(level: Any, cfg: Config) -> Optional[Tuple[Decimal, Decimal]]:
     else:
         return None
 
-    price = d(price_raw, cfg.usdt_wei_decimals)
-    size = d(size_raw, cfg.usdt_wei_decimals)
+    price = to_decimal(price_raw, cfg.usdt_wei_decimals)
+    size = to_decimal(size_raw, cfg.usdt_wei_decimals)
 
     if price <= 0 or size <= 0:
         return None
@@ -461,16 +493,17 @@ def format_orderbook_alert(
     notional: Decimal,
     update_ts: Any,
 ) -> str:
+    side_cn = "买盘 bids" if side == "bids" else "卖盘 asks"
     return "\n".join(
         [
             "🐋 <b>Predict 盘口大额挂单/加单</b>",
             f"市场：<b>{normalize_text(title)}</b>",
             f"Market ID：<code>{market_id}</code>",
-            f"盘口：<code>{html.escape(side)}</code>",
+            f"盘口：<code>{html.escape(side_cn)}</code>",
             f"新增数量：<code>{fmt_decimal(delta_size, 4)}</code> @ <code>{fmt_decimal(price, 6)}</code>",
             f"估算金额：<b>${fmt_decimal(notional, 2)} USDT</b>",
             f"更新时间：<code>{html.escape(str(update_ts or '-'))}</code>",
-            "说明：这是盘口层级增量监控；如果多人同价挂单，会显示为同一价格层级的合并增量。",
+            "说明：盘口是价格层级增量；多人同价挂单会合并到同一层级。",
         ]
     )
 
@@ -664,7 +697,7 @@ async def monitor_orderbook(
                                         price=price,
                                         delta_size=delta,
                                         notional=notional,
-                                        update_ts=data.get("updateTimestampMs"),
+                                        update_ts=data.get("updateTimestampMs") or data.get("timestamp"),
                                     )
                                 )
 
@@ -683,6 +716,7 @@ async def monitor_orderbook(
         finally:
             if refresher_task:
                 refresher_task.cancel()
+                await asyncio.gather(refresher_task, return_exceptions=True)
 
 
 async def main() -> None:
@@ -733,8 +767,8 @@ async def main() -> None:
 
         await stop.wait()
 
-        for t in tasks:
-            t.cancel()
+        for task in tasks:
+            task.cancel()
 
         await asyncio.gather(*tasks, return_exceptions=True)
 

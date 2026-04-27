@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Dict, List, Optional, Set, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from dotenv import load_dotenv
@@ -102,6 +103,10 @@ class Config:
     # 每小时摘要：默认 3600s（1 小时），运行期可用 /set_summary 改并持久化。
     # 设成 0 = 关掉自动摘要（仍可 /summary 手动查）
     summary_interval_sec: int
+
+    # 告警里时间字段渲染用的时区（IANA 名，比如 Asia/Shanghai / UTC）。
+    # 没设或解析失败默认 UTC。Telegram 自带消息时间戳，这里只显示 HH:MM:SS。
+    display_tz: str
 
     @property
     def threshold_usdt_wei(self) -> int:
@@ -182,6 +187,8 @@ class Config:
             ).strip(),
 
             summary_interval_sec=int(os.getenv("SUMMARY_INTERVAL_SEC", "3600")),
+
+            display_tz=(os.getenv("DISPLAY_TZ") or "UTC").strip() or "UTC",
         )
 
 
@@ -202,6 +209,9 @@ class RuntimeState:
     # 私聊订阅者：chat_id → {"threshold_usdt": str, "lang": "zh"|"en", "created_at", "last_seen"}
     # 每个私聊用户保存自己的阈值/语言，告警时按各自门槛分发。持久化在 runtime_state.json。
     subscribers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # 地址 → 用户起的别名。匹配 signer 后在告警里显示成 "<别名> · 0xabc…123"。
+    # 持久化在 runtime_state.json。Key 全部小写。
+    address_labels: Dict[str, str] = field(default_factory=dict)
     # 内存里维护"本会话每个钱包大单计数"。重启清零（不持久化），FIFO 限 5000。
     cumulative_trades: "OrderedDict[str, int]" = field(default_factory=OrderedDict)
     # 滚动窗口：最近被告警过的成交，用于摘要聚合。重启清零（短窗口数据，不需持久化）。
@@ -335,11 +345,18 @@ class RuntimeState:
                             "last_seen": str(info.get("last_seen", "")),
                         }
                     state.subscribers = valid
+                if "address_labels" in saved and isinstance(saved["address_labels"], dict):
+                    state.address_labels = {
+                        str(k).lower(): str(v)[:30]
+                        for k, v in saved["address_labels"].items()
+                        if v
+                    }
                 LOG.info(
-                    "已从 %s 恢复 runtime state: threshold=%s offset=%s lang=%s summary=%ss subscribers=%d",
+                    "已从 %s 恢复 runtime state: threshold=%s offset=%s lang=%s summary=%ss subscribers=%d labels=%d",
                     cfg.runtime_state_path,
                     state.threshold_usdt, state.telegram_offset, state.lang,
                     state.summary_interval_sec, len(state.subscribers),
+                    len(state.address_labels),
                 )
             except (InvalidOperation, ValueError, TypeError) as exc:
                 LOG.warning("runtime state 字段格式异常 (%s): %s — 用 env 默认", saved, exc)
@@ -356,6 +373,7 @@ class RuntimeState:
             "lang": self.lang,
             "summary_interval_sec": self.summary_interval_sec,
             "subscribers": self.subscribers,
+            "address_labels": self.address_labels,
         })
 
     # ---------- 私聊订阅者（每个 chat 自己的阈值 / 语言） ----------
@@ -421,6 +439,28 @@ class RuntimeState:
             del self.subscribers[key]
             return True
         return False
+
+    # ---------- 地址别名 ----------
+
+    def set_address_label(self, address: str, label: str) -> str:
+        """给一个地址起别名。label 会被裁到 30 字符。返回最终落库的别名。"""
+        key = (address or "").strip().lower()
+        clean = (label or "").strip()[:30]
+        if not key or not clean:
+            return ""
+        self.address_labels[key] = clean
+        return clean
+
+    def remove_address_label(self, address: str) -> bool:
+        key = (address or "").strip().lower()
+        if key in self.address_labels:
+            del self.address_labels[key]
+            return True
+        return False
+
+    def get_address_label(self, address: str) -> str:
+        key = (address or "").strip().lower()
+        return self.address_labels.get(key, "")
 
 
 def load_runtime_state(path: str) -> Optional[Dict[str, Any]]:
@@ -517,6 +557,54 @@ def fmt_money(x: Decimal) -> str:
     if x >= 100:
         return f"${int(x.to_integral_value(rounding=ROUND_DOWN)):,}"
     return f"${fmt_decimal(x, 2)}"
+
+
+def fmt_compact_qty(x: Decimal) -> str:
+    """股数紧凑展示：529 → "529"，3,624 → "3.6K"，1,200,000 → "1.2M"。"""
+    n = abs(x)
+    if n < Decimal("1000"):
+        return fmt_decimal(x, 0)
+    if n < Decimal("1000000"):
+        return f"{(x / Decimal('1000')).quantize(Decimal('0.1'), rounding=ROUND_DOWN)}K"
+    return f"{(x / Decimal('1000000')).quantize(Decimal('0.1'), rounding=ROUND_DOWN)}M"
+
+
+def get_display_tz(name: str) -> Tuple[Any, str]:
+    """根据 IANA 名解析时区。失败回退 UTC。返回 (tzinfo, label)。"""
+    if name and name.upper() != "UTC":
+        try:
+            return ZoneInfo(name), name
+        except (ZoneInfoNotFoundError, ValueError):
+            LOG.warning("DISPLAY_TZ=%r 无法解析，回退 UTC", name)
+    return timezone.utc, "UTC"
+
+
+def parse_iso_ts(raw: Any) -> Optional[datetime]:
+    """把 'YYYY-MM-DDTHH:MM:SS[.fff]Z' 解析成带 tz 的 datetime。失败返回 None。"""
+    if not raw:
+        return None
+    try:
+        s = str(raw).strip().replace("Z", "+00:00")
+        ts = datetime.fromisoformat(s)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts
+    except Exception:
+        return None
+
+
+def infer_signal(action: str, outcome: str) -> str:
+    """二元市场（YES/NO）下推断方向：买 YES / 卖 NO = 看涨；买 NO / 卖 YES = 看空。
+    多结果市场（候选人/数字）outcome 不是 yes/no，返回空串让上层跳过这一行。"""
+    out = (outcome or "").strip().lower()
+    if out not in {"yes", "no", "y", "n"}:
+        return ""
+    is_yes = out in {"yes", "y"}
+    if action == "buy":
+        return "bullish" if is_yes else "bearish"
+    if action == "sell":
+        return "bearish" if is_yes else "bullish"
+    return ""
 
 
 def short_addr(addr: Any) -> str:
@@ -784,6 +872,11 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "card_trader": "交易者",
         "card_time": "时间",
         "card_traded": "成交",
+        "card_signal": "信号",
+        "signal_bullish": "看涨",
+        "signal_bearish": "看空",
+        "card_delay_fmt": "延迟 {n}s",
+        "card_anon_wallet": "匿名钱包",
         "tier_super": "超级鲸鱼单",
         "tier_big": "大鲸鱼单",
         "tier_mid": "中型鲸鱼单",
@@ -819,7 +912,9 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "<code>/whoami</code> · <code>/lang zh|en</code>\n"
             "<code>/set_match 100</code>  改阈值（私聊改你自己的；主频道要 admin）\n"
             "<code>/unsubscribe</code>  退订私聊推送\n"
-            "<code>/speed</code>  当前 API 占用\n\n"
+            "<code>/speed</code>  当前 API 占用\n"
+            "<code>/label 0x… 别名</code> · <code>/labels</code> · <code>/unlabel 0x…</code>"
+            "  地址别名（告警里替换显示）\n\n"
             "<b>仅管理员</b>\n"
             "<code>/set_summary 60</code> · <code>/benchmark 0.2 15</code>\n"
             "<code>/ramp</code> 阶梯压测（3.2→0.2 找最稳定档位）\n"
@@ -867,6 +962,11 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "card_trader": "Trader",
         "card_time": "Time",
         "card_traded": "trade",
+        "card_signal": "Signal",
+        "signal_bullish": "bullish",
+        "signal_bearish": "bearish",
+        "card_delay_fmt": "delay {n}s",
+        "card_anon_wallet": "Anon wallet",
         "tier_super": "Super whale",
         "tier_big": "Big whale",
         "tier_mid": "Mid whale",
@@ -902,7 +1002,9 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "<code>/whoami</code> · <code>/lang zh|en</code>\n"
             "<code>/set_match 100</code>  threshold (DM = your own; main chat = admin)\n"
             "<code>/unsubscribe</code>  stop DM alerts\n"
-            "<code>/speed</code>  current API usage\n\n"
+            "<code>/speed</code>  current API usage\n"
+            "<code>/label 0x… name</code> · <code>/labels</code> · <code>/unlabel 0x…</code>"
+            "  address aliases (shown in alerts)\n\n"
             "<b>Admin only</b>\n"
             "<code>/set_summary 60</code> · <code>/benchmark 0.2 15</code>\n"
             "<code>/ramp</code> ladder bench (3.2→0.2 to find sweet-spot)\n"
@@ -1796,6 +1898,12 @@ class TelegramBot:
             await self._run_benchmark(arg, reply_chat_id=src)
         elif cmd == "/ramp":
             await self._run_ramp(arg, reply_chat_id=src)
+        elif cmd == "/label":
+            await self._handle_label(arg, reply_chat_id=src)
+        elif cmd == "/unlabel":
+            await self._handle_unlabel(arg, reply_chat_id=src)
+        elif cmd == "/labels":
+            await self._handle_labels_list(reply_chat_id=src)
         elif cmd == "/help":
             await self.tg.send(
                 t(self.state, "help_text"),
@@ -2018,6 +2126,77 @@ class TelegramBot:
                 f"${fmt_decimal(amt, 0)} · "
                 f"{info.get('lang', 'zh')} · "
                 f"last_seen=<code>{html.escape(str(info.get('last_seen', '?'))[:19])}</code>"
+            )
+        await self.tg.send("\n".join(lines), chat_id=reply_chat_id)
+
+    async def _handle_label(
+        self, raw: str, *, reply_chat_id: Optional[Any] = None
+    ) -> None:
+        """/label 0xabc... 我的别名 — 任何用户都能维护这张共享别名表。"""
+        parts = (raw or "").split(None, 1)
+        if len(parts) < 2:
+            await self.tg.send(
+                "用法：<code>/label 0x地址 别名</code>\n"
+                "示例：<code>/label 0x1234abcd…ef 巨鲸A</code>\n"
+                "查看现有：<code>/labels</code>，删除：<code>/unlabel 0x地址</code>",
+                chat_id=reply_chat_id,
+            )
+            return
+        address, label = parts[0].strip(), parts[1].strip()
+        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
+            await self.tg.send(
+                f"❌ 无效地址：<code>{html.escape(address)}</code>（需要 0x 开头 40 位 hex）",
+                chat_id=reply_chat_id,
+            )
+            return
+        clean = self.state.set_address_label(address, label)
+        if not clean:
+            await self.tg.send("❌ 别名不能为空。", chat_id=reply_chat_id)
+            return
+        self.state.persist()
+        await self.tg.send(
+            f"✅ 已记别名：<b>{html.escape(clean)}</b> · "
+            f"<code>{html.escape(short_addr(address))}</code>",
+            chat_id=reply_chat_id,
+        )
+
+    async def _handle_unlabel(
+        self, raw: str, *, reply_chat_id: Optional[Any] = None
+    ) -> None:
+        address = (raw or "").strip().split(None, 1)[0] if raw else ""
+        if not address:
+            await self.tg.send(
+                "用法：<code>/unlabel 0x地址</code>",
+                chat_id=reply_chat_id,
+            )
+            return
+        if self.state.remove_address_label(address):
+            self.state.persist()
+            await self.tg.send(
+                f"✅ 已删除 <code>{html.escape(short_addr(address))}</code> 的别名。",
+                chat_id=reply_chat_id,
+            )
+        else:
+            await self.tg.send(
+                f"<code>{html.escape(short_addr(address))}</code> 没有别名记录。",
+                chat_id=reply_chat_id,
+            )
+
+    async def _handle_labels_list(
+        self, *, reply_chat_id: Optional[Any] = None
+    ) -> None:
+        labels = self.state.address_labels
+        if not labels:
+            await self.tg.send(
+                "(还没有任何地址别名。用 <code>/label 0x地址 别名</code> 添加)",
+                chat_id=reply_chat_id,
+            )
+            return
+        lines = [f"<b>地址别名（{len(labels)}）</b>"]
+        for addr, name in sorted(labels.items(), key=lambda kv: kv[1].lower()):
+            lines.append(
+                f"• <b>{html.escape(name)}</b> · "
+                f"<code>{html.escape(short_addr(addr))}</code>"
             )
         await self.tg.send("\n".join(lines), chat_id=reply_chat_id)
 
@@ -2846,26 +3025,21 @@ def format_match_alert(
     # 方向：Ask = SELL，Bid = BUY
     quote_type = str(taker.get("quoteType") or event.get("quoteType") or "").strip().lower()
     if quote_type in {"bid", "buy"}:
-        action_label = t(state, "buy")
+        action_key = "buy"
     elif quote_type in {"ask", "sell"}:
-        action_label = t(state, "sell")
+        action_key = "sell"
     else:
-        action_label = t(state, "trade")
+        action_key = "trade"
+    action_label = t(state, action_key)
 
     signer = extract_signer(event) or ""
     username_raw = extract_username(event)
     short = short_addr(signer) if signer else ""
-    # 用户名 + 短地址组合：有 username 就 "username · 0xabc…123"，没有就只显示短地址
-    if username_raw and username_raw != short:
-        trader_html = (
-            f"<b>{normalize_text(username_raw)}</b> · "
-            f"<code>{html.escape(short or '-')}</code>"
-        )
-    else:
-        trader_html = f"<code>{html.escape(short or '-')}</code>"
+    # 用户别名 > 链上 username > 短地址。
+    label = state.address_labels.get(signer.lower()) if signer else ""
+    display_name = label or username_raw
 
     fee = event_fee_usdt(event, cfg)
-
     tx = extract_tx_hash(event)
 
     market_link = _render_template(cfg.market_url_template, id=mid_str, slug=slug, title=raw_title)
@@ -2876,57 +3050,89 @@ def format_match_alert(
     )
     tx_link = _render_template(cfg.tx_url_template, hash=tx) if tx else ""
 
-    # 标题：emoji + value（≥$100 无小数）+ outcome + 价格（cents）
+    # ---- 第一行：emoji + 金额 + 动作 + outcome + 价格 + 数量 ----
     tier_emoji, _tier_label = whale_tier(notional, state)
     price_cents = price * Decimal("100")
     notional_str = fmt_money(notional)
-    price_str = f"{fmt_decimal(price_cents, 1)}¢" if price > 0 else "-"
+    price_str = f"@{fmt_decimal(price_cents, 1)}¢" if price > 0 else ""
     outcome_safe = normalize_text(outcome_name)
+    qty_str = f"{fmt_compact_qty(amount)} {t(state, 'shares')}" if amount > 0 else ""
 
-    title_line = (
-        f"{tier_emoji} <b>{notional_str} {t(state, 'card_traded')}</b>"
-        f" ｜ {outcome_safe} @ {price_str}"
-    )
+    head_parts = [notional_str, action_label, outcome_safe]
+    if price_str:
+        head_parts.append(price_str)
+    title_line = f"{tier_emoji} <b>{' '.join(p for p in head_parts if p)}</b>"
+    if qty_str:
+        title_line += f" · {qty_str}"
 
-    # 卡片正文
-    side_line = f"{t(state, 'card_side')}：<b>{action_label} {outcome_safe}</b>"
-    amount_line = (
-        f"{t(state, 'card_amount')}：<code>{fmt_decimal(amount, 0)}</code>"
-        f" {t(state, 'shares')}"
-    )
-    price_body_line = f"{t(state, 'card_price')}：<code>{price_str}</code>"
-    trader_line = f"{t(state, 'card_trader')}：{trader_html}"
-    fee_line = (
-        f"{t(state, 'fee_label')}：<code>${fmt_decimal(fee, 4)} USDT</code>"
-        if fee > 0 else None
-    )
-    # 时间：用 event.executedAt 的 UTC 时间戳；找不到就用 now
-    ts_raw = event.get("executedAt") or event.get("createdAt") or ""
-    if ts_raw:
-        ts_str = str(ts_raw).replace("T", " ").replace("Z", " UTC")
-        ts_str = re.sub(r"(\d{2}:\d{2}:\d{2})\.\d+", r"\1", ts_str)
+    # ---- 交易者行（带钱包链接） ----
+    trader_inner: str
+    if display_name and display_name != short:
+        # @username 这种 handle 才加 @ 前缀；含空格的真实姓名（如 "Péter Magyar"）保留原样
+        name_clean = display_name.strip()
+        is_handle = bool(re.fullmatch(r"[A-Za-z0-9_.\-]{2,}", name_clean))
+        if is_handle and not name_clean.startswith("@"):
+            name_clean = "@" + name_clean
+        name_html = f"<b>{normalize_text(name_clean)}</b>"
+        if user_link:
+            name_html = (
+                f'<a href="{html.escape(user_link, quote=True)}">{name_html}</a>'
+            )
+        if short:
+            trader_inner = f"{name_html} · <code>{html.escape(short)}</code>"
+        else:
+            trader_inner = name_html
+    elif short:
+        code_html = f"<code>{html.escape(short)}</code>"
+        if user_link:
+            code_html = f'<a href="{html.escape(user_link, quote=True)}">{code_html}</a>'
+        trader_inner = code_html
     else:
-        ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    time_line = f"{t(state, 'card_time')}：<code>{html.escape(ts_str)}</code>"
+        trader_inner = t(state, "card_anon_wallet")
+    trader_line = f"👤 {trader_inner}"
 
-    body_lines = [side_line, amount_line, price_body_line, trader_line]
-    if fee_line:
-        body_lines.append(fee_line)
-    body_lines.append(time_line)
+    # ---- 信号 + 时间 + 延迟（合并一行） ----
+    signal_key = infer_signal(action_key, outcome_name)
+    signal_text = t(state, f"signal_{signal_key}") if signal_key else ""
+
+    tzinfo, _tz_label = get_display_tz(cfg.display_tz)
+    ts_dt = parse_iso_ts(event.get("executedAt") or event.get("createdAt"))
+    if ts_dt is None:
+        ts_dt = datetime.now(timezone.utc)
+    local_time_str = ts_dt.astimezone(tzinfo).strftime("%H:%M:%S")
+    delay_secs = max(0.0, (datetime.now(timezone.utc) - ts_dt).total_seconds())
+    delay_str = t(state, "card_delay_fmt").format(n=f"{delay_secs:.1f}")
+
+    meta_parts: List[str] = []
+    if signal_text:
+        meta_parts.append(f"{t(state, 'card_signal')}：<b>{signal_text}</b>")
+    meta_parts.append(f"<code>{local_time_str}</code>")
+    meta_parts.append(delay_str)
+    meta_line = " · ".join(meta_parts)
+
+    # ---- 手续费：< $1 隐藏，>= $1 显示但不再硬塞每条消息 ----
+    body_lines: List[str] = [trader_line, meta_line]
+    if fee >= Decimal("1"):
+        body_lines.insert(
+            1,
+            f"{t(state, 'fee_label')}：<code>${fmt_decimal(fee, 2)} USDT</code>",
+        )
 
     text = "\n".join([title_line, market_line, ""] + body_lines)
 
-    # 底部 inline 按钮：查看市场 / 查看钱包 / 查看交易
-    buttons: List[Dict[str, str]] = []
+    # ---- 按钮：分两行，移动端更紧凑 ----
+    row1: List[Dict[str, str]] = []
     if market_link:
-        buttons.append({"text": t(state, "view_market"), "url": market_link})
-    if user_link:
-        buttons.append({"text": t(state, "view_wallet"), "url": user_link})
+        row1.append({"text": t(state, "view_market"), "url": market_link})
     if tx_link:
-        buttons.append({"text": t(state, "view_tx"), "url": tx_link})
+        row1.append({"text": t(state, "view_tx"), "url": tx_link})
+    row2: List[Dict[str, str]] = []
+    if user_link:
+        row2.append({"text": t(state, "view_wallet"), "url": user_link})
 
+    inline_rows = [row for row in (row1, row2) if row]
     markup: Optional[Dict[str, Any]] = (
-        {"inline_keyboard": [buttons]} if buttons else None
+        {"inline_keyboard": inline_rows} if inline_rows else None
     )
 
     return text, markup

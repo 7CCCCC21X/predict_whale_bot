@@ -121,6 +121,27 @@ class Config:
         )
 
 
+@dataclass
+class RuntimeState:
+    """运行期可变状态。Telegram 菜单可以改这里的阈值，监控任务每轮读取最新值。"""
+    threshold_usdt: Decimal
+    orderbook_threshold_usdt: Decimal
+    usdt_wei_decimals: int
+
+    @property
+    def threshold_usdt_wei(self) -> int:
+        scale = Decimal(10) ** self.usdt_wei_decimals
+        return int((self.threshold_usdt * scale).to_integral_value(rounding=ROUND_DOWN))
+
+    @classmethod
+    def from_config(cls, cfg: Config) -> "RuntimeState":
+        return cls(
+            threshold_usdt=cfg.threshold_usdt,
+            orderbook_threshold_usdt=cfg.orderbook_threshold_usdt,
+            usdt_wei_decimals=cfg.usdt_wei_decimals,
+        )
+
+
 def to_decimal(value: Any, decimals: int = 18, *, wei_hint: bool = True) -> Decimal:
     """
     把 API 里的数字转成 Decimal。
@@ -195,26 +216,120 @@ class Telegram:
         self.cfg = cfg
         self.client = client
         self.base = f"https://api.telegram.org/bot{cfg.tg_bot_token}"
+        self._lock = asyncio.Lock()
 
-    async def send(self, text: str, *, silent: bool = False) -> None:
+    async def send(
+        self,
+        text: str,
+        *,
+        silent: bool = False,
+        reply_markup: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
         chunks = [text[i: i + 3900] for i in range(0, len(text), 3900)] or [text]
+        last_message_id: Optional[int] = None
 
-        for chunk in chunks:
-            resp = await self.client.post(
-                f"{self.base}/sendMessage",
-                json={
-                    "chat_id": self.cfg.tg_chat_id,
-                    "text": chunk,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                    "disable_notification": silent,
-                },
-            )
+        # 串行发送，避免 matches/orderbook 两个任务并发触发 Telegram 限流。
+        async with self._lock:
+            for idx, chunk in enumerate(chunks):
+                # markup 只附在最后一片，否则按钮会被前面的分片覆盖。
+                markup = reply_markup if idx == len(chunks) - 1 else None
+                last_message_id = await self._send_one(
+                    chunk, silent=silent, reply_markup=markup
+                )
+                await asyncio.sleep(0.05)
+
+        return last_message_id
+
+    async def _send_one(
+        self,
+        text: str,
+        *,
+        silent: bool,
+        reply_markup: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        payload: Dict[str, Any] = {
+            "chat_id": self.cfg.tg_chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+            "disable_notification": silent,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = json.dumps(reply_markup)
+
+        for attempt in range(5):
+            try:
+                resp = await self.client.post(f"{self.base}/sendMessage", json=payload)
+            except Exception as exc:
+                LOG.warning("Telegram sendMessage 网络异常: %s", exc)
+                await asyncio.sleep(min(2 ** attempt, 10))
+                continue
+
+            if resp.status_code == 429:
+                retry_after = 1.0
+                try:
+                    retry_after = float(resp.json().get("parameters", {}).get("retry_after", 1))
+                except Exception:
+                    pass
+                LOG.warning("Telegram 429 限流，等待 %.1fs", retry_after)
+                await asyncio.sleep(retry_after + 0.5)
+                continue
+
+            if 500 <= resp.status_code < 600:
+                LOG.warning("Telegram %s，重试", resp.status_code)
+                await asyncio.sleep(min(2 ** attempt, 10))
+                continue
 
             if resp.status_code >= 400:
+                # 4xx 一般是请求本身的问题（比如格式错误），重试也修不了。
                 LOG.error("Telegram sendMessage 失败: %s %s", resp.status_code, resp.text[:500])
+                return None
 
-            await asyncio.sleep(0.25)
+            try:
+                return int(resp.json().get("result", {}).get("message_id"))
+            except Exception:
+                return None
+
+        LOG.error("Telegram sendMessage 多次重试仍失败，丢弃消息")
+        return None
+
+    async def edit_message(
+        self,
+        message_id: int,
+        text: str,
+        *,
+        reply_markup: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "chat_id": self.cfg.tg_chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = json.dumps(reply_markup)
+
+        try:
+            resp = await self.client.post(f"{self.base}/editMessageText", json=payload)
+            if resp.status_code >= 400:
+                # 常见无害报错：消息内容未变（"message is not modified"）— 直接忽略。
+                body = resp.text[:300]
+                if "message is not modified" not in body:
+                    LOG.warning("editMessageText 失败: %s %s", resp.status_code, body)
+        except Exception as exc:
+            LOG.warning("editMessageText 异常: %s", exc)
+
+    async def answer_callback_query(
+        self, callback_query_id: str, text: str = ""
+    ) -> None:
+        try:
+            await self.client.post(
+                f"{self.base}/answerCallbackQuery",
+                json={"callback_query_id": callback_query_id, "text": text},
+            )
+        except Exception as exc:
+            LOG.warning("answerCallbackQuery 异常: %s", exc)
 
 
 class Predict:
@@ -243,12 +358,12 @@ class Predict:
 
         return data
 
-    async def fetch_matches(self) -> List[Dict[str, Any]]:
+    async def fetch_matches(self, threshold_wei: int) -> List[Dict[str, Any]]:
         data = await self.get(
             "/v1/orders/matches",
             params={
                 "first": self.cfg.matches_page_size,
-                "minValueUsdtWei": str(self.cfg.threshold_usdt_wei),
+                "minValueUsdtWei": str(threshold_wei),
             },
         )
         return list(data.get("data") or data.get("matches") or [])
@@ -298,6 +413,201 @@ class Predict:
                 break
 
         return markets
+
+
+PRESET_AMOUNTS = (Decimal("500"), Decimal("1000"), Decimal("5000"), Decimal("10000"))
+MIN_THRESHOLD_USDT = Decimal("1")
+MAX_THRESHOLD_USDT = Decimal("10000000")
+
+
+def _menu_text(state: RuntimeState) -> str:
+    return (
+        "🐋 <b>Predict 监控菜单</b>\n"
+        f"成交阈值：<b>${fmt_decimal(state.threshold_usdt, 2)} USDT</b>\n"
+        f"盘口阈值：<b>${fmt_decimal(state.orderbook_threshold_usdt, 2)} USDT</b>\n\n"
+        "点击下方按钮快速设置，或自定义：\n"
+        "<code>/set_match 数额</code>  设置成交阈值\n"
+        "<code>/set_book 数额</code>  设置盘口阈值\n"
+        "<code>/status</code>  查看当前阈值\n"
+        "<code>/menu</code>  重新打开菜单"
+    )
+
+
+def _menu_keyboard() -> Dict[str, Any]:
+    def row(prefix: str, label: str) -> List[Dict[str, str]]:
+        return [
+            {
+                "text": f"{label} ${int(amt):,}",
+                "callback_data": f"{prefix}:{int(amt)}",
+            }
+            for amt in PRESET_AMOUNTS
+        ]
+
+    return {
+        "inline_keyboard": [
+            row("match", "成交"),
+            row("book", "盘口"),
+            [{"text": "🔄 刷新", "callback_data": "refresh"}],
+        ]
+    }
+
+
+def _parse_amount(text: str) -> Optional[Decimal]:
+    raw = text.strip().lstrip("$").replace(",", "").replace("_", "")
+    if not raw:
+        return None
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        return None
+    if not (MIN_THRESHOLD_USDT <= value <= MAX_THRESHOLD_USDT):
+        return None
+    return value
+
+
+class TelegramBot:
+    """Telegram 命令/菜单处理。长轮询 getUpdates，运行期改 RuntimeState 的阈值。"""
+
+    def __init__(
+        self,
+        cfg: Config,
+        state: RuntimeState,
+        tg: Telegram,
+        client: httpx.AsyncClient,
+    ) -> None:
+        self.cfg = cfg
+        self.state = state
+        self.tg = tg
+        self.client = client
+        self.base = tg.base
+        # 只接受配置好的 chat_id 的命令，避免别人加机器人后乱改阈值。
+        self._allowed_chat_id = str(cfg.tg_chat_id)
+
+    async def run(self, stop: asyncio.Event) -> None:
+        offset = 0
+        long_poll_timeout = 25
+        # 长轮询要求 HTTP 超时大于 polling timeout
+        http_timeout = httpx.Timeout(long_poll_timeout + 10)
+
+        while not stop.is_set():
+            try:
+                resp = await self.client.get(
+                    f"{self.base}/getUpdates",
+                    params={
+                        "timeout": long_poll_timeout,
+                        "offset": offset,
+                        "allowed_updates": json.dumps(["message", "callback_query"]),
+                    },
+                    timeout=http_timeout,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+            except Exception as exc:
+                LOG.warning("Telegram getUpdates 失败: %s", exc)
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=3)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            for update in payload.get("result") or []:
+                offset = int(update.get("update_id", 0)) + 1
+                try:
+                    await self._handle_update(update)
+                except Exception:
+                    LOG.exception("处理 Telegram update 出错")
+
+    def _allowed(self, chat_id: Any) -> bool:
+        return str(chat_id) == self._allowed_chat_id
+
+    async def _handle_update(self, update: Dict[str, Any]) -> None:
+        if "message" in update:
+            await self._handle_message(update["message"])
+        elif "callback_query" in update:
+            await self._handle_callback(update["callback_query"])
+
+    async def _handle_message(self, msg: Dict[str, Any]) -> None:
+        chat_id = (msg.get("chat") or {}).get("id")
+        if not self._allowed(chat_id):
+            return
+
+        text = (msg.get("text") or "").strip()
+        if not text.startswith("/"):
+            return
+
+        head, _, tail = text.partition(" ")
+        # 兼容 "/set_match@MyBot 1000"
+        cmd = head.split("@", 1)[0].lower()
+        arg = tail.strip()
+
+        if cmd in {"/menu", "/start"}:
+            await self.tg.send(_menu_text(self.state), reply_markup=_menu_keyboard())
+        elif cmd == "/status":
+            await self.tg.send(_menu_text(self.state))
+        elif cmd == "/set_match":
+            await self._set_threshold("match", arg)
+        elif cmd == "/set_book":
+            await self._set_threshold("book", arg)
+        elif cmd == "/help":
+            await self.tg.send(
+                "命令列表：\n"
+                "<code>/menu</code> 打开菜单\n"
+                "<code>/status</code> 查看阈值\n"
+                "<code>/set_match 1000</code> 设置成交阈值（USDT）\n"
+                "<code>/set_book 1000</code> 设置盘口阈值（USDT）"
+            )
+
+    async def _handle_callback(self, cb: Dict[str, Any]) -> None:
+        cb_id = cb.get("id", "")
+        chat_id = ((cb.get("message") or {}).get("chat") or {}).get("id")
+
+        if not self._allowed(chat_id):
+            await self.tg.answer_callback_query(cb_id, "无权限")
+            return
+
+        data = cb.get("data") or ""
+        message_id = (cb.get("message") or {}).get("message_id")
+
+        if data == "refresh":
+            await self.tg.answer_callback_query(cb_id, "已刷新")
+            if message_id:
+                await self.tg.edit_message(
+                    message_id, _menu_text(self.state), reply_markup=_menu_keyboard()
+                )
+            return
+
+        kind, _, raw_amount = data.partition(":")
+        amount = _parse_amount(raw_amount)
+        if kind not in {"match", "book"} or amount is None:
+            await self.tg.answer_callback_query(cb_id, "无效操作")
+            return
+
+        await self._apply_threshold(kind, amount)
+        await self.tg.answer_callback_query(cb_id, f"已设置 ${int(amount):,}")
+        if message_id:
+            await self.tg.edit_message(
+                message_id, _menu_text(self.state), reply_markup=_menu_keyboard()
+            )
+
+    async def _set_threshold(self, kind: str, raw: str) -> None:
+        amount = _parse_amount(raw)
+        if amount is None:
+            await self.tg.send(
+                f"❌ 无效金额：<code>{html.escape(raw or '(空)')}</code>\n"
+                f"范围 {MIN_THRESHOLD_USDT}–{int(MAX_THRESHOLD_USDT):,} USDT"
+            )
+            return
+
+        await self._apply_threshold(kind, amount)
+        await self.tg.send(_menu_text(self.state), reply_markup=_menu_keyboard())
+
+    async def _apply_threshold(self, kind: str, amount: Decimal) -> None:
+        if kind == "match":
+            self.state.threshold_usdt = amount
+            LOG.info("成交阈值更新为 %s USDT", amount)
+        else:
+            self.state.orderbook_threshold_usdt = amount
+            LOG.info("盘口阈值更新为 %s USDT", amount)
 
 
 def event_value_usdt(event: Dict[str, Any], cfg: Config) -> Decimal:
@@ -375,6 +685,7 @@ def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
 
 async def monitor_matches(
     cfg: Config,
+    state: RuntimeState,
     predict: Predict,
     tg: Telegram,
     stop: asyncio.Event,
@@ -384,14 +695,15 @@ async def monitor_matches(
 
     await tg.send(
         f"✅ <b>Predict 成交大单监控已启动</b>\n"
-        f"阈值：<b>${fmt_decimal(cfg.threshold_usdt, 2)} USDT</b>\n"
-        f"模式：<code>matches</code> ｜ 轮询：<code>{cfg.poll_interval_sec}s</code>",
+        f"阈值：<b>${fmt_decimal(state.threshold_usdt, 2)} USDT</b>\n"
+        f"模式：<code>matches</code> ｜ 轮询：<code>{cfg.poll_interval_sec}s</code>\n"
+        f"用 /menu 调整阈值",
         silent=True,
     )
 
     while not stop.is_set():
         try:
-            events = await predict.fetch_matches()
+            events = await predict.fetch_matches(state.threshold_usdt_wei)
             fresh: List[Dict[str, Any]] = []
 
             for ev in events:
@@ -508,8 +820,9 @@ def format_orderbook_alert(
     )
 
 
-async def subscribe_topics(
+async def _send_topic_op(
     ws: Any,
+    method: str,
     topics: List[str],
     req_ids: count,
     batch_size: int,
@@ -520,15 +833,33 @@ async def subscribe_topics(
         await ws.send(
             json.dumps(
                 {
-                    "method": "subscribe",
+                    "method": method,
                     "requestId": next(req_ids),
                     "params": batch,
                 }
             )
         )
 
-        LOG.info("已订阅 %d 个 topic", len(batch))
+        LOG.info("已 %s %d 个 topic", method, len(batch))
         await asyncio.sleep(0.2)
+
+
+async def subscribe_topics(
+    ws: Any,
+    topics: List[str],
+    req_ids: count,
+    batch_size: int,
+) -> None:
+    await _send_topic_op(ws, "subscribe", topics, req_ids, batch_size)
+
+
+async def unsubscribe_topics(
+    ws: Any,
+    topics: List[str],
+    req_ids: count,
+    batch_size: int,
+) -> None:
+    await _send_topic_op(ws, "unsubscribe", topics, req_ids, batch_size)
 
 
 async def market_refresher(
@@ -537,31 +868,48 @@ async def market_refresher(
     ws: Any,
     subscribed: Set[int],
     market_titles: Dict[int, str],
+    books: Dict[int, Dict[str, Dict[str, Tuple[Decimal, Decimal]]]],
     req_ids: count,
     stop: asyncio.Event,
 ) -> None:
     while not stop.is_set():
         try:
             markets = await predict.fetch_open_markets()
-            market_titles.update(markets)
+            current_ids = set(markets.keys())
 
-            new_ids = [mid for mid in markets if mid not in subscribed]
+            new_ids = sorted(current_ids - subscribed)
+            stale_ids = sorted(subscribed - current_ids)
 
             if new_ids:
-                topics = [f"predictOrderbook/{mid}" for mid in new_ids]
-
                 await subscribe_topics(
                     ws,
-                    topics,
+                    [f"predictOrderbook/{mid}" for mid in new_ids],
                     req_ids,
                     cfg.orderbook_sub_batch,
                 )
-
                 subscribed.update(new_ids)
 
+            if stale_ids:
+                await unsubscribe_topics(
+                    ws,
+                    [f"predictOrderbook/{mid}" for mid in stale_ids],
+                    req_ids,
+                    cfg.orderbook_sub_batch,
+                )
+                for mid in stale_ids:
+                    subscribed.discard(mid)
+                    books.pop(mid, None)
+                    market_titles.pop(mid, None)
+
+            # 标题可能更新（重命名），用最新值刷新
+            for mid, title in markets.items():
+                market_titles[mid] = title
+
+            if new_ids or stale_ids:
                 LOG.info(
-                    "本轮新增订阅市场: %d，总订阅: %d",
+                    "本轮订阅变更：新增 %d，移除 %d，总订阅 %d",
                     len(new_ids),
+                    len(stale_ids),
                     len(subscribed),
                 )
 
@@ -576,14 +924,16 @@ async def market_refresher(
 
 async def monitor_orderbook(
     cfg: Config,
+    state: RuntimeState,
     predict: Predict,
     tg: Telegram,
     stop: asyncio.Event,
 ) -> None:
     await tg.send(
         f"✅ <b>Predict 盘口监控已启动</b>\n"
-        f"阈值：<b>${fmt_decimal(cfg.orderbook_threshold_usdt, 2)} USDT</b>\n"
-        f"模式：<code>orderbook</code>",
+        f"阈值：<b>${fmt_decimal(state.orderbook_threshold_usdt, 2)} USDT</b>\n"
+        f"模式：<code>orderbook</code>\n"
+        f"用 /menu 调整阈值",
         silent=True,
     )
 
@@ -611,7 +961,10 @@ async def monitor_orderbook(
 
             async with websockets.connect(
                 ws_url,
-                ping_interval=None,
+                # 让 websockets 自己每 20s 发一次 ping，20s 收不到 pong 就断开重连。
+                # 避免链路静默掉线时 async for 无限挂起。
+                ping_interval=20,
+                ping_timeout=20,
                 close_timeout=10,
             ) as ws:
                 backoff = 1
@@ -623,6 +976,7 @@ async def monitor_orderbook(
                         ws,
                         subscribed,
                         market_titles,
+                        books,
                         req_ids,
                         stop,
                     )
@@ -660,6 +1014,10 @@ async def monitor_orderbook(
                     except Exception:
                         continue
 
+                    # 已取消订阅的市场（refresher 清理过）丢弃残留帧。
+                    if market_id not in subscribed:
+                        continue
+
                     data = msg.get("data") or {}
                     title = market_titles.get(market_id, f"Market {market_id}")
 
@@ -688,7 +1046,7 @@ async def monitor_orderbook(
 
                             notional = delta * price
 
-                            if notional >= cfg.orderbook_threshold_usdt:
+                            if notional >= state.orderbook_threshold_usdt:
                                 await tg.send(
                                     format_orderbook_alert(
                                         market_id=market_id,
@@ -721,6 +1079,7 @@ async def monitor_orderbook(
 
 async def main() -> None:
     cfg = Config.from_env()
+    state = RuntimeState.from_config(cfg)
 
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -745,25 +1104,29 @@ async def main() -> None:
     async with httpx.AsyncClient(timeout=timeout) as client:
         tg = Telegram(cfg, client)
         predict = Predict(cfg, client)
+        bot = TelegramBot(cfg, state, tg, client)
 
         tasks: List[asyncio.Task[Any]] = []
 
         if cfg.mode in {"matches", "both"}:
             tasks.append(
                 asyncio.create_task(
-                    monitor_matches(cfg, predict, tg, stop)
+                    monitor_matches(cfg, state, predict, tg, stop)
                 )
             )
 
         if cfg.mode in {"orderbook", "both"}:
             tasks.append(
                 asyncio.create_task(
-                    monitor_orderbook(cfg, predict, tg, stop)
+                    monitor_orderbook(cfg, state, predict, tg, stop)
                 )
             )
 
         if not tasks:
             raise RuntimeError("没有可运行的监控任务")
+
+        # 菜单/命令处理任务，与监控任务并行。
+        tasks.append(asyncio.create_task(bot.run(stop)))
 
         await stop.wait()
 

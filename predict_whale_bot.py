@@ -72,6 +72,9 @@ class Config:
 
     request_timeout_sec: float
 
+    market_url_template: str
+    tx_url_template: str
+
     @property
     def threshold_usdt_wei(self) -> int:
         scale = Decimal(10) ** self.usdt_wei_decimals
@@ -118,6 +121,11 @@ class Config:
             ),
 
             request_timeout_sec=float(os.getenv("REQUEST_TIMEOUT_SEC", "12")),
+
+            # 可选：用 {id} / {slug} 拼成市场详情链接，例如 https://predict.fun/markets/{slug}
+            market_url_template=os.getenv("MARKET_URL_TEMPLATE", "").strip(),
+            # 可选：链上浏览器，例如 https://basescan.org/tx/{hash}
+            tx_url_template=os.getenv("TX_URL_TEMPLATE", "").strip(),
         )
 
 
@@ -190,8 +198,27 @@ def short_addr(addr: Any) -> str:
     return f"{s[:6]}…{s[-6:]}"
 
 
+def extract_tx_hash(event: Dict[str, Any]) -> str:
+    """从可能的字段里取出交易哈希，找不到返回空串。"""
+    transaction = event.get("transaction") if isinstance(event.get("transaction"), dict) else None
+    candidates = (
+        event.get("transactionHash"),
+        event.get("txHash"),
+        event.get("transaction_hash"),
+        event.get("hash"),
+        (transaction or {}).get("hash"),
+        (transaction or {}).get("transactionHash"),
+    )
+    for c in candidates:
+        if c:
+            s = str(c).strip()
+            if s:
+                return s
+    return ""
+
+
 def stable_event_id(event: Dict[str, Any]) -> str:
-    tx = event.get("transactionHash") or event.get("txHash")
+    tx = extract_tx_hash(event)
     executed = event.get("executedAt") or event.get("createdAt")
     market = (event.get("market") or {}).get("id") or event.get("marketId")
     amount = event.get("amountFilled") or event.get("amount")
@@ -640,14 +667,37 @@ def event_value_usdt(event: Dict[str, Any], cfg: Config) -> Decimal:
     return amount * price if amount and price else Decimal("0")
 
 
+def _render_template(template: str, **kwargs: Any) -> str:
+    """安全的字符串模板渲染：缺字段或异常时返回空串。"""
+    if not template:
+        return ""
+    try:
+        return template.format(**kwargs)
+    except Exception:
+        return ""
+
+
 def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
     market = event.get("market") or {}
     taker = event.get("taker") or {}
     outcome = taker.get("outcome") or event.get("outcome") or {}
     fee = taker.get("fee") or event.get("fee") or {}
 
-    title = market.get("title") or market.get("question") or event.get("marketTitle") or "-"
-    mid = market.get("id") or event.get("marketId") or "-"
+    raw_title = (
+        market.get("title")
+        or market.get("question")
+        or market.get("name")
+        or event.get("marketTitle")
+        or ""
+    )
+    mid = market.get("id") or event.get("marketId")
+    mid_str = str(mid) if mid is not None else ""
+    slug = market.get("slug") or market.get("urlSlug") or ""
+
+    # 标题缺失时不再显示 "-"，回退到 Market #<id>，确保"成交的市场"始终可见。
+    if not raw_title:
+        raw_title = f"Market #{mid_str}" if mid_str else "Unknown market"
+
     category = market.get("categorySlug") or market.get("category") or "-"
 
     amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.usdt_wei_decimals)
@@ -657,28 +707,48 @@ def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
     fee_amount = to_decimal(fee.get("amount"), cfg.usdt_wei_decimals)
     signer = taker.get("signer") or event.get("signer") or "-"
     makers = event.get("makers") or []
-    tx = event.get("transactionHash") or event.get("txHash") or "-"
+    tx = extract_tx_hash(event)
     executed_at = event.get("executedAt") or event.get("createdAt") or "-"
+
+    title_safe = normalize_text(raw_title)
+    market_link = _render_template(cfg.market_url_template, id=mid_str, slug=slug, title=raw_title)
+    if market_link:
+        title_html = f'<a href="{html.escape(market_link, quote=True)}">{title_safe}</a>'
+    else:
+        title_html = title_safe
 
     lines = [
         "🚨 <b>Predict 成交大单</b>",
-        f"市场：<b>{normalize_text(title)}</b>",
-        f"Market ID：<code>{html.escape(str(mid))}</code> ｜ 分类：<code>{html.escape(str(category))}</code>",
-        f"Taker：<code>{html.escape(short_addr(signer))}</code> ｜ Makers：<code>{len(makers)}</code>",
-        f"方向字段：<code>{html.escape(str(taker.get('quoteType', event.get('quoteType', '-'))))}</code> ｜ Outcome：<b>{normalize_text(outcome.get('name') if isinstance(outcome, dict) else outcome)}</b>",
+        f"市场：<b>{title_html}</b>",
     ]
 
+    # 成交价值最重要，紧跟市场显示。
     if notional > 0:
-        lines.append(f"成交额：<b>${fmt_decimal(notional, 2)} USDT</b>")
+        lines.append(f"成交价值：<b>${fmt_decimal(notional, 2)} USDT</b>")
+    else:
+        lines.append("成交价值：<b>-</b>")
 
     lines.extend(
         [
-            f"数量：<code>{fmt_decimal(amount, 4)}</code> ｜ 价格：<code>{fmt_decimal(price, 6)}</code>",
+            f"Market ID：<code>{html.escape(mid_str or '-')}</code> ｜ 分类：<code>{html.escape(str(category))}</code>",
+            f"Taker：<code>{html.escape(short_addr(signer))}</code> ｜ Makers：<code>{len(makers)}</code>",
+            f"方向字段：<code>{html.escape(str(taker.get('quoteType', event.get('quoteType', '-'))))}</code> ｜ Outcome：<b>{normalize_text(outcome.get('name') if isinstance(outcome, dict) else outcome)}</b>",
+            f"份额数量：<code>{fmt_decimal(amount, 4)}</code> ｜ 价格：<code>{fmt_decimal(price, 6)}</code>",
             f"手续费：<code>{fmt_decimal(fee_amount, 6)}</code> <code>{html.escape(str(fee.get('type') or ''))}</code>",
             f"时间：<code>{html.escape(str(executed_at))}</code>",
-            f"Tx：<code>{html.escape(short_addr(tx))}</code>",
         ]
     )
+
+    if tx:
+        tx_url = _render_template(cfg.tx_url_template, hash=tx)
+        if tx_url:
+            lines.append(
+                f'Tx：<a href="{html.escape(tx_url, quote=True)}"><code>{html.escape(tx)}</code></a>'
+            )
+        else:
+            lines.append(f"Tx：<code>{html.escape(tx)}</code>")
+    else:
+        lines.append("Tx：<code>-</code>")
 
     return "\n".join(lines)
 
@@ -704,6 +774,12 @@ async def monitor_matches(
     while not stop.is_set():
         try:
             events = await predict.fetch_matches(state.threshold_usdt_wei)
+
+            # 客户端兜底：阈值是"成交价值"（USDT notional），不是份额数量。
+            # 即便 API 漏过了低价值事件，也会被这里过滤掉。
+            threshold = state.threshold_usdt
+            events = [ev for ev in events if event_value_usdt(ev, cfg) >= threshold]
+
             fresh: List[Dict[str, Any]] = []
 
             for ev in events:

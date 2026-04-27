@@ -1,4 +1,2 @@
 httpx[http2]>=0.27
 python-dotenv>=1.0
-# 可选：标题中文化的后台 worker。没设 ANTHROPIC_API_KEY 时不会调，纯依赖加载安全。
-anthropic>=0.40

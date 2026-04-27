@@ -2536,26 +2536,32 @@ def format_match_alert(
     )
     tx_link = _render_template(cfg.tx_url_template, hash=tx) if tx else ""
 
-    # ---- 第一行：emoji + 金额 + 动作 + outcome + 价格 + 数量 ----
-    tier_emoji, _tier_label = whale_tier(notional, state)
+    # ---- 第一行：方向色点 + 金额 + outcome + 价格 ----
+    # 🟢 = 买入，🔴 = 卖出，⚪️ = 未知方向。size-tier emoji 改放在金额前不显眼了，
+    # 用户更关心买/卖方向（红/绿）一眼可辨，跟交易软件一致
+    dir_emoji = "🟢" if action_key == "buy" else "🔴" if action_key == "sell" else "⚪️"
     price_cents = price * Decimal("100")
     notional_str = fmt_money(notional)
-    price_str = f"@{fmt_decimal(price_cents, 1)}¢" if price > 0 else ""
+    price_str = f"{fmt_decimal(price_cents, 1)}¢" if price > 0 else "-"
     outcome_safe = normalize_text(outcome_name)
-    qty_str = f"{fmt_compact_qty(amount)} {t(state, 'shares')}" if amount > 0 else ""
 
-    head_parts = [notional_str, action_label, outcome_safe]
-    if price_str:
-        head_parts.append(price_str)
-    title_line = f"{tier_emoji} <b>{' '.join(p for p in head_parts if p)}</b>"
-    if qty_str:
-        title_line += f" · {qty_str}"
+    title_line = (
+        f"{dir_emoji} <b>{notional_str} {t(state, 'card_traded')}</b>"
+        f" ｜ {outcome_safe} @ {price_str}"
+    )
 
-    # ---- 交易者行（带钱包链接） ----
-    trader_inner: str
+    # ---- 卡片正文：方向 / 数量 / 价格 / 交易者 / 时间 ----
+    side_line = f"{t(state, 'card_side')}：<b>{action_label} {outcome_safe}</b>"
+    amount_line = (
+        f"{t(state, 'card_amount')}：<code>{fmt_decimal(amount, 0)}</code>"
+        f" {t(state, 'shares')}"
+    )
+    price_body_line = f"{t(state, 'card_price')}：<code>{price_str}</code>"
+
+    # 交易者：用户别名 > username > 短地址；任意一种情况下都包成可点 portfolio 链接
     if display_name and display_name != short:
-        # @username 这种 handle 才加 @ 前缀；含空格的真实姓名（如 "Péter Magyar"）保留原样
         name_clean = display_name.strip()
+        # ASCII handle 才补 @ 前缀；中文/空格名（"巨鲸 A"、"Péter Magyar"）保留原样
         is_handle = bool(re.fullmatch(r"[A-Za-z0-9_.\-]{2,}", name_clean))
         if is_handle and not name_clean.startswith("@"):
             name_clean = "@" + name_clean
@@ -2565,60 +2571,54 @@ def format_match_alert(
                 f'<a href="{html.escape(user_link, quote=True)}">{name_html}</a>'
             )
         if short:
-            trader_inner = f"{name_html} · <code>{html.escape(short)}</code>"
+            trader_html = f"{name_html} · <code>{html.escape(short)}</code>"
         else:
-            trader_inner = name_html
+            trader_html = name_html
     elif short:
         code_html = f"<code>{html.escape(short)}</code>"
         if user_link:
             code_html = f'<a href="{html.escape(user_link, quote=True)}">{code_html}</a>'
-        trader_inner = code_html
+        trader_html = code_html
     else:
-        trader_inner = t(state, "card_anon_wallet")
-    trader_line = f"👤 {trader_inner}"
+        trader_html = t(state, "card_anon_wallet")
+    trader_line = f"{t(state, 'card_trader')}：{trader_html}"
 
-    # ---- 信号 + 时间 + 延迟（合并一行） ----
-    signal_key = infer_signal(action_key, outcome_name)
-    signal_text = t(state, f"signal_{signal_key}") if signal_key else ""
-
+    # 时间：全日期 + DISPLAY_TZ + UTC offset 后缀 + 延迟。延迟 = now - executedAt。
     tzinfo, _tz_label = get_display_tz(cfg.display_tz)
     ts_dt = parse_iso_ts(event.get("executedAt") or event.get("createdAt"))
     if ts_dt is None:
         ts_dt = datetime.now(timezone.utc)
-    local_time_str = ts_dt.astimezone(tzinfo).strftime("%H:%M:%S")
+    local_dt = ts_dt.astimezone(tzinfo)
+    offset = local_dt.utcoffset() or timedelta(0)
+    total_minutes = int(offset.total_seconds() / 60)
+    if total_minutes == 0:
+        tz_suffix = "UTC"
+    else:
+        sign = "+" if total_minutes > 0 else "-"
+        hours, mins = divmod(abs(total_minutes), 60)
+        tz_suffix = f"UTC{sign}{hours}" + (f":{mins:02d}" if mins else "")
+    ts_str = local_dt.strftime("%Y-%m-%d %H:%M:%S") + " " + tz_suffix
     delay_secs = max(0.0, (datetime.now(timezone.utc) - ts_dt).total_seconds())
     delay_str = t(state, "card_delay_fmt").format(n=f"{delay_secs:.1f}")
+    time_line = (
+        f"{t(state, 'card_time')}：<code>{html.escape(ts_str)}</code>"
+        f" · {delay_str}"
+    )
 
-    meta_parts: List[str] = []
-    if signal_text:
-        meta_parts.append(f"{t(state, 'card_signal')}：<b>{signal_text}</b>")
-    meta_parts.append(f"<code>{local_time_str}</code>")
-    meta_parts.append(delay_str)
-    meta_line = " · ".join(meta_parts)
-
-    # ---- 手续费：< $1 隐藏，>= $1 显示但不再硬塞每条消息 ----
-    body_lines: List[str] = [trader_line, meta_line]
-    if fee >= Decimal("1"):
-        body_lines.insert(
-            1,
-            f"{t(state, 'fee_label')}：<code>${fmt_decimal(fee, 2)} USDT</code>",
-        )
-
+    body_lines = [side_line, amount_line, price_body_line, trader_line, time_line]
     text = "\n".join([title_line, market_line, ""] + body_lines)
 
-    # ---- 按钮：分两行，移动端更紧凑 ----
-    row1: List[Dict[str, str]] = []
+    # ---- 按钮：单行三连（查看市场 / 查看钱包 / 查看交易），保持原版布局 ----
+    buttons: List[Dict[str, str]] = []
     if market_link:
-        row1.append({"text": t(state, "view_market"), "url": market_link})
-    if tx_link:
-        row1.append({"text": t(state, "view_tx"), "url": tx_link})
-    row2: List[Dict[str, str]] = []
+        buttons.append({"text": t(state, "view_market"), "url": market_link})
     if user_link:
-        row2.append({"text": t(state, "view_wallet"), "url": user_link})
+        buttons.append({"text": t(state, "view_wallet"), "url": user_link})
+    if tx_link:
+        buttons.append({"text": t(state, "view_tx"), "url": tx_link})
 
-    inline_rows = [row for row in (row1, row2) if row]
     markup: Optional[Dict[str, Any]] = (
-        {"inline_keyboard": inline_rows} if inline_rows else None
+        {"inline_keyboard": [buttons]} if buttons else None
     )
 
     return text, markup

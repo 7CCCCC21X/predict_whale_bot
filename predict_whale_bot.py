@@ -204,6 +204,9 @@ class RuntimeState:
     usdt_wei_decimals: int
     telegram_offset: int = 0
     lang: str = "zh"
+    # 主告警频道是否暂停。True 时全局停推（fanout 仍按订阅 paused 字段为各 DM 独立判断）。
+    # 持久化在 runtime_state.json，重启续跑自动恢复。
+    paused: bool = False
     # 摘要轮播间隔（秒），可以 /set_summary 动态改并写盘
     summary_interval_sec: int = 3600
     # 主告警 chat（持久化里不存；from_config 时从 cfg 注入），用来区分"主频道 vs DM"
@@ -330,6 +333,8 @@ class RuntimeState:
                     state.lang = saved["lang"]
                 if "summary_interval_sec" in saved:
                     state.summary_interval_sec = int(saved["summary_interval_sec"])
+                if "paused" in saved:
+                    state.paused = bool(saved["paused"])
                 if "subscribers" in saved and isinstance(saved["subscribers"], dict):
                     # 校验+裁掉异常项；threshold 留 str 形态在 dict 里，用时再转 Decimal
                     valid: Dict[str, Dict[str, Any]] = {}
@@ -345,6 +350,7 @@ class RuntimeState:
                             "lang": info.get("lang", "zh") if info.get("lang") in {"zh", "en"} else "zh",
                             "created_at": str(info.get("created_at", "")),
                             "last_seen": str(info.get("last_seen", "")),
+                            "paused": bool(info.get("paused", False)),
                         }
                     state.subscribers = valid
                 if "address_labels" in saved and isinstance(saved["address_labels"], dict):
@@ -366,7 +372,7 @@ class RuntimeState:
         return state
 
     def persist(self) -> None:
-        """把当前阈值 + offset + lang + summary_interval + subscribers 写盘。失败只 log。"""
+        """把当前阈值 + offset + lang + summary_interval + subscribers + paused 写盘。失败只 log。"""
         if not self._path:
             return
         save_runtime_state(self._path, {
@@ -374,6 +380,7 @@ class RuntimeState:
             "telegram_offset": self.telegram_offset,
             "lang": self.lang,
             "summary_interval_sec": self.summary_interval_sec,
+            "paused": self.paused,
             "subscribers": self.subscribers,
             "address_labels": self.address_labels,
         })
@@ -405,6 +412,24 @@ class RuntimeState:
             return info["lang"]
         return self.lang
 
+    def is_paused_for(self, chat_id: Any) -> bool:
+        """主告警频道看 state.paused；DM 看 subscribers[cid]['paused']。"""
+        key = str(chat_id)
+        if key == self.main_chat_id:
+            return self.paused
+        info = self.subscribers.get(key)
+        return bool(info.get("paused")) if info else False
+
+    def set_paused_for(self, chat_id: Any, paused: bool) -> None:
+        """主频道改全局 state.paused；DM 改自己 subscribers[cid]['paused']。"""
+        key = str(chat_id)
+        if key == self.main_chat_id:
+            self.paused = paused
+            return
+        # 用 upsert_subscriber 兜底创建条目，再设 paused
+        self.upsert_subscriber(chat_id)
+        self.subscribers[key]["paused"] = paused
+
     def upsert_subscriber(
         self,
         chat_id: Any,
@@ -425,6 +450,7 @@ class RuntimeState:
                 "lang": self.lang,
                 "created_at": now,
                 "last_seen": now,
+                "paused": False,
             }
             self.subscribers[key] = existing
             LOG.info("[subscribers] 新订阅 chat_id=%s 默认阈值=%s", key, existing["threshold_usdt"])
@@ -856,6 +882,8 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "btn_lang_switch": "🌐 EN",
         "btn_refresh": "🔄",
         "btn_summary": "📊 摘要",
+        "btn_pause": "⏸ 暂停",
+        "btn_resume": "▶️ 恢复",
         "btn_test": "🧪 测试推送",  # 保留键以备 _send_test_alert 调用，按钮已不挂菜单
         "implied_label": "隐含",
         "fee_label": "手续费",
@@ -905,19 +933,19 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "🐋 <b>Predict Whale Bot</b>\n\n"
             "<b>私聊 bot</b>：自动注册，能改你<b>自己的</b>门槛、自己的语言。\n"
             "<b>主告警频道</b>：管理员才能改全局阈值。\n\n"
-            "<b>菜单按钮</b>\n"
-            "💵 预设 $100/$300/$500/$1k\n"
-            "✏️ 自定义（最低 $10）\n"
-            "🌐 切换中英文 · 🔄 刷新 · 🧪 测试推送（admin）\n\n"
-            "<b>命令</b>（任意聊天）\n"
-            "<code>/menu</code> · <code>/status</code> · <code>/summary</code>\n"
-            "<code>/whoami</code> · <code>/lang zh|en</code>\n"
-            "<code>/set_match 100</code>  改阈值（私聊改你自己的；主频道要 admin）\n"
-            "<code>/unsubscribe</code>  退订私聊推送\n"
-            "<code>/label 0x… 别名</code> · <code>/labels</code> · <code>/unlabel 0x…</code>"
-            "  地址别名（告警里替换显示）\n\n"
-            "<b>仅管理员</b>\n"
-            "<code>/set_summary 60</code> · <code>/subscribers</code>"
+            "<b>菜单按钮</b>（/menu）\n"
+            "💵 预设 $100/$300/$500/$1k · ✏️ 自定义（最低 $10）\n"
+            "🌐 中英 · 📊 摘要 · ⏸ 暂停/▶️ 恢复 · 🔄 刷新\n\n"
+            "<b>常用命令</b>\n"
+            "<code>/menu</code>  阈值 + 暂停 + 语言\n"
+            "<code>/summary</code>  当前窗口摘要\n"
+            "<code>/pause</code> · <code>/resume</code>  暂停/恢复推送\n"
+            "<code>/whoami</code> · <code>/lang zh|en</code>\n\n"
+            "<b>进阶（输全名即可）</b>\n"
+            "<code>/set_match 100</code>  改阈值（DM=自己，主频道要 admin）\n"
+            "<code>/unsubscribe</code>  退订私聊\n"
+            "<code>/label 0x… 别名</code> · <code>/labels</code> · <code>/unlabel 0x…</code>\n"
+            "<code>/set_summary 60</code> · <code>/subscribers</code>（admin）"
         ),
     },
     "en": {
@@ -944,6 +972,8 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "btn_lang_switch": "🌐 中",
         "btn_refresh": "🔄",
         "btn_summary": "📊 Summary",
+        "btn_pause": "⏸ Pause",
+        "btn_resume": "▶️ Resume",
         "btn_test": "🧪 Test",
         "implied_label": "Implied",
         "fee_label": "Fee",
@@ -991,20 +1021,20 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "help_text": (
             "🐋 <b>Predict Whale Bot</b>\n\n"
             "<b>DM the bot</b>: auto-registers; controls <b>your own</b> threshold + language.\n"
-            "<b>Main alert chat</b>: admin only for the global threshold.\n\n"
-            "<b>Menu buttons</b>\n"
-            "💵 Presets $100/$300/$500/$1k\n"
-            "✏️ Custom (min $10)\n"
-            "🌐 Toggle zh/en · 🔄 Refresh · 🧪 Test (admin)\n\n"
-            "<b>Commands</b> (any chat)\n"
-            "<code>/menu</code> · <code>/status</code> · <code>/summary</code>\n"
-            "<code>/whoami</code> · <code>/lang zh|en</code>\n"
-            "<code>/set_match 100</code>  threshold (DM = your own; main chat = admin)\n"
+            "<b>Main alert chat</b>: admin only for global controls.\n\n"
+            "<b>Menu buttons</b> (/menu)\n"
+            "💵 $100/$300/$500/$1k presets · ✏️ Custom (min $10)\n"
+            "🌐 zh/en · 📊 Summary · ⏸ Pause/▶️ Resume · 🔄 Refresh\n\n"
+            "<b>Common</b>\n"
+            "<code>/menu</code>  threshold + pause + language\n"
+            "<code>/summary</code>  current window summary\n"
+            "<code>/pause</code> · <code>/resume</code>  stop/start alerts\n"
+            "<code>/whoami</code> · <code>/lang zh|en</code>\n\n"
+            "<b>Advanced (type full name)</b>\n"
+            "<code>/set_match 100</code>  threshold (DM = own; main = admin)\n"
             "<code>/unsubscribe</code>  stop DM alerts\n"
-            "<code>/label 0x… name</code> · <code>/labels</code> · <code>/unlabel 0x…</code>"
-            "  address aliases (shown in alerts)\n\n"
-            "<b>Admin only</b>\n"
-            "<code>/set_summary 60</code> · <code>/subscribers</code>"
+            "<code>/label 0x… name</code> · <code>/labels</code> · <code>/unlabel 0x…</code>\n"
+            "<code>/set_summary 60</code> · <code>/subscribers</code> (admin)"
         ),
     },
 }
@@ -1468,11 +1498,17 @@ def _menu_text(
     # 临时 view-state 用来取翻译；不修改真正的 state.lang
     tmp_state = state if lang == state.lang else dataclass_replace_lang(state, lang)
     lang_label = t(tmp_state, "lang_zh") if lang == "zh" else t(tmp_state, "lang_en")
+    paused = state.is_paused_for(chat_id) if chat_id is not None else state.paused
+    if paused:
+        status_line = "\n⏸ <b>推送已暂停</b>" if lang == "zh" else "\n⏸ <b>Alerts paused</b>"
+    else:
+        status_line = ""
     return (
         f"{t(tmp_state, 'menu_title')}\n\n"
         f"{scope_hint}"
         f"💵 {t(tmp_state, 'match_short')} <b>${fmt_decimal(threshold, 2)} USDT</b>\n"
         f"🌐 {lang_label}"
+        f"{status_line}"
     )
 
 
@@ -1517,12 +1553,15 @@ def _menu_keyboard(state: RuntimeState, *, chat_id: Optional[Any] = None) -> Dic
         cells.append({"text": t(view, "btn_custom"), "callback_data": f"custom:{prefix}"})
         return cells
 
+    paused = state.is_paused_for(chat_id) if chat_id is not None else state.paused
+    pause_btn_key = "btn_resume" if paused else "btn_pause"
     return {
         "inline_keyboard": [
             preset_row("match", "💵"),
             [
                 {"text": t(view, "btn_lang_switch"), "callback_data": "lang:toggle"},
                 {"text": t(view, "btn_summary"), "callback_data": "summary"},
+                {"text": t(view, pause_btn_key), "callback_data": "pause:toggle"},
                 {"text": t(view, "btn_refresh"), "callback_data": "refresh"},
             ],
         ]
@@ -1694,17 +1733,15 @@ class TelegramBot:
             resp = await self.client.post(
                 f"{self.base}/setMyCommands",
                 json={
+                    # 这里只挂"主流程入口"，少而精；阈值/订阅/别名等都从 /menu 里走。
+                    # /set_match /unsubscribe /label /labels /unlabel /subscribers /status
+                    # 仍然可用，只是不在 / 自动补全里露出，避免菜单太长。
                     "commands": [
                         {"command": "menu", "description": "打开监控菜单"},
-                        {"command": "status", "description": "查看当前阈值"},
                         {"command": "summary", "description": "查看当前窗口摘要"},
-                        {"command": "set_match", "description": "设置成交阈值 (USDT，DM 里改自己的)"},
                         {"command": "set_summary", "description": "设置自动摘要间隔（如 60 / 2h / 0）"},
-                        {"command": "unsubscribe", "description": "退订私聊推送"},
-                        {"command": "label", "description": "给地址起别名（/label 0x... 名字）"},
-                        {"command": "labels", "description": "查看所有地址别名"},
-                        {"command": "unlabel", "description": "删除地址别名"},
-                        {"command": "subscribers", "description": "列出订阅者（admin）"},
+                        {"command": "pause", "description": "暂停推送（DM 改自己 / 主频道 admin）"},
+                        {"command": "resume", "description": "恢复推送"},
                         {"command": "whoami", "description": "查看自己的 user_id"},
                         {"command": "help", "description": "查看帮助"},
                     ]
@@ -1791,10 +1828,10 @@ class TelegramBot:
         cmd = head.split("@", 1)[0].lower()
         arg = tail.strip()
 
-        # 主频道里 /set_match / /set_summary 需要 admin。
-        # 私聊里 /set_match 是改"自己的"，不要 admin 检查。
+        # 主频道里 /set_match / /set_summary / /pause / /resume 需要 admin。
+        # 私聊里这些命令是改"自己的"，不要 admin 检查。
         admin_only_cmds = {"/set_summary"}
-        main_chat_admin_cmds = {"/set_match"}
+        main_chat_admin_cmds = {"/set_match", "/pause", "/resume"}
         if cmd in admin_only_cmds and not is_admin:
             await self.tg.send(
                 f"⛔ 仅管理员可执行此命令。当前 user_id=<code>{user_id}</code>。",
@@ -1804,7 +1841,7 @@ class TelegramBot:
             return
         if cmd in main_chat_admin_cmds and is_main and not is_admin:
             await self.tg.send(
-                f"⛔ 仅管理员可改全局阈值。私聊 bot 调你自己的就不需要管理员权限。",
+                f"⛔ 仅管理员可在主频道执行此命令。私聊 bot 调你自己的不需要管理员权限。",
                 chat_id=src,
             )
             return
@@ -1890,6 +1927,16 @@ class TelegramBot:
             await self._handle_unlabel(arg, reply_chat_id=src)
         elif cmd == "/labels":
             await self._handle_labels_list(reply_chat_id=src)
+        elif cmd == "/pause":
+            await self._handle_pause(
+                paused=True, target_chat_id=chat_id, reply_chat_id=src,
+                is_main=is_main, is_admin=is_admin,
+            )
+        elif cmd == "/resume":
+            await self._handle_pause(
+                paused=False, target_chat_id=chat_id, reply_chat_id=src,
+                is_main=is_main, is_admin=is_admin,
+            )
         elif cmd == "/help":
             await self.tg.send(
                 t(self.state, "help_text"),
@@ -1965,6 +2012,26 @@ class TelegramBot:
                 return
             await self.tg.answer_callback_query(cb_id, "✓")
             await self._send_test_alert(reply_chat_id=src)
+            return
+
+        # 暂停 / 恢复推送：主频道改全局（要 admin），DM 改自己（不要 admin）
+        if data == "pause:toggle":
+            if is_main and not self._is_admin(user_id):
+                await self.tg.answer_callback_query(cb_id, "⛔ 仅管理员可暂停全局推送")
+                return
+            cur = self.state.is_paused_for(chat_id)
+            self.state.set_paused_for(chat_id, not cur)
+            self.state.persist()
+            await self.tg.answer_callback_query(
+                cb_id, "⏸ 已暂停" if not cur else "▶️ 已恢复",
+            )
+            if message_id:
+                await self.tg.edit_message(
+                    message_id,
+                    _menu_text(self.state, chat_id=chat_id),
+                    reply_markup=_menu_keyboard(self.state, chat_id=chat_id),
+                    chat_id=src,
+                )
             return
 
         # 其它写操作（改阈值）：主频道里要 admin；DM 里改自己的不要 admin
@@ -2185,6 +2252,43 @@ class TelegramBot:
                 f"<code>{html.escape(short_addr(addr))}</code>"
             )
         await self.tg.send("\n".join(lines), chat_id=reply_chat_id)
+
+    async def _handle_pause(
+        self,
+        *,
+        paused: bool,
+        target_chat_id: Any,
+        reply_chat_id: Optional[Any] = None,
+        is_main: bool = False,
+        is_admin: bool = False,
+    ) -> None:
+        """暂停/恢复推送。主频道改全局；DM 改自己。
+        admin 检查由分发器（main_chat_admin_cmds）兜底，这里只关心写状态。"""
+        already = self.state.is_paused_for(target_chat_id)
+        self.state.set_paused_for(target_chat_id, paused)
+        self.state.persist()
+
+        scope = "全局推送" if is_main else "你的私聊推送"
+        if paused:
+            if already:
+                msg = f"⏸ {scope}已经处于暂停状态。"
+            else:
+                msg = (
+                    f"⏸ 已暂停 <b>{scope}</b>。\n"
+                    f"在此期间监控仍然在跑（不会丢数据），只是不向你推大单告警。\n"
+                    f"用 <code>/resume</code> 或菜单里的「▶️ 恢复」继续。"
+                )
+        else:
+            if not already:
+                msg = f"▶️ {scope}本来就在推送中。"
+            else:
+                msg = f"▶️ 已恢复 <b>{scope}</b>。下一笔满足阈值的大单会立刻推过来。"
+        LOG.info(
+            "[pause] target_chat_id=%s scope=%s paused=%s by %s",
+            target_chat_id, "main" if is_main else "dm", paused,
+            "admin" if is_admin else "user",
+        )
+        await self.tg.send(msg, chat_id=reply_chat_id)
 
     async def _send_test_alert(self, *, reply_chat_id: Optional[Any] = None) -> None:
         """构造一笔假成交，按当前阈值/语言渲染一遍。用于验证消息样式 + 通道。
@@ -2749,7 +2853,13 @@ async def watch_new_markets(
                         iteration, len(new_ids), new_ids[:10], titles,
                     )
 
-                    if len(new_ids) > BURST_THRESHOLD:
+                    if state.paused:
+                        # 暂停时仍把新市场加进 seen — 解除暂停后不会回放，只看新增
+                        LOG.info(
+                            "[watch_new_markets] iter=%d: 主频道已暂停，%d 个新市场静默 seed",
+                            iteration, len(new_ids),
+                        )
+                    elif len(new_ids) > BURST_THRESHOLD:
                         # 大概率 seen 文件丢了 / 被 reset；不要刷屏，只发个摘要
                         LOG.warning(
                             "[watch_new_markets] iter=%d: 异常 burst（%d 个新市场），"
@@ -2811,14 +2921,16 @@ async def _dispatch_match(
     sent_main = False
     sent_subs = 0
 
-    # 主告警频道：过全局阈值才发
-    if notional >= state.threshold_usdt:
+    # 主告警频道：过全局阈值才发；state.paused 时全局静默
+    if notional >= state.threshold_usdt and not state.paused:
         text, markup = format_match_alert(ev, cfg, state, cumulative=n)
         await tg.send(text, reply_markup=markup)
         sent_main = True
 
-    # 私聊订阅者：按各自门槛分发
+    # 私聊订阅者：按各自门槛分发；订阅者 paused 时跳过
     for sub_chat_id, info in list(state.subscribers.items()):
+        if info.get("paused"):
+            continue
         try:
             sub_threshold = Decimal(str(info.get("threshold_usdt", "0")))
         except (InvalidOperation, ValueError, TypeError):
@@ -3177,6 +3289,9 @@ async def summary_runner(
                 # 同时也清掉太老的 recent_matches
                 cutoff = datetime.now(timezone.utc) - timedelta(days=1)
                 state.recent_matches = [m for m in state.recent_matches if m["ts"] >= cutoff]
+                continue
+            if state.paused:
+                LOG.info("[summary] iter=%d 主频道已暂停，跳过推送", iteration)
                 continue
             text = format_summary_alert(summary, cfg, state)
             await tg.send(text, silent=True)

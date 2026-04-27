@@ -327,15 +327,35 @@ def extract_signer(event: Dict[str, Any]) -> str:
 
 
 def extract_tx_hash(event: Dict[str, Any]) -> str:
-    """从可能的字段里取出交易哈希，找不到返回空串。"""
+    """
+    从可能的字段里取出"链上 settlement 交易哈希"，找不到返回空串。
+
+    注意：Predict 把"撮合事件 ID"和"链上结算 tx 哈希"是分开的。一些字段
+    （比如 hash / id）只是撮合层面的内部 ID，bscscan 上根本查不到。
+    所以候选顺序按"越像 on-chain settlement 的越靠前"排，并显式去重内部 id。
+    """
     transaction = event.get("transaction") if isinstance(event.get("transaction"), dict) else None
+    settlement = event.get("settlement") if isinstance(event.get("settlement"), dict) else None
+    onchain = event.get("onchain") if isinstance(event.get("onchain"), dict) else None
+
+    # 越往前越优先：明确表明是链上结算 / 区块链交易的字段
     candidates = (
+        event.get("settlementTxHash"),
+        event.get("settlementTransactionHash"),
+        (settlement or {}).get("transactionHash"),
+        (settlement or {}).get("txHash"),
+        (settlement or {}).get("hash"),
+        event.get("onchainTxHash"),
+        event.get("onchainHash"),
+        (onchain or {}).get("transactionHash"),
+        (onchain or {}).get("hash"),
         event.get("transactionHash"),
-        event.get("txHash"),
-        event.get("transaction_hash"),
-        event.get("hash"),
-        (transaction or {}).get("hash"),
         (transaction or {}).get("transactionHash"),
+        (transaction or {}).get("hash"),
+        event.get("txHash"),
+        event.get("txnHash"),
+        event.get("transaction_hash"),
+        event.get("hash"),  # 最后兜底；这个常常是撮合层面的内部 ID
     )
     for c in candidates:
         if c:
@@ -1285,20 +1305,22 @@ async def monitor_matches(
                     max_pages,
                 )
 
-            # 第一次拿到事件时把所有可能跟金额相关的字段原样写日志，
-            # 万一以后 Predict 改了字段编码（比如 amount 不再是 1e12 而是 1e18），
-            # 看一眼日志就能直接判断该把 SHARES_WEI_DECIMALS 调成几。
+            # 每次会话第一笔成交，把完整 JSON 写到日志（截断 4000 字符）。
+            # 这样金额编码、tx 哈希字段、用户名字段任何位置改了，都能从日志一眼看出。
             if events and not raw_logged:
-                ev0 = events[0]
-                taker0 = ev0.get("taker") or {}
-                fee0 = taker0.get("fee") or ev0.get("fee") or {}
+                try:
+                    raw_dump = json.dumps(events[0], ensure_ascii=False, default=str, sort_keys=True)
+                except Exception:
+                    raw_dump = repr(events[0])
+                LOG.info("[match raw event] %s", raw_dump[:4000])
+                # 列出我们目前提取出来的关键字段，跟原始 JSON 对照
                 LOG.info(
-                    "[match raw] amountFilled=%r priceExecuted=%r taker.amount=%r taker.price=%r "
-                    "fee.amount=%r valueUsdt=%r valueUsdtWei=%r",
-                    ev0.get("amountFilled"), ev0.get("priceExecuted"),
-                    taker0.get("amount"), taker0.get("price"),
-                    fee0.get("amount"),
-                    ev0.get("valueUsdt"), ev0.get("valueUsdtWei"),
+                    "[match parsed] tx=%s signer=%s amount=%s price=%s notional=%s",
+                    extract_tx_hash(events[0]),
+                    extract_signer(events[0]),
+                    to_decimal(events[0].get("amountFilled") or (events[0].get("taker") or {}).get("amount"), cfg.shares_wei_decimals),
+                    to_decimal(events[0].get("priceExecuted") or (events[0].get("taker") or {}).get("price"), cfg.usdt_wei_decimals),
+                    event_value_usdt(events[0], cfg),
                 )
                 raw_logged = True
 

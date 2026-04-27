@@ -202,6 +202,9 @@ class RuntimeState:
     # 私聊订阅者：chat_id → {"threshold_usdt": str, "lang": "zh"|"en", "created_at", "last_seen"}
     # 每个私聊用户保存自己的阈值/语言，告警时按各自门槛分发。持久化在 runtime_state.json。
     subscribers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # 地址 → 用户起的别名。匹配 signer 后在告警里显示成 "<别名> · 0xabc…123"。
+    # 持久化在 runtime_state.json。Key 全部小写。
+    address_labels: Dict[str, str] = field(default_factory=dict)
     # 内存里维护"本会话每个钱包大单计数"。重启清零（不持久化），FIFO 限 5000。
     cumulative_trades: "OrderedDict[str, int]" = field(default_factory=OrderedDict)
     # 滚动窗口：最近被告警过的成交，用于摘要聚合。重启清零（短窗口数据，不需持久化）。
@@ -335,11 +338,18 @@ class RuntimeState:
                             "last_seen": str(info.get("last_seen", "")),
                         }
                     state.subscribers = valid
+                if "address_labels" in saved and isinstance(saved["address_labels"], dict):
+                    state.address_labels = {
+                        str(k).lower(): str(v)[:30]
+                        for k, v in saved["address_labels"].items()
+                        if v
+                    }
                 LOG.info(
-                    "已从 %s 恢复 runtime state: threshold=%s offset=%s lang=%s summary=%ss subscribers=%d",
+                    "已从 %s 恢复 runtime state: threshold=%s offset=%s lang=%s summary=%ss subscribers=%d labels=%d",
                     cfg.runtime_state_path,
                     state.threshold_usdt, state.telegram_offset, state.lang,
                     state.summary_interval_sec, len(state.subscribers),
+                    len(state.address_labels),
                 )
             except (InvalidOperation, ValueError, TypeError) as exc:
                 LOG.warning("runtime state 字段格式异常 (%s): %s — 用 env 默认", saved, exc)
@@ -356,6 +366,7 @@ class RuntimeState:
             "lang": self.lang,
             "summary_interval_sec": self.summary_interval_sec,
             "subscribers": self.subscribers,
+            "address_labels": self.address_labels,
         })
 
     # ---------- 私聊订阅者（每个 chat 自己的阈值 / 语言） ----------
@@ -421,6 +432,28 @@ class RuntimeState:
             del self.subscribers[key]
             return True
         return False
+
+    # ---------- 地址别名 ----------
+
+    def set_address_label(self, address: str, label: str) -> str:
+        """给一个地址起别名。label 会被裁到 30 字符。返回最终落库的别名。"""
+        key = (address or "").strip().lower()
+        clean = (label or "").strip()[:30]
+        if not key or not clean:
+            return ""
+        self.address_labels[key] = clean
+        return clean
+
+    def remove_address_label(self, address: str) -> bool:
+        key = (address or "").strip().lower()
+        if key in self.address_labels:
+            del self.address_labels[key]
+            return True
+        return False
+
+    def get_address_label(self, address: str) -> str:
+        key = (address or "").strip().lower()
+        return self.address_labels.get(key, "")
 
 
 def load_runtime_state(path: str) -> Optional[Dict[str, Any]]:
@@ -819,7 +852,9 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "<code>/whoami</code> · <code>/lang zh|en</code>\n"
             "<code>/set_match 100</code>  改阈值（私聊改你自己的；主频道要 admin）\n"
             "<code>/unsubscribe</code>  退订私聊推送\n"
-            "<code>/speed</code>  当前 API 占用\n\n"
+            "<code>/speed</code>  当前 API 占用\n"
+            "<code>/label 0x… 别名</code> · <code>/labels</code> · <code>/unlabel 0x…</code>"
+            "  地址别名（告警里替换显示）\n\n"
             "<b>仅管理员</b>\n"
             "<code>/set_summary 60</code> · <code>/benchmark 0.2 15</code>\n"
             "<code>/ramp</code> 阶梯压测（3.2→0.2 找最稳定档位）\n"
@@ -902,7 +937,9 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "<code>/whoami</code> · <code>/lang zh|en</code>\n"
             "<code>/set_match 100</code>  threshold (DM = your own; main chat = admin)\n"
             "<code>/unsubscribe</code>  stop DM alerts\n"
-            "<code>/speed</code>  current API usage\n\n"
+            "<code>/speed</code>  current API usage\n"
+            "<code>/label 0x… name</code> · <code>/labels</code> · <code>/unlabel 0x…</code>"
+            "  address aliases (shown in alerts)\n\n"
             "<b>Admin only</b>\n"
             "<code>/set_summary 60</code> · <code>/benchmark 0.2 15</code>\n"
             "<code>/ramp</code> ladder bench (3.2→0.2 to find sweet-spot)\n"
@@ -1796,6 +1833,12 @@ class TelegramBot:
             await self._run_benchmark(arg, reply_chat_id=src)
         elif cmd == "/ramp":
             await self._run_ramp(arg, reply_chat_id=src)
+        elif cmd == "/label":
+            await self._handle_label(arg, reply_chat_id=src)
+        elif cmd == "/unlabel":
+            await self._handle_unlabel(arg, reply_chat_id=src)
+        elif cmd == "/labels":
+            await self._handle_labels_list(reply_chat_id=src)
         elif cmd == "/help":
             await self.tg.send(
                 t(self.state, "help_text"),
@@ -2018,6 +2061,77 @@ class TelegramBot:
                 f"${fmt_decimal(amt, 0)} · "
                 f"{info.get('lang', 'zh')} · "
                 f"last_seen=<code>{html.escape(str(info.get('last_seen', '?'))[:19])}</code>"
+            )
+        await self.tg.send("\n".join(lines), chat_id=reply_chat_id)
+
+    async def _handle_label(
+        self, raw: str, *, reply_chat_id: Optional[Any] = None
+    ) -> None:
+        """/label 0xabc... 我的别名 — 任何用户都能维护这张共享别名表。"""
+        parts = (raw or "").split(None, 1)
+        if len(parts) < 2:
+            await self.tg.send(
+                "用法：<code>/label 0x地址 别名</code>\n"
+                "示例：<code>/label 0x1234abcd…ef 巨鲸A</code>\n"
+                "查看现有：<code>/labels</code>，删除：<code>/unlabel 0x地址</code>",
+                chat_id=reply_chat_id,
+            )
+            return
+        address, label = parts[0].strip(), parts[1].strip()
+        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
+            await self.tg.send(
+                f"❌ 无效地址：<code>{html.escape(address)}</code>（需要 0x 开头 40 位 hex）",
+                chat_id=reply_chat_id,
+            )
+            return
+        clean = self.state.set_address_label(address, label)
+        if not clean:
+            await self.tg.send("❌ 别名不能为空。", chat_id=reply_chat_id)
+            return
+        self.state.persist()
+        await self.tg.send(
+            f"✅ 已记别名：<b>{html.escape(clean)}</b> · "
+            f"<code>{html.escape(short_addr(address))}</code>",
+            chat_id=reply_chat_id,
+        )
+
+    async def _handle_unlabel(
+        self, raw: str, *, reply_chat_id: Optional[Any] = None
+    ) -> None:
+        address = (raw or "").strip().split(None, 1)[0] if raw else ""
+        if not address:
+            await self.tg.send(
+                "用法：<code>/unlabel 0x地址</code>",
+                chat_id=reply_chat_id,
+            )
+            return
+        if self.state.remove_address_label(address):
+            self.state.persist()
+            await self.tg.send(
+                f"✅ 已删除 <code>{html.escape(short_addr(address))}</code> 的别名。",
+                chat_id=reply_chat_id,
+            )
+        else:
+            await self.tg.send(
+                f"<code>{html.escape(short_addr(address))}</code> 没有别名记录。",
+                chat_id=reply_chat_id,
+            )
+
+    async def _handle_labels_list(
+        self, *, reply_chat_id: Optional[Any] = None
+    ) -> None:
+        labels = self.state.address_labels
+        if not labels:
+            await self.tg.send(
+                "(还没有任何地址别名。用 <code>/label 0x地址 别名</code> 添加)",
+                chat_id=reply_chat_id,
+            )
+            return
+        lines = [f"<b>地址别名（{len(labels)}）</b>"]
+        for addr, name in sorted(labels.items(), key=lambda kv: kv[1].lower()):
+            lines.append(
+                f"• <b>{html.escape(name)}</b> · "
+                f"<code>{html.escape(short_addr(addr))}</code>"
             )
         await self.tg.send("\n".join(lines), chat_id=reply_chat_id)
 
@@ -2855,10 +2969,12 @@ def format_match_alert(
     signer = extract_signer(event) or ""
     username_raw = extract_username(event)
     short = short_addr(signer) if signer else ""
-    # 用户名 + 短地址组合：有 username 就 "username · 0xabc…123"，没有就只显示短地址
-    if username_raw and username_raw != short:
+    # 用户给的别名优先于链上 username。匹配后显示成 "<别名> · 0xabc…123"。
+    label = state.address_labels.get(signer.lower()) if signer else ""
+    display_name = label or username_raw
+    if display_name and display_name != short:
         trader_html = (
-            f"<b>{normalize_text(username_raw)}</b> · "
+            f"<b>{normalize_text(display_name)}</b> · "
             f"<code>{html.escape(short or '-')}</code>"
         )
     else:

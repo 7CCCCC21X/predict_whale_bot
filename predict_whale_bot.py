@@ -218,8 +218,8 @@ class RuntimeState:
     cumulative_trades: "OrderedDict[str, int]" = field(default_factory=OrderedDict)
     # 滚动窗口：最近被告警过的成交，用于摘要聚合。重启清零（短窗口数据，不需持久化）。
     recent_matches: List[Dict[str, Any]] = field(default_factory=list)
-    # /diag 用：monitor_matches 每轮把最新一轮的统计放这里，让 /diag 一眼看到
-    # bot 是不是在工作 / 哪里把告警吞掉了。重启清零，不持久化。
+    # 监控心跳：monitor_matches 每轮把最新一轮统计放这里，方便日后再加诊断命令
+    # 直接读取。重启清零，不持久化。
     last_iter_stats: Dict[str, Any] = field(default_factory=dict)
     _path: str = ""  # 仅内部用，不参与持久化
 
@@ -914,13 +914,10 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "<code>/whoami</code> · <code>/lang zh|en</code>\n"
             "<code>/set_match 100</code>  改阈值（私聊改你自己的；主频道要 admin）\n"
             "<code>/unsubscribe</code>  退订私聊推送\n"
-            "<code>/speed</code>  当前 API 占用\n"
             "<code>/label 0x… 别名</code> · <code>/labels</code> · <code>/unlabel 0x…</code>"
             "  地址别名（告警里替换显示）\n\n"
             "<b>仅管理员</b>\n"
-            "<code>/set_summary 60</code> · <code>/benchmark 0.2 15</code>\n"
-            "<code>/ramp</code> 阶梯压测（3.2→0.2 找最稳定档位）\n"
-            "<code>/subscribers</code> · <code>/test</code>"
+            "<code>/set_summary 60</code> · <code>/subscribers</code>"
         ),
     },
     "en": {
@@ -1004,13 +1001,10 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "<code>/whoami</code> · <code>/lang zh|en</code>\n"
             "<code>/set_match 100</code>  threshold (DM = your own; main chat = admin)\n"
             "<code>/unsubscribe</code>  stop DM alerts\n"
-            "<code>/speed</code>  current API usage\n"
             "<code>/label 0x… name</code> · <code>/labels</code> · <code>/unlabel 0x…</code>"
             "  address aliases (shown in alerts)\n\n"
             "<b>Admin only</b>\n"
-            "<code>/set_summary 60</code> · <code>/benchmark 0.2 15</code>\n"
-            "<code>/ramp</code> ladder bench (3.2→0.2 to find sweet-spot)\n"
-            "<code>/subscribers</code> · <code>/test</code>"
+            "<code>/set_summary 60</code> · <code>/subscribers</code>"
         ),
     },
 }
@@ -1596,7 +1590,6 @@ class TelegramBot:
         self.state = state
         self.tg = tg
         self.client = client
-        # /speed 和 /benchmark / /ramp 直接复用 predict.client 打 API + 读 _request_log
         self.predict = predict
         self.base = tg.base
         # 命令可以来自任何 chat（私聊 / 群 / 主告警频道）；回复就地。
@@ -1708,10 +1701,9 @@ class TelegramBot:
                         {"command": "set_match", "description": "设置成交阈值 (USDT，DM 里改自己的)"},
                         {"command": "set_summary", "description": "设置自动摘要间隔（如 60 / 2h / 0）"},
                         {"command": "unsubscribe", "description": "退订私聊推送"},
-                        {"command": "speed", "description": "查看当前 API 占用"},
-                        {"command": "diag", "description": "全状态诊断快照"},
-                        {"command": "benchmark", "description": "速度压测（admin）"},
-                        {"command": "ramp", "description": "阶梯压测找最稳定 interval（admin）"},
+                        {"command": "label", "description": "给地址起别名（/label 0x... 名字）"},
+                        {"command": "labels", "description": "查看所有地址别名"},
+                        {"command": "unlabel", "description": "删除地址别名"},
                         {"command": "subscribers", "description": "列出订阅者（admin）"},
                         {"command": "whoami", "description": "查看自己的 user_id"},
                         {"command": "help", "description": "查看帮助"},
@@ -1799,9 +1791,9 @@ class TelegramBot:
         cmd = head.split("@", 1)[0].lower()
         arg = tail.strip()
 
-        # 主频道里 /set_match / /set_summary / /test / /benchmark 需要 admin。
+        # 主频道里 /set_match / /set_summary 需要 admin。
         # 私聊里 /set_match 是改"自己的"，不要 admin 检查。
-        admin_only_cmds = {"/set_summary", "/benchmark", "/ramp"}
+        admin_only_cmds = {"/set_summary"}
         main_chat_admin_cmds = {"/set_match"}
         if cmd in admin_only_cmds and not is_admin:
             await self.tg.send(
@@ -1892,14 +1884,6 @@ class TelegramBot:
                 await self.tg.send("⛔ 仅管理员", chat_id=src)
                 return
             await self._send_subscriber_list(reply_chat_id=src)
-        elif cmd == "/speed":
-            await self._send_speed_status(reply_chat_id=src)
-        elif cmd == "/diag":
-            await self._send_diag(reply_chat_id=src, asking_chat_id=chat_id, is_admin=is_admin)
-        elif cmd == "/benchmark":
-            await self._run_benchmark(arg, reply_chat_id=src)
-        elif cmd == "/ramp":
-            await self._run_ramp(arg, reply_chat_id=src)
         elif cmd == "/label":
             await self._handle_label(arg, reply_chat_id=src)
         elif cmd == "/unlabel":
@@ -2201,506 +2185,6 @@ class TelegramBot:
                 f"<code>{html.escape(short_addr(addr))}</code>"
             )
         await self.tg.send("\n".join(lines), chat_id=reply_chat_id)
-
-    async def _send_speed_status(self, *, reply_chat_id: Optional[Any] = None) -> None:
-        """读 Predict._request_log 显示当前 60s API 占用。任何人都能用。"""
-        import time as _time
-        now = _time.monotonic()
-        recent = [t for t in self.predict._request_log if t >= now - 60]
-        count = len(recent)
-        pct = count * 100 // Predict.RATE_LIMIT_PER_MIN
-        bar_len = min(20, pct // 5)
-        bar = "█" * bar_len + "░" * (20 - bar_len)
-        msg = (
-            "📊 <b>API 速度状态</b>\n\n"
-            f"最近 60s 调用：<b>{count}</b> 次\n"
-            f"限速预算：<b>{Predict.RATE_LIMIT_PER_MIN}/min</b>\n"
-            f"占用：<b>{pct}%</b>\n"
-            f"<code>{bar}</code>\n\n"
-            f"当前 POLL_INTERVAL_SEC = <code>{self.cfg.poll_interval_sec}s</code>"
-        )
-        await self.tg.send(msg, chat_id=reply_chat_id)
-
-    async def _send_diag(
-        self,
-        *,
-        reply_chat_id: Optional[Any] = None,
-        asking_chat_id: Optional[Any] = None,
-        is_admin: bool = False,
-    ) -> None:
-        """全状态快照。任何人都能用，但只有 admin 能看到所有订阅者明细。"""
-        import time as _time
-
-        is_main = self.state.is_main_chat(asking_chat_id) if asking_chat_id is not None else False
-        my_threshold = (
-            self.state.threshold_usdt if is_main
-            else self.state.get_threshold_for(asking_chat_id) if asking_chat_id is not None
-            else self.state.threshold_usdt
-        )
-
-        # 持久化文件状态
-        def _file_status(path: str) -> str:
-            if not path:
-                return "(未配置)"
-            if not os.path.exists(path):
-                return f"<code>{html.escape(path)}</code> ❌ 不存在（Railway volume 没挂！）"
-            try:
-                size = os.path.getsize(path)
-                return f"<code>{html.escape(path)}</code> ✅ {size:,} bytes"
-            except Exception:
-                return f"<code>{html.escape(path)}</code> ⚠️ 无法读"
-
-        # API 占用
-        now = _time.monotonic()
-        recent = [t for t in self.predict._request_log if t >= now - 60]
-        api_count = len(recent)
-        api_pct = api_count * 100 // Predict.RATE_LIMIT_PER_MIN
-
-        # 上一轮 monitor_matches 统计
-        last = self.state.last_iter_stats
-        last_iter = "(尚未跑过一轮)"
-        if last:
-            last_iter = (
-                f"fetched=<b>{last.get('fetched', '?')}</b> · "
-                f"filtered=<b>{last.get('filtered', '?')}</b>"
-                f"(min_th=$<b>{last.get('min_threshold', '?')}</b>) · "
-                f"fresh=<b>{last.get('fresh', '?')}</b>\n"
-                f"→ main=<b>{last.get('sent_main', '?')}</b> · "
-                f"subs=<b>{last.get('sent_subs', '?')}</b> · "
-                f"@ <code>{html.escape(str(last.get('ts', '?'))[:19])}</code>"
-            )
-
-        # 最近一笔被推送的成交（从 recent_matches 取最后一条）
-        last_alert = "(本会话尚无)"
-        if self.state.recent_matches:
-            m = self.state.recent_matches[-1]
-            ago_secs = (datetime.now(timezone.utc) - m["ts"]).total_seconds()
-            if ago_secs < 60:
-                ago = f"{int(ago_secs)}秒前"
-            elif ago_secs < 3600:
-                ago = f"{int(ago_secs / 60)}分钟前"
-            else:
-                ago = f"{int(ago_secs / 3600)}小时前"
-            last_alert = f"${fmt_decimal(m['value'], 2)} · {normalize_text(m['title'])[:40]} · {ago}"
-
-        # 订阅者列表
-        sub_count = len(self.state.subscribers)
-        if is_admin:
-            if sub_count == 0:
-                sub_lines = "(无)"
-            else:
-                rows = []
-                for cid, info in sorted(self.state.subscribers.items()):
-                    try:
-                        amt = Decimal(str(info.get("threshold_usdt", "0")))
-                    except Exception:
-                        amt = Decimal("0")
-                    rows.append(
-                        f"  • <code>{html.escape(cid)}</code> · ${fmt_decimal(amt, 0)} · "
-                        f"{info.get('lang', '?')}"
-                    )
-                sub_lines = "\n".join(rows[:10])
-                if len(rows) > 10:
-                    sub_lines += f"\n  …还有 {len(rows) - 10} 个"
-        else:
-            # 非 admin：只暴露数量 + 自己的 entry
-            sub_lines = "(完整列表仅 admin 可见)"
-            if asking_chat_id is not None:
-                my_info = self.state.subscribers.get(str(asking_chat_id))
-                if my_info:
-                    try:
-                        amt = Decimal(str(my_info.get("threshold_usdt", "0")))
-                    except Exception:
-                        amt = Decimal("0")
-                    sub_lines += (
-                        f"\n  你：${fmt_decimal(amt, 0)} · "
-                        f"{my_info.get('lang', '?')}"
-                    )
-
-        scope_label = (
-            "主告警频道（你看到的是全局值）" if is_main
-            else "私聊订阅模式（你看到的是你自己的）"
-        )
-
-        msg = (
-            "🔧 <b>当前状态诊断</b>\n\n"
-            f"<b>本 chat 视角</b>：{scope_label}\n"
-            f"  你的有效阈值：<b>${fmt_decimal(my_threshold, 2)} USDT</b>\n\n"
-            f"<b>全局配置</b>\n"
-            f"  主告警 chat_id：<code>{html.escape(self.state.main_chat_id)}</code>\n"
-            f"  全局阈值：<b>${fmt_decimal(self.state.threshold_usdt, 2)} USDT</b>\n"
-            f"  POLL_INTERVAL_SEC：<code>{self.cfg.poll_interval_sec}s</code>\n"
-            f"  默认语言：<code>{self.state.lang}</code>\n\n"
-            f"<b>持久化文件</b>\n"
-            f"  runtime_state：{_file_status(self.cfg.runtime_state_path)}\n"
-            f"  seen 事件：{_file_status(self.cfg.seen_state_path)}\n"
-            f"  seen 市场：{_file_status(self.cfg.seen_markets_path)}\n\n"
-            f"<b>订阅者：{sub_count} 个</b>\n{sub_lines}\n\n"
-            f"<b>监控状态</b>\n"
-            f"  最近 60s API：<b>{api_count}</b> 次（{api_pct}% 预算）\n"
-            f"  最后一轮 monitor_matches：{last_iter}\n"
-            f"  最后一笔已推送告警：{last_alert}\n"
-            f"  内存 seen：<b>{len(self.state.recent_matches)}</b> 笔窗口缓存\n"
-        )
-
-        await self.tg.send(msg, chat_id=reply_chat_id)
-
-    async def _benchmark_loop(
-        self, interval: float, duration: float, *, label: str = "",
-    ) -> Dict[str, Any]:
-        """裸打 GET /v1/markets 的循环。返回 counts + RTT 分位数。供 /benchmark 和 /ramp 共用。"""
-        import time as _time
-        url = f"{self.cfg.predict_api_base}/v1/markets"
-        headers = self.predict.headers
-        params = {"first": 1}
-
-        end = _time.monotonic() + duration
-        counts = {"200": 0, "429": 0, "5xx": 0, "4xx": 0, "err": 0}
-        timings: List[float] = []
-        iter_n = 0
-        last_log = _time.monotonic()
-        prefix = f"[bench{label}] " if label else "[bench] "
-
-        LOG.info("%s开始 interval=%.2fs duration=%.0fs", prefix, interval, duration)
-
-        while _time.monotonic() < end:
-            iter_n += 1
-            t0 = _time.monotonic()
-            try:
-                resp = await asyncio.wait_for(
-                    self.predict.client.get(
-                        url, params=params, headers=headers,
-                        timeout=httpx.Timeout(5),
-                    ),
-                    timeout=8.0,
-                )
-                rtt = (_time.monotonic() - t0) * 1000
-                timings.append(rtt)
-                if resp.status_code == 200:
-                    counts["200"] += 1
-                elif resp.status_code == 429:
-                    counts["429"] += 1
-                elif 500 <= resp.status_code < 600:
-                    counts["5xx"] += 1
-                else:
-                    counts["4xx"] += 1
-            except asyncio.TimeoutError:
-                counts["err"] += 1
-                LOG.warning("%siter %d 硬超时 8s", prefix, iter_n)
-            except Exception as exc:
-                counts["err"] += 1
-                LOG.warning("%siter %d 异常: %s", prefix, iter_n, exc)
-
-            if _time.monotonic() - last_log >= 5.0:
-                last_log = _time.monotonic()
-                elapsed_s = duration - (end - _time.monotonic())
-                LOG.info(
-                    "%s进度 %.0f/%.0fs · iter=%d · 200=%d 429=%d err=%d",
-                    prefix, elapsed_s, duration, iter_n,
-                    counts["200"], counts["429"], counts["err"],
-                )
-
-            elapsed = _time.monotonic() - t0
-            sleep_for = max(0, interval - elapsed)
-            try:
-                await asyncio.sleep(sleep_for)
-            except asyncio.CancelledError:
-                LOG.info("%s被取消", prefix)
-                break
-
-        LOG.info(
-            "%s完成 iter=%d 200=%d 429=%d 5xx=%d 4xx=%d err=%d",
-            prefix, iter_n,
-            counts["200"], counts["429"],
-            counts["5xx"], counts["4xx"], counts["err"],
-        )
-
-        result: Dict[str, Any] = {"counts": counts, "iter": iter_n}
-        if timings:
-            timings.sort()
-            result["rtt_min"] = timings[0]
-            result["rtt_med"] = timings[len(timings) // 2]
-            result["rtt_p95"] = timings[max(0, int(len(timings) * 0.95) - 1)]
-            result["rtt_max"] = timings[-1]
-        return result
-
-    async def _run_benchmark(self, raw: str, *, reply_chat_id: Optional[Any] = None) -> None:
-        """admin only。/benchmark [interval] [duration] — 单档速度测试。"""
-        parts = (raw or "").split()
-        try:
-            interval = float(parts[0]) if len(parts) >= 1 and parts[0] else 0.2
-            duration = float(parts[1]) if len(parts) >= 2 and parts[1] else 15.0
-        except ValueError:
-            await self.tg.send(
-                "用法：<code>/benchmark [interval_sec] [duration_sec]</code>\n"
-                "例：<code>/benchmark 0.2 15</code>（默认值）\n"
-                "限制：interval ≥ 0.05，duration ≤ 60",
-                chat_id=reply_chat_id,
-            )
-            return
-        if interval < 0.05 or interval > 5 or duration < 1 or duration > 60:
-            await self.tg.send(
-                "❌ 参数超界。interval 0.05–5s，duration 1–60s。",
-                chat_id=reply_chat_id,
-            )
-            return
-
-        await self.tg.send(
-            f"⏱ 速度测试运行中…\n"
-            f"间隔 {interval}s · 时长 {duration}s · 预计 {int(duration / interval)} 次请求",
-            chat_id=reply_chat_id,
-        )
-
-        bench_error: Optional[str] = None
-        try:
-            result = await self._benchmark_loop(interval, duration)
-        except Exception as exc:
-            LOG.exception("[benchmark] 整体异常")
-            bench_error = str(exc)
-            result = {"counts": {"200": 0, "429": 0, "5xx": 0, "4xx": 0, "err": 0}}
-
-        counts = result["counts"]
-        total = sum(counts.values())
-        pct429 = (counts["429"] / total * 100) if total else 0
-        if total and "rtt_med" in result:
-            rtt_line = (
-                f"min {result['rtt_min']:.0f}ms · 中位 {result['rtt_med']:.0f}ms · "
-                f"p95 {result['rtt_p95']:.0f}ms · max {result['rtt_max']:.0f}ms"
-            )
-        else:
-            rtt_line = "(无成功响应)"
-
-        # 建议
-        if total == 0:
-            suggestion = "❌ 一次请求都没成功。检查 PREDICT_API_BASE / API key / 网络。"
-        elif pct429 < 1:
-            suggestion = (
-                f"✅ 当前间隔 <b>{interval}s</b> 表现良好（429 < 1%），"
-                f"可以把 <code>POLL_INTERVAL_SEC</code> 设到 <code>{interval}</code>。"
-            )
-        elif pct429 < 5:
-            suggestion = (
-                f"⚠️ 间隔 <b>{interval}s</b> 触发 {pct429:.1f}% 429。可用但偏紧；"
-                f"稳健选 <code>POLL_INTERVAL_SEC={interval * 1.5:.2f}</code>。"
-            )
-        else:
-            suggestion = (
-                f"❌ 间隔 <b>{interval}s</b> 触发 {pct429:.1f}% 429，过激进。"
-                f"建议 <code>POLL_INTERVAL_SEC={max(interval * 2, 0.4):.2f}</code> 起步。"
-            )
-
-        report = (
-            "🏎 <b>速度测试结果</b>\n\n"
-            f"间隔 <code>{interval}s</code> · 时长 <code>{duration}s</code> · 总计 <b>{total}</b> 次\n\n"
-            f"✓ 200: <b>{counts['200']}</b> ({(counts['200'] / total * 100) if total else 0:.1f}%)\n"
-            f"⚠️ 429: <b>{counts['429']}</b> ({pct429:.1f}%)\n"
-        )
-        if counts["5xx"]:
-            report += f"⚠️ 5xx: {counts['5xx']}\n"
-        if counts["4xx"]:
-            report += f"❓ 4xx: {counts['4xx']}\n"
-        if counts["err"]:
-            report += f"❌ 网络/超时: {counts['err']}\n"
-        report += f"\n响应：{rtt_line}\n\n{suggestion}"
-        if bench_error:
-            report += f"\n\n⚠️ 测试中途异常：<code>{html.escape(bench_error)}</code>"
-
-        try:
-            await self.tg.send(report, chat_id=reply_chat_id)
-            LOG.info("[benchmark] 报告已发出")
-        except Exception:
-            LOG.exception("[benchmark] 发送报告失败")
-            # 兜底：纯文本简化版
-            try:
-                fallback = (
-                    f"benchmark done: total={total} 200={counts['200']} "
-                    f"429={counts['429']} err={counts['err']}"
-                )
-                await self.tg.send(fallback, chat_id=reply_chat_id)
-            except Exception:
-                LOG.exception("[benchmark] 兜底报告也失败")
-
-    async def _run_ramp(self, raw: str, *, reply_chat_id: Optional[Any] = None) -> None:
-        """admin only。阶梯压测：逐档加速找最稳定 / 最快的 interval。
-
-        默认序列：3.2s → 1.6s → 0.8s → 0.4s → 0.2s（每档 10s，连续两档 >5% 429 提前停）
-
-        - <code>/ramp</code>                       默认序列
-        - <code>/ramp 0.8,0.4,0.2 8</code>         自定义档位 + 每档秒数
-        - <code>/ramp 3.2 5 10</code>              start / 步数 / 每步秒数（速率翻倍）
-        """
-        parts = (raw or "").split()
-        intervals: List[float] = []
-        duration_per_step = 10.0
-
-        if len(parts) >= 1 and "," in parts[0]:
-            try:
-                intervals = [float(x.strip()) for x in parts[0].split(",") if x.strip()]
-            except ValueError:
-                intervals = []
-            if len(parts) >= 2:
-                try:
-                    duration_per_step = float(parts[1])
-                except ValueError:
-                    pass
-        elif len(parts) >= 1:
-            try:
-                start = float(parts[0])
-                steps = int(parts[1]) if len(parts) >= 2 else 5
-                if len(parts) >= 3:
-                    duration_per_step = float(parts[2])
-                intervals = [start / (2 ** i) for i in range(steps)]
-            except ValueError:
-                intervals = []
-        else:
-            intervals = [3.2 / (2 ** i) for i in range(5)]  # 默认 3.2→0.2
-
-        intervals = [round(i, 3) for i in intervals if 0.05 <= i <= 10]
-        if not intervals or len(intervals) > 8:
-            await self.tg.send(
-                "用法：\n"
-                "<code>/ramp</code>  默认 3.2→1.6→0.8→0.4→0.2，每档 10s\n"
-                "<code>/ramp 0.8,0.4,0.2 8</code>  自定义档位 + 每档秒数\n"
-                "<code>/ramp 3.2 5 10</code>  start / 步数 / 每步秒数（速率翻倍）\n"
-                "限制：每档间隔 0.05–10s，最多 8 档，每档 3–30s",
-                chat_id=reply_chat_id,
-            )
-            return
-        if not (3 <= duration_per_step <= 30):
-            await self.tg.send("❌ 每档时长 3–30s。", chat_id=reply_chat_id)
-            return
-
-        seq_str = " → ".join(f"{i:g}s" for i in intervals)
-        total_eta = int(len(intervals) * duration_per_step)
-        await self.tg.send(
-            f"📈 <b>速率阶梯测试</b>\n\n"
-            f"序列：<code>{seq_str}</code>\n"
-            f"每档：<code>{duration_per_step:.0f}s</code> · 预计总时长：~<code>{total_eta}s</code>\n"
-            f"自动停：连续两档 429 &gt; 5%\n\n"
-            f"开始…",
-            chat_id=reply_chat_id,
-        )
-
-        rows: List[Dict[str, Any]] = []
-        consecutive_bad = 0
-
-        for i, interval in enumerate(intervals, 1):
-            try:
-                result = await self._benchmark_loop(
-                    interval, duration_per_step, label=f"-step{i}",
-                )
-            except Exception:
-                LOG.exception("[ramp] step %d 异常", i)
-                await self.tg.send(
-                    f"⚠️ 第 {i} 档（{interval:g}s）异常，跳过",
-                    chat_id=reply_chat_id,
-                )
-                continue
-
-            counts = result["counts"]
-            total = sum(counts.values())
-            pct429 = (counts["429"] / total * 100) if total else 0
-            err_pct = (counts["err"] / total * 100) if total else 0
-            rtt_med = result.get("rtt_med", 0)
-            rtt_p95 = result.get("rtt_p95", 0)
-            rtt_jitter = (rtt_p95 - rtt_med) if rtt_p95 and rtt_med else 0
-
-            row = {
-                "interval": interval,
-                "total": total,
-                "ok": counts["200"],
-                "limited": counts["429"],
-                "err": counts["err"],
-                "pct429": pct429,
-                "rtt_med": rtt_med,
-                "rtt_p95": rtt_p95,
-                "rtt_jitter": rtt_jitter,
-            }
-            rows.append(row)
-
-            emoji = "✅" if pct429 < 1 and err_pct == 0 else "⚠️" if pct429 < 5 else "❌"
-            await self.tg.send(
-                f"{emoji} <b>第 {i}/{len(intervals)} 档</b> · 间隔 <code>{interval:g}s</code>\n"
-                f"总数 {total} · 200={counts['200']} · "
-                f"429={counts['429']} ({pct429:.1f}%) · err={counts['err']}\n"
-                f"中位 {rtt_med:.0f}ms · p95 {rtt_p95:.0f}ms",
-                chat_id=reply_chat_id,
-            )
-
-            if pct429 > 5:
-                consecutive_bad += 1
-            else:
-                consecutive_bad = 0
-            if consecutive_bad >= 2:
-                await self.tg.send(
-                    f"🛑 连续两档 429 &gt; 5%，提前停止（已测 {i}/{len(intervals)} 档）",
-                    chat_id=reply_chat_id,
-                )
-                break
-
-        if not rows:
-            await self.tg.send("❌ 所有档位都失败了。", chat_id=reply_chat_id)
-            return
-
-        # 综合评分：429 < 1% 且 err = 0 的"稳定档位"
-        stable = [r for r in rows if r["pct429"] < 1 and r["err"] == 0]
-        # "最稳定" = 在稳定档位里 RTT 抖动最小（p95 与中位差距最小）
-        most_stable = min(stable, key=lambda r: r["rtt_jitter"]) if stable else None
-        # "最快稳定" = 稳定档位里 interval 最小（速率最高）
-        fastest_safe = min(stable, key=lambda r: r["interval"]) if stable else None
-
-        # 用 <pre> 等宽对齐
-        summary = "📊 <b>阶梯测试总结</b>\n\n<pre>"
-        summary += " 间隔 |总数|200|429| %429 |中位 |p95\n"
-        summary += "------+----+---+---+------+-----+----\n"
-        for r in rows:
-            mark = ""
-            if r is most_stable:
-                mark = " ⭐"
-            elif r is fastest_safe:
-                mark = " 🏎"
-            summary += (
-                f"{r['interval']:5g}s|{r['total']:4d}|{r['ok']:3d}|{r['limited']:3d}|"
-                f"{r['pct429']:5.1f}%|{r['rtt_med']:4.0f}ms|{r['rtt_p95']:4.0f}ms{mark}\n"
-            )
-        summary += "</pre>\n\n"
-
-        if most_stable:
-            summary += (
-                f"⭐ <b>最稳定</b>：<code>{most_stable['interval']:g}s</code>"
-                f"（429={most_stable['limited']}，p95-中位 = {most_stable['rtt_jitter']:.0f}ms）\n"
-            )
-        if fastest_safe and fastest_safe is not most_stable:
-            summary += (
-                f"🏎 <b>最快稳定</b>：<code>{fastest_safe['interval']:g}s</code>"
-                f"（429 &lt; 1%，速率最高的安全档）\n"
-            )
-
-        if fastest_safe:
-            summary += (
-                f"\n<b>建议：</b><code>POLL_INTERVAL_SEC={fastest_safe['interval']:g}</code>"
-            )
-        elif rows:
-            min_429 = min(rows, key=lambda r: r["pct429"])
-            summary += (
-                f"\n⚠️ 没找到 429 &lt; 1% 的档位。"
-                f"最低 429 是 <b>{min_429['interval']:g}s</b>（{min_429['pct429']:.1f}%），"
-                f"建议 <code>POLL_INTERVAL_SEC={min_429['interval'] * 1.5:.2f}</code>。"
-            )
-
-        try:
-            await self.tg.send(summary, chat_id=reply_chat_id)
-        except Exception:
-            LOG.exception("[ramp] 发送总结失败")
-            try:
-                await self.tg.send(
-                    f"ramp done: tested {len(rows)} steps, "
-                    f"recommended POLL_INTERVAL_SEC="
-                    f"{fastest_safe['interval'] if fastest_safe else 'N/A'}",
-                    chat_id=reply_chat_id,
-                )
-            except Exception:
-                LOG.exception("[ramp] 兜底总结也失败")
 
     async def _send_test_alert(self, *, reply_chat_id: Optional[Any] = None) -> None:
         """构造一笔假成交，按当前阈值/语言渲染一遍。用于验证消息样式 + 通道。
@@ -3515,7 +2999,7 @@ async def monitor_matches(
                             extract_tx_hash(ev)[:16],
                         )
 
-            # 每轮总结：写一行 INFO 日志 + 把统计写到 state.last_iter_stats 让 /diag 读
+            # 每轮总结：写一行 INFO 日志 + 把统计存进 state.last_iter_stats 便于排障
             iter_stats = {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "fetched": fetched_n,
@@ -3745,7 +3229,7 @@ async def main() -> None:
     # 速度优化：
     # 1) HTTP/2 复用 TCP+TLS 连接 → 节省每次握手 ~50-150ms（Predict 服务端支持
     #    时自动启用，不支持时无声回退到 HTTP/1.1）
-    # 2) 连接池：matches 轮询 + getUpdates 长轮询 + 潜在的 benchmark/ramp 并发，
+    # 2) 连接池：matches 轮询 + getUpdates 长轮询并发，
     #    保 20 条空闲连接随时可用，避免连接重建
     transport_limits = httpx.Limits(
         max_keepalive_connections=20,

@@ -22,7 +22,7 @@ import signal
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -99,6 +99,10 @@ class Config:
     new_markets_check_sec: int
     seen_markets_path: str
 
+    # 每小时摘要：默认 3600s（1 小时），运行期可用 /set_summary 改并持久化。
+    # 设成 0 = 关掉自动摘要（仍可 /summary 手动查）
+    summary_interval_sec: int
+
     @property
     def threshold_usdt_wei(self) -> int:
         scale = Decimal(10) ** self.usdt_wei_decimals
@@ -129,9 +133,10 @@ class Config:
             # 实测是 18 位小数（份额 × 1e18），跟 USDT 一样。
             shares_wei_decimals=int(os.getenv("SHARES_WEI_DECIMALS", "18")),
 
-            # 1s 轮询：在 Predict API 限流容忍内拿到尽可能小的检测延迟。
-            # 对一笔成交从落账到推 Telegram，端到端中位数 ~1s。
-            poll_interval_sec=float(os.getenv("POLL_INTERVAL_SEC", "1")),
+            # 0.5s 轮询：参考 Predict API 通用限速（~10 req/s），matches 单端
+            # 占 2 req/s + 新市场 ~0.03 req/s + 翻页保险 ~1 req/s 仍在容忍内。
+            # 端到端检测延迟中位数 ~0.5s。被限流时 get() 会自动退避并重试。
+            poll_interval_sec=float(os.getenv("POLL_INTERVAL_SEC", "0.5")),
             matches_page_size=int(os.getenv("MATCHES_PAGE_SIZE", "100")),
             matches_max_pages=int(os.getenv("MATCHES_MAX_PAGES", "5")),
             # 默认开：seen 持久化后，重启不会重复推送，所以 startup 告警是安全的。
@@ -171,6 +176,8 @@ class Config:
             seen_markets_path=os.getenv(
                 "SEEN_MARKETS_PATH", "/data/predict_seen_markets.json"
             ).strip(),
+
+            summary_interval_sec=int(os.getenv("SUMMARY_INTERVAL_SEC", "3600")),
         )
 
 
@@ -184,11 +191,16 @@ class RuntimeState:
     usdt_wei_decimals: int
     telegram_offset: int = 0
     lang: str = "zh"
+    # 摘要轮播间隔（秒），可以 /set_summary 动态改并写盘
+    summary_interval_sec: int = 3600
     # 内存里维护"本会话每个钱包大单计数"。重启清零（不持久化），FIFO 限 5000。
     cumulative_trades: "OrderedDict[str, int]" = field(default_factory=OrderedDict)
+    # 滚动窗口：最近被告警过的成交，用于摘要聚合。重启清零（短窗口数据，不需持久化）。
+    recent_matches: List[Dict[str, Any]] = field(default_factory=list)
     _path: str = ""  # 仅内部用，不参与持久化
 
     _CUMULATIVE_CAP = 5000
+    _RECENT_MATCHES_CAP = 5000  # ~ 容纳极端情况下的 1 天大单（实际远超够用）
 
     def bump_cumulative(self, signer: str) -> int:
         """大单触发后递增。返回这是该签名地址本轮第几笔（>=1）。"""
@@ -201,6 +213,69 @@ class RuntimeState:
         while len(self.cumulative_trades) > self._CUMULATIVE_CAP:
             self.cumulative_trades.popitem(last=False)
         return n
+
+    def add_match_for_summary(
+        self,
+        *,
+        market_title: str,
+        market_slug: str,
+        market_id: str,
+        value: Decimal,
+        signer: str,
+        timestamp: datetime,
+    ) -> None:
+        """每笔被告警的大单都进入这个滚动窗口；摘要任务读它做聚合。"""
+        self.recent_matches.append({
+            "title": market_title or "?",
+            "slug": market_slug or "",
+            "mid": market_id or "",
+            "value": value,
+            "signer": signer or "",
+            "ts": timestamp,
+        })
+        # 上限保护；同时定期把 1 天前的事件也修剪掉
+        cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+        if len(self.recent_matches) > self._RECENT_MATCHES_CAP or len(self.recent_matches) % 100 == 0:
+            self.recent_matches = [m for m in self.recent_matches if m["ts"] >= cutoff]
+        if len(self.recent_matches) > self._RECENT_MATCHES_CAP:
+            self.recent_matches = self.recent_matches[-self._RECENT_MATCHES_CAP:]
+
+    def summarize_window(self, window_seconds: int) -> Optional[Dict[str, Any]]:
+        """聚合最近 window 秒内的成交。无数据返回 None。"""
+        if window_seconds <= 0:
+            return None
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+        within = [m for m in self.recent_matches if m["ts"] >= cutoff]
+        if not within:
+            return None
+
+        total_value = sum((m["value"] for m in within), Decimal("0"))
+        max_match = max(within, key=lambda m: m["value"])
+
+        # 按市场聚合
+        bucket: Dict[str, Dict[str, Any]] = {}
+        for m in within:
+            key = m["slug"] or m["mid"] or m["title"]
+            if key not in bucket:
+                bucket[key] = {
+                    "title": m["title"],
+                    "slug": m["slug"],
+                    "mid": m["mid"],
+                    "value": Decimal("0"),
+                    "count": 0,
+                }
+            bucket[key]["value"] += m["value"]
+            bucket[key]["count"] += 1
+
+        top = sorted(bucket.values(), key=lambda x: x["value"], reverse=True)[:3]
+        return {
+            "count": len(within),
+            "total_value": total_value,
+            "max_value": max_match["value"],
+            "max_title": max_match["title"],
+            "top_markets": top,
+            "window_seconds": window_seconds,
+        }
 
     @property
     def threshold_usdt_wei(self) -> int:
@@ -215,6 +290,7 @@ class RuntimeState:
             threshold_usdt=cfg.threshold_usdt,
             usdt_wei_decimals=cfg.usdt_wei_decimals,
             lang=lang,
+            summary_interval_sec=cfg.summary_interval_sec,
             _path=cfg.runtime_state_path,
         )
 
@@ -227,10 +303,13 @@ class RuntimeState:
                     state.telegram_offset = int(saved["telegram_offset"])
                 if "lang" in saved and saved["lang"] in {"zh", "en"}:
                     state.lang = saved["lang"]
+                if "summary_interval_sec" in saved:
+                    state.summary_interval_sec = int(saved["summary_interval_sec"])
                 LOG.info(
-                    "已从 %s 恢复 runtime state: threshold=%s offset=%s lang=%s",
+                    "已从 %s 恢复 runtime state: threshold=%s offset=%s lang=%s summary=%ss",
                     cfg.runtime_state_path,
                     state.threshold_usdt, state.telegram_offset, state.lang,
+                    state.summary_interval_sec,
                 )
             except (InvalidOperation, ValueError, TypeError) as exc:
                 LOG.warning("runtime state 字段格式异常 (%s): %s — 用 env 默认", saved, exc)
@@ -238,13 +317,14 @@ class RuntimeState:
         return state
 
     def persist(self) -> None:
-        """把当前阈值 + offset + lang 写盘。失败只 log，不抛异常。"""
+        """把当前阈值 + offset + lang + summary_interval 写盘。失败只 log，不抛异常。"""
         if not self._path:
             return
         save_runtime_state(self._path, {
             "threshold_usdt": str(self.threshold_usdt),
             "telegram_offset": self.telegram_offset,
             "lang": self.lang,
+            "summary_interval_sec": self.summary_interval_sec,
         })
 
 
@@ -573,18 +653,36 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "cumulative_fmt": "本轮第 {n} 笔",
         "btn_custom": "✏️ 自定义",
         "test_caption": "🧪 <b>测试推送</b>（不是真实成交）",
+        "summary_title": "📊 <b>Predict Whale 摘要</b>",
+        "summary_period_fmt": "过去 {label}：",
+        "summary_total_count": "总大单",
+        "summary_total_value": "总成交额",
+        "summary_max_trade": "最大单",
+        "summary_top_markets": "最活跃市场",
+        "summary_none_fmt": "过去 {label}没有大单",
+        "summary_off": "自动摘要已关闭（间隔 = 0），仍可 /summary 手动查",
+        "summary_set_ok_fmt": "摘要间隔已设为 <b>{label}</b>",
+        "summary_set_off": "已关闭自动摘要（仍可 /summary 手动查）",
+        "summary_set_help": (
+            "用法：<code>/set_summary 60</code>（分钟）或 <code>/set_summary 0</code> 关闭。\n"
+            "支持 <code>/set_summary 30s</code> / <code>/set_summary 2h</code>。"
+        ),
+        "summary_set_invalid": "❌ 无效时长。1m–24h，或 0 关闭。",
+        "shares_unit": "笔",
         "stopped": "🛑 <b>Predict 大额监控已停止</b>",
         "help_text": (
             "🐋 <b>Predict Whale Bot</b>\n\n"
             "底部按钮：<b>菜单 · 状态</b>\n\n"
             "<b>菜单按钮（管理员）</b>\n"
-            "💵 预设金额 → 一键改阈值\n"
+            "💵 预设 $100/$300/$500/$1k → 一键改阈值\n"
             "✏️ → 输入任意金额\n"
             "🌐 → 切换中英文\n"
             "🧪 → 用当前阈值发测试推送\n\n"
-            "<b>命令</b>\n"
-            "<code>/menu /status</code>\n"
-            "<code>/set_match 1000</code> · <code>/lang zh|en</code> · <code>/whoami</code>"
+            "<b>命令（任意聊天可用）</b>\n"
+            "<code>/menu /status /summary /whoami /lang zh|en</code>\n"
+            "<b>命令（管理员）</b>\n"
+            "<code>/set_match 1000</code>  改成交阈值\n"
+            "<code>/set_summary 60</code>  改自动摘要间隔（分钟，<code>0</code>=关）"
         ),
     },
     "en": {
@@ -621,18 +719,36 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "cumulative_fmt": "trade #{n} this session",
         "btn_custom": "✏️ Custom",
         "test_caption": "🧪 <b>Test alert</b> (not a real trade)",
+        "summary_title": "📊 <b>Predict Whale Summary</b>",
+        "summary_period_fmt": "Past {label}:",
+        "summary_total_count": "Total trades",
+        "summary_total_value": "Total volume",
+        "summary_max_trade": "Largest",
+        "summary_top_markets": "Top markets",
+        "summary_none_fmt": "No large trades in the past {label}",
+        "summary_off": "Auto-summary off (interval=0), use /summary on demand",
+        "summary_set_ok_fmt": "Summary interval set to <b>{label}</b>",
+        "summary_set_off": "Auto-summary off (use /summary on demand)",
+        "summary_set_help": (
+            "Usage: <code>/set_summary 60</code> (minutes) or <code>/set_summary 0</code> to disable.\n"
+            "Also accepts <code>/set_summary 30s</code> / <code>/set_summary 2h</code>."
+        ),
+        "summary_set_invalid": "❌ Invalid duration. Range 1m–24h, or 0 to disable.",
+        "shares_unit": "trades",
         "stopped": "🛑 <b>Predict whale-bot stopped</b>",
         "help_text": (
             "🐋 <b>Predict Whale Bot</b>\n\n"
             "Bottom buttons: <b>Menu · Status</b>\n\n"
             "<b>Menu (admin)</b>\n"
-            "💵 Preset amounts → set threshold\n"
+            "💵 Presets $100/$300/$500/$1k → set threshold\n"
             "✏️ → enter any amount\n"
             "🌐 → toggle zh/en\n"
             "🧪 → send a test alert with current threshold\n\n"
-            "<b>Commands</b>\n"
-            "<code>/menu /status</code>\n"
-            "<code>/set_match 1000</code> · <code>/lang zh|en</code> · <code>/whoami</code>"
+            "<b>Commands (any chat)</b>\n"
+            "<code>/menu /status /summary /whoami /lang zh|en</code>\n"
+            "<b>Commands (admin)</b>\n"
+            "<code>/set_match 1000</code>  threshold (USDT)\n"
+            "<code>/set_summary 60</code>  auto-summary interval (min, <code>0</code>=off)"
         ),
     },
 }
@@ -695,17 +811,23 @@ class Telegram:
         *,
         silent: bool = False,
         reply_markup: Optional[Dict[str, Any]] = None,
+        chat_id: Optional[Any] = None,
     ) -> Optional[int]:
+        """
+        发消息。chat_id 可选；不传 → 默认主告警频道（cfg.tg_chat_id）。
+        命令应答场景里传入消息源 chat_id，让 bot 在私聊/群里就地回复。
+        """
         chunks = chunk_html_safely(text, 3900) or [text]
         last_message_id: Optional[int] = None
+        target_chat = str(chat_id) if chat_id is not None else self.cfg.tg_chat_id
 
-        # 串行发送，避免 matches/orderbook 两个任务并发触发 Telegram 限流。
+        # 串行发送，避免多个监控任务并发触发 Telegram 限流。
         async with self._lock:
             for idx, chunk in enumerate(chunks):
                 # markup 只附在最后一片，否则按钮会被前面的分片覆盖。
                 markup = reply_markup if idx == len(chunks) - 1 else None
                 last_message_id = await self._send_one(
-                    chunk, silent=silent, reply_markup=markup
+                    chunk, silent=silent, reply_markup=markup, chat_id=target_chat,
                 )
                 await asyncio.sleep(0.05)
 
@@ -717,9 +839,10 @@ class Telegram:
         *,
         silent: bool,
         reply_markup: Optional[Dict[str, Any]] = None,
+        chat_id: Optional[str] = None,
     ) -> Optional[int]:
         payload: Dict[str, Any] = {
-            "chat_id": self.cfg.tg_chat_id,
+            "chat_id": chat_id or self.cfg.tg_chat_id,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
@@ -800,9 +923,10 @@ class Telegram:
         text: str,
         *,
         reply_markup: Optional[Dict[str, Any]] = None,
+        chat_id: Optional[Any] = None,
     ) -> None:
         payload: Dict[str, Any] = {
-            "chat_id": self.cfg.tg_chat_id,
+            "chat_id": str(chat_id) if chat_id is not None else self.cfg.tg_chat_id,
             "message_id": message_id,
             "text": text,
             "parse_mode": "HTML",
@@ -1038,7 +1162,7 @@ def market_title_of(m: Dict[str, Any]) -> str:
     )
 
 
-PRESET_AMOUNTS = (Decimal("500"), Decimal("1000"), Decimal("5000"), Decimal("10000"))
+PRESET_AMOUNTS = (Decimal("100"), Decimal("300"), Decimal("500"), Decimal("1000"))
 MIN_THRESHOLD_USDT = Decimal("1")
 MAX_THRESHOLD_USDT = Decimal("10000000")
 
@@ -1145,9 +1269,11 @@ class TelegramBot:
         self.tg = tg
         self.client = client
         self.base = tg.base
-        # 只接受配置好的 chat_id 的命令，避免别人加机器人后乱改阈值。
-        self._allowed_chat_id = str(cfg.tg_chat_id)
-        # 写入类命令（改阈值）只有这些 user_id 能用。空 = 不限制（兼容老部署）。
+        # 命令可以来自任何 chat（私聊 / 群 / 主告警频道）；回复就地。
+        # 主告警频道（cfg.tg_chat_id）只用作告警目的地。
+        self._main_chat_id = str(cfg.tg_chat_id)
+        # 写入类命令（改阈值/测试推送/改摘要间隔）只有这些 user_id 能用。
+        # 空集合 = 不限制（兼容老部署，但强烈建议设置 ALLOWED_USER_IDS）。
         self._admin_user_ids = cfg.allowed_user_ids
 
     def _is_admin(self, user_id: Any) -> bool:
@@ -1160,7 +1286,7 @@ class TelegramBot:
             return False
 
     async def run(self, stop: asyncio.Event) -> None:
-        LOG.info("Telegram 命令机器人启动，allowed chat_id=%s", self._allowed_chat_id)
+        LOG.info("Telegram 命令机器人启动，主告警 chat_id=%s（命令接受来自任意 chat）", self._main_chat_id)
 
         await self._prepare()
 
@@ -1248,14 +1374,17 @@ class TelegramBot:
                     "commands": [
                         {"command": "menu", "description": "打开监控菜单"},
                         {"command": "status", "description": "查看当前阈值"},
+                        {"command": "summary", "description": "查看当前窗口摘要"},
                         {"command": "set_match", "description": "设置成交阈值 (USDT)"},
+                        {"command": "set_summary", "description": "设置自动摘要间隔（如 60 / 2h / 0）"},
+                        {"command": "whoami", "description": "查看自己的 user_id"},
                         {"command": "help", "description": "查看帮助"},
                     ]
                 },
                 timeout=httpx.Timeout(10),
             )
             if resp.status_code == 200 and resp.json().get("ok"):
-                LOG.info("Telegram 命令列表已注册（/menu /status /set_match /help）")
+                LOG.info("Telegram 命令列表已注册（/menu /status /summary /set_match /set_summary /whoami /help）")
         except Exception as exc:
             LOG.warning("setMyCommands 失败（不影响功能）: %s", exc)
 
@@ -1270,9 +1399,6 @@ class TelegramBot:
                 LOG.info("Telegram webhook 已清空（如有）")
         except Exception as exc:
             LOG.warning("deleteWebhook 失败（可忽略）: %s", exc)
-
-    def _allowed(self, chat_id: Any) -> bool:
-        return str(chat_id) == self._allowed_chat_id
 
     async def _handle_update(self, update: Dict[str, Any]) -> None:
         if "message" in update:
@@ -1289,18 +1415,13 @@ class TelegramBot:
         user_id = from_user.get("id")
         user_label = from_user.get("username") or from_user.get("first_name") or user_id
 
-        if not self._allowed(chat_id):
-            if text.startswith("/"):
-                LOG.warning(
-                    "收到未授权 chat 的命令 chat_id=%s type=%s 期望 %s text=%r — 忽略。",
-                    chat_id, chat_type, self._allowed_chat_id, text[:80],
-                )
-            return
-
         is_admin = self._is_admin(user_id)
+        # 命令在哪发的就回哪。私聊 bot → 私聊回复，群里发 → 群里回复。
+        # 主告警频道（cfg.tg_chat_id）不参与命令路由 —— 只用于发布全局 alert。
+        src = chat_id
 
         # 自定义阈值的 force_reply 回填：用户的消息是对 bot 之前的"请输入自定义"提示
-        # 的回复时，按提示里写的"成交"/"盘口"决定改哪个阈值。
+        # 的回复时，把后续消息当作金额处理。
         reply_to = msg.get("reply_to_message")
         if (
             isinstance(reply_to, dict)
@@ -1311,9 +1432,9 @@ class TelegramBot:
         ):
             if not is_admin:
                 LOG.warning("非管理员尝试改阈值: user=%s id=%s", user_label, user_id)
-                await self.tg.send("⛔ 仅管理员可改阈值。")
+                await self.tg.send("⛔ 仅管理员可改阈值。", chat_id=src)
                 return
-            await self._set_threshold("match", text)
+            await self._set_threshold("match", text, reply_chat_id=src)
             LOG.info("admin %s (id=%s) 改了成交阈值 -> %s", user_label, user_id, text)
             return
 
@@ -1325,8 +1446,8 @@ class TelegramBot:
             return
 
         LOG.info(
-            "收到命令 chat=%s user=%s(id=%s) text=%r admin=%s",
-            chat_id, user_label, user_id, text[:80], is_admin,
+            "收到命令 chat=%s(type=%s) user=%s(id=%s) text=%r admin=%s",
+            chat_id, chat_type, user_label, user_id, text[:80], is_admin,
         )
 
         head, _, tail = text.partition(" ")
@@ -1334,65 +1455,73 @@ class TelegramBot:
         cmd = head.split("@", 1)[0].lower()
         arg = tail.strip()
 
-        write_cmds = {"/set_match"}
+        write_cmds = {"/set_match", "/set_summary", "/test"}
         if cmd in write_cmds and not is_admin:
             await self.tg.send(
-                f"⛔ 仅管理员可改阈值。当前 user_id=<code>{user_id}</code>，"
-                "如需授权请把它加进 ALLOWED_USER_IDS。"
+                f"⛔ 仅管理员可执行此命令。当前 user_id=<code>{user_id}</code>，"
+                "如需授权请把它加进 ALLOWED_USER_IDS。",
+                chat_id=src,
             )
             LOG.warning("非管理员尝试 %s: user=%s id=%s", cmd, user_label, user_id)
             return
 
         if cmd == "/start":
-            # /start 用持久键盘开场，让底部「菜单」按钮立刻就位。
             await self.tg.send(
                 _menu_text(self.state),
                 reply_markup=_persistent_keyboard(),
+                chat_id=src,
             )
         elif cmd == "/menu":
-            # /menu 用 inline 预设按钮，底部持久键盘不会被覆盖。
             await self.tg.send(
                 _menu_text(self.state),
                 reply_markup=_menu_keyboard(self.state),
+                chat_id=src,
             )
         elif cmd == "/status":
             await self.tg.send(
                 _menu_text(self.state),
                 reply_markup=_persistent_keyboard(),
+                chat_id=src,
             )
         elif cmd == "/whoami":
-            # 帮用户查自己的 user_id，方便加进 ALLOWED_USER_IDS。
             await self.tg.send(
                 f"你的 Telegram user_id：<code>{user_id}</code>\n"
                 f"用户名：<code>{html.escape(str(user_label))}</code>\n"
-                f"管理员权限：<b>{'✅ 是' if is_admin else '❌ 否'}</b>"
+                f"管理员权限：<b>{'✅ 是' if is_admin else '❌ 否'}</b>",
+                chat_id=src,
             )
         elif cmd == "/lang":
-            # /lang zh / /lang en — 改语言；不带参数 = 显示当前
             wanted = arg.strip().lower()
             if wanted in {"zh", "cn", "chinese", "中文"}:
                 self.state.lang = "zh"
                 self.state.persist()
-                await self.tg.send(t(self.state, "lang_switched"))
+                await self.tg.send(t(self.state, "lang_switched"), chat_id=src)
             elif wanted in {"en", "english", "英文"}:
                 self.state.lang = "en"
                 self.state.persist()
-                await self.tg.send(t(self.state, "lang_switched"))
+                await self.tg.send(t(self.state, "lang_switched"), chat_id=src)
             else:
                 await self.tg.send(
                     f"Current language: <b>{self.state.lang}</b>\n"
-                    "Usage: <code>/lang zh</code> 或 <code>/lang en</code>"
+                    "Usage: <code>/lang zh</code> 或 <code>/lang en</code>",
+                    chat_id=src,
                 )
         elif cmd == "/set_match":
-            await self._set_threshold("match", arg)
+            await self._set_threshold("match", arg, reply_chat_id=src)
             LOG.info("admin %s (id=%s) /set_match -> %s", user_label, user_id, arg)
+        elif cmd == "/summary":
+            # 任何用户都能查询当前摘要；回复在源聊天。
+            await self._send_summary(reply_chat_id=src)
+        elif cmd == "/set_summary":
+            await self._handle_set_summary(arg, reply_chat_id=src)
         elif cmd == "/help":
-            await self.tg.send(t(self.state, "help_text"), reply_markup=_persistent_keyboard())
+            await self.tg.send(
+                t(self.state, "help_text"),
+                reply_markup=_persistent_keyboard(),
+                chat_id=src,
+            )
         elif cmd == "/test":
-            if not is_admin:
-                await self.tg.send("⛔ admin only")
-                return
-            await self._send_test_alert()
+            await self._send_test_alert(reply_chat_id=src)
 
     async def _handle_callback(self, cb: Dict[str, Any]) -> None:
         cb_id = cb.get("id", "")
@@ -1401,18 +1530,13 @@ class TelegramBot:
         user_id = from_user.get("id")
         user_label = from_user.get("username") or from_user.get("first_name") or user_id
 
-        if not self._allowed(chat_id):
-            LOG.warning(
-                "未授权回调 chat_id=%s 期望 %s data=%r",
-                chat_id, self._allowed_chat_id, cb.get("data"),
-            )
-            await self.tg.answer_callback_query(cb_id, "无权限")
-            return
-
+        # 不再按 chat_id 拒绝。任何 chat 都能点按钮，回复就地刷新。
+        # 写操作（改阈值/测试推送）仍按 user_id 看 ALLOWED_USER_IDS。
         data = cb.get("data") or ""
         message_id = (cb.get("message") or {}).get("message_id")
+        src = chat_id
 
-        # 刷新是只读，谁都能点
+        # 刷新：只读，谁都能点
         if data == "refresh":
             await self.tg.answer_callback_query(cb_id, "✓")
             if message_id:
@@ -1420,10 +1544,11 @@ class TelegramBot:
                     message_id,
                     _menu_text(self.state),
                     reply_markup=_menu_keyboard(self.state),
+                    chat_id=src,
                 )
             return
 
-        # 切换语言：zh ↔ en，并刷新菜单消息
+        # 切换语言：zh ↔ en
         if data == "lang:toggle":
             self.state.lang = "en" if self.state.lang == "zh" else "zh"
             self.state.persist()
@@ -1433,6 +1558,7 @@ class TelegramBot:
                     message_id,
                     _menu_text(self.state),
                     reply_markup=_menu_keyboard(self.state),
+                    chat_id=src,
                 )
             return
 
@@ -1442,7 +1568,7 @@ class TelegramBot:
                 await self.tg.answer_callback_query(cb_id, "⛔ admin only")
                 return
             await self.tg.answer_callback_query(cb_id, "✓")
-            await self._send_test_alert()
+            await self._send_test_alert(reply_chat_id=src)
             return
 
         # 其它都是写操作（改阈值），需要管理员权限
@@ -1460,6 +1586,7 @@ class TelegramBot:
                 f"💰 {CUSTOM_PROMPT_MARKER}成交阈值（USDT 数字，如 2500）。\n"
                 "回复这条消息即可，发送 /menu 取消。",
                 reply_markup=_custom_prompt_markup(),
+                chat_id=src,
             )
             return
 
@@ -1477,14 +1604,18 @@ class TelegramBot:
                 message_id,
                 _menu_text(self.state),
                 reply_markup=_menu_keyboard(self.state),
+                chat_id=src,
             )
 
-    async def _set_threshold(self, kind: str, raw: str) -> None:
+    async def _set_threshold(
+        self, kind: str, raw: str, *, reply_chat_id: Optional[Any] = None
+    ) -> None:
         amount = _parse_amount(raw)
         if amount is None:
             await self.tg.send(
                 f"❌ 无效金额：<code>{html.escape(raw or '(空)')}</code>\n"
-                f"范围 {MIN_THRESHOLD_USDT}–{int(MAX_THRESHOLD_USDT):,} USDT"
+                f"范围 {MIN_THRESHOLD_USDT}–{int(MAX_THRESHOLD_USDT):,} USDT",
+                chat_id=reply_chat_id,
             )
             return
 
@@ -1492,6 +1623,7 @@ class TelegramBot:
         await self.tg.send(
             _menu_text(self.state),
             reply_markup=_menu_keyboard(self.state),
+            chat_id=reply_chat_id,
         )
 
     async def _apply_threshold(self, kind: str, amount: Decimal) -> None:
@@ -1501,7 +1633,47 @@ class TelegramBot:
         # 立刻写盘，重启续跑就能恢复用户调过的阈值
         self.state.persist()
 
-    async def _send_test_alert(self) -> None:
+    async def _send_summary(self, *, reply_chat_id: Optional[Any] = None) -> None:
+        """渲染当前窗口摘要并发到指定 chat（无指定 = 主告警频道）。"""
+        # 用当前自动间隔做窗口；间隔 = 0（关闭）时仍按"过去 1 小时"快查
+        window = self.state.summary_interval_sec or 3600
+        summary = self.state.summarize_window(window)
+        if not summary:
+            label = _format_duration_label(window, self.state.lang)
+            await self.tg.send(
+                t(self.state, "summary_none_fmt").format(label=label),
+                chat_id=reply_chat_id,
+            )
+            return
+        text = format_summary_alert(summary, self.cfg, self.state)
+        await self.tg.send(text, chat_id=reply_chat_id)
+
+    async def _handle_set_summary(
+        self, raw: str, *, reply_chat_id: Optional[Any] = None
+    ) -> None:
+        """改自动摘要间隔；admin 已由调用方校验。"""
+        if not raw:
+            await self.tg.send(t(self.state, "summary_set_help"), chat_id=reply_chat_id)
+            return
+        secs = _parse_duration(raw)
+        if secs is None:
+            await self.tg.send(
+                t(self.state, "summary_set_invalid") + "\n" + t(self.state, "summary_set_help"),
+                chat_id=reply_chat_id,
+            )
+            return
+        self.state.summary_interval_sec = secs
+        self.state.persist()
+        if secs == 0:
+            await self.tg.send(t(self.state, "summary_set_off"), chat_id=reply_chat_id)
+        else:
+            label = _format_duration_label(secs, self.state.lang)
+            await self.tg.send(
+                t(self.state, "summary_set_ok_fmt").format(label=label),
+                chat_id=reply_chat_id,
+            )
+
+    async def _send_test_alert(self, *, reply_chat_id: Optional[Any] = None) -> None:
         """构造一笔假成交，按当前阈值/语言渲染一遍。用于验证消息样式 + 通道。
         故意填上 makers 多人、手续费、刚刚的 executedAt、cumulative=3，让 🧪 一键
         看到所有增强字段的样子。不调 bump_cumulative，避免污染真实计数器。"""
@@ -1549,7 +1721,7 @@ class TelegramBot:
         text, markup = format_match_alert(fake_event, self.cfg, self.state, cumulative=3)
         # 加个"测试推送"前缀，让用户分清这不是真单
         text = f"{t(self.state, 'test_caption')}\n\n{text}"
-        await self.tg.send(text, reply_markup=markup)
+        await self.tg.send(text, reply_markup=markup, chat_id=reply_chat_id)
 
 
 def event_value_usdt(event: Dict[str, Any], cfg: Config) -> Decimal:
@@ -2128,6 +2300,41 @@ async def monitor_matches(
                     text, markup = format_match_alert(ev, cfg, state, cumulative=n)
                     await tg.send(text, reply_markup=markup)
 
+                    # 同步记入摘要滚动窗口（聚合用），不影响 alert 发送。
+                    try:
+                        notional = event_value_usdt(ev, cfg)
+                        if notional > 0:
+                            market = ev.get("market") or {}
+                            mid = market.get("id") or ev.get("marketId") or ""
+                            slug = (
+                                market.get("slug")
+                                or market.get("urlSlug")
+                                or market.get("categorySlug")
+                                or ""
+                            )
+                            title = market_title_of(market) if isinstance(market, dict) else "?"
+                            ts_raw = ev.get("executedAt") or ev.get("createdAt") or ""
+                            ts: datetime = datetime.now(timezone.utc)
+                            if ts_raw:
+                                try:
+                                    ts = datetime.fromisoformat(
+                                        str(ts_raw).replace("Z", "+00:00")
+                                    )
+                                    if ts.tzinfo is None:
+                                        ts = ts.replace(tzinfo=timezone.utc)
+                                except Exception:
+                                    pass
+                            state.add_match_for_summary(
+                                market_title=title,
+                                market_slug=slug,
+                                market_id=str(mid),
+                                value=notional,
+                                signer=signer,
+                                timestamp=ts,
+                            )
+                    except Exception:
+                        LOG.exception("[summary] add_match_for_summary 异常（忽略）")
+
             startup = False
 
             if fresh:
@@ -2149,6 +2356,155 @@ async def monitor_matches(
         except asyncio.TimeoutError:
             pass
 
+
+# -------------------- 每小时摘要 --------------------
+
+
+def _format_duration_label(seconds: int, lang: str = "zh") -> str:
+    """3600 → '1 小时' / '1h'; 1800 → '30 分钟' / '30m'; 等。"""
+    if seconds <= 0:
+        return "0"
+    if seconds % 3600 == 0:
+        n = seconds // 3600
+        return f"{n} 小时" if lang == "zh" else f"{n}h"
+    if seconds % 60 == 0:
+        n = seconds // 60
+        return f"{n} 分钟" if lang == "zh" else f"{n}m"
+    return f"{seconds} 秒" if lang == "zh" else f"{seconds}s"
+
+
+def _parse_duration(raw: str) -> Optional[int]:
+    """
+    /set_summary 接受：60（默认分钟）、30s、2h、0（关闭）。
+    返回秒数；None = 解析失败；0 = 关闭。
+    """
+    s = (raw or "").strip().lower()
+    if not s:
+        return None
+    # 0 = 关
+    if s in {"0", "off", "disable", "none", "关"}:
+        return 0
+    # 单位后缀
+    multiplier = 60  # 默认分钟
+    if s.endswith(("s", "秒")):
+        s = s.rstrip("s秒")
+        multiplier = 1
+    elif s.endswith(("m", "min", "分", "分钟")):
+        for suffix in ("min", "分钟", "m", "分"):
+            if s.endswith(suffix):
+                s = s[: -len(suffix)]
+                break
+        multiplier = 60
+    elif s.endswith(("h", "hour", "小时", "时")):
+        for suffix in ("hour", "小时", "h", "时"):
+            if s.endswith(suffix):
+                s = s[: -len(suffix)]
+                break
+        multiplier = 3600
+    s = s.strip()
+    try:
+        n = float(s)
+    except ValueError:
+        return None
+    secs = int(n * multiplier)
+    if secs == 0:
+        return 0
+    # 安全护栏：1 分钟 ~ 24 小时
+    if secs < 60 or secs > 86400:
+        return None
+    return secs
+
+
+def format_summary_alert(
+    summary: Dict[str, Any], cfg: Config, state: "RuntimeState"
+) -> str:
+    """渲染摘要消息。"""
+    label = _format_duration_label(int(summary["window_seconds"]), state.lang)
+    lines: List[str] = [
+        t(state, "summary_title"),
+        "",
+        t(state, "summary_period_fmt").format(label=label),
+        f"{t(state, 'summary_total_count')}：<b>{summary['count']}</b>",
+        f"{t(state, 'summary_total_value')}：<b>${fmt_decimal(summary['total_value'], 0)}</b>",
+        f"{t(state, 'summary_max_trade')}：<b>${fmt_decimal(summary['max_value'], 0)}</b>"
+        f" · {normalize_text(summary['max_title'])}",
+        "",
+        f"{t(state, 'summary_top_markets')}：",
+    ]
+    unit = t(state, "shares_unit")
+    for i, mkt in enumerate(summary.get("top_markets") or [], start=1):
+        title_safe = normalize_text(mkt["title"])
+        link = _render_template(
+            cfg.market_url_template,
+            id=mkt.get("mid", ""), slug=mkt.get("slug", ""), title=mkt["title"],
+        )
+        if link:
+            title_html = f'<a href="{html.escape(link, quote=True)}">{title_safe}</a>'
+        else:
+            title_html = title_safe
+        lines.append(
+            f"{i}. {title_html} — <b>${fmt_decimal(mkt['value'], 0)}</b>"
+            f" / {mkt['count']} {unit}"
+        )
+
+    return "\n".join(lines)
+
+
+async def summary_runner(
+    cfg: Config,
+    state: "RuntimeState",
+    tg: "Telegram",
+    stop: asyncio.Event,
+) -> None:
+    """每 state.summary_interval_sec 秒发一次摘要到主告警频道。"""
+    LOG.info(
+        "[summary] 启动（间隔 %ds = %s）",
+        state.summary_interval_sec,
+        _format_duration_label(state.summary_interval_sec),
+    )
+    iteration = 0
+    while not stop.is_set():
+        iteration += 1
+        # 每次循环都重新读 summary_interval_sec —— 用户随时可能改
+        interval = state.summary_interval_sec
+        if interval <= 0:
+            # 关闭状态：每 10 秒醒一次复查
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                pass
+            continue
+
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return  # stop set
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            window = state.summary_interval_sec  # 用最新值（可能刚被 /set_summary 改过）
+            if window <= 0:
+                continue
+            summary = state.summarize_window(window)
+            if not summary:
+                LOG.info(
+                    "[summary] iter=%d 过去 %ds 无大单，跳过",
+                    iteration, window,
+                )
+                # 同时也清掉太老的 recent_matches
+                cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+                state.recent_matches = [m for m in state.recent_matches if m["ts"] >= cutoff]
+                continue
+            text = format_summary_alert(summary, cfg, state)
+            await tg.send(text, silent=True)
+            LOG.info(
+                "[summary] iter=%d 已推送（%d 笔，总额 $%s，最大 $%s）",
+                iteration, summary["count"],
+                fmt_decimal(summary["total_value"], 0),
+                fmt_decimal(summary["max_value"], 0),
+            )
+        except Exception:
+            LOG.exception("[summary] iter=%d 失败", iteration)
 
 
 async def main() -> None:
@@ -2195,6 +2551,9 @@ async def main() -> None:
         # 新市场上线告警，独立任务。
         if cfg.watch_new_markets:
             tasks.append(asyncio.create_task(watch_new_markets(cfg, state, predict, tg, stop)))
+
+        # 每 N 秒推一次摘要。state.summary_interval_sec=0 时任务空转直到被打开。
+        tasks.append(asyncio.create_task(summary_runner(cfg, state, tg, stop)))
 
         await stop.wait()
 

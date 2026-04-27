@@ -207,6 +207,9 @@ class RuntimeState:
     usdt_wei_decimals: int
     telegram_offset: int = 0
     lang: str = "zh"
+    # 运行期开关：盘口监控可以从菜单一键暂停（保留连接配置，但不连 WS、不告警）。
+    # 默认 True，向后兼容旧 runtime_state.json（缺字段时仍是 True）。
+    orderbook_enabled: bool = True
     _path: str = ""  # 仅内部用，不参与持久化
 
     @property
@@ -237,10 +240,13 @@ class RuntimeState:
                     state.telegram_offset = int(saved["telegram_offset"])
                 if "lang" in saved and saved["lang"] in {"zh", "en"}:
                     state.lang = saved["lang"]
+                if "orderbook_enabled" in saved:
+                    state.orderbook_enabled = bool(saved["orderbook_enabled"])
                 LOG.info(
-                    "已从 %s 恢复 runtime state: threshold=%s orderbook=%s offset=%s lang=%s",
+                    "已从 %s 恢复 runtime state: threshold=%s orderbook=%s offset=%s lang=%s ob_enabled=%s",
                     cfg.runtime_state_path,
-                    state.threshold_usdt, state.orderbook_threshold_usdt, state.telegram_offset, state.lang,
+                    state.threshold_usdt, state.orderbook_threshold_usdt,
+                    state.telegram_offset, state.lang, state.orderbook_enabled,
                 )
             except (InvalidOperation, ValueError, TypeError) as exc:
                 LOG.warning("runtime state 字段格式异常 (%s): %s — 用 env 默认", saved, exc)
@@ -256,6 +262,7 @@ class RuntimeState:
             "orderbook_threshold_usdt": str(self.orderbook_threshold_usdt),
             "telegram_offset": self.telegram_offset,
             "lang": self.lang,
+            "orderbook_enabled": self.orderbook_enabled,
         })
 
 
@@ -576,6 +583,12 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "btn_lang_switch": "🌐 EN",
         "btn_refresh": "🔄",
         "btn_test": "🧪 测试推送",
+        "btn_ob_off": "📊 关",
+        "btn_ob_on": "📊 开",
+        "ob_toggled_on": "盘口监控已开启",
+        "ob_toggled_off": "盘口监控已暂停",
+        "ob_off_warning": "⚠️ MODE=orderbook，关闭后只剩新市场监控",
+        "ob_status_off": "[暂停]",
         "btn_custom": "✏️",
         "test_caption": "🧪 <b>测试推送</b>（不是真实成交）",
         "stopped": "🛑 <b>Predict 大额监控已停止</b>",
@@ -619,6 +632,12 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "btn_lang_switch": "🌐 中",
         "btn_refresh": "🔄",
         "btn_test": "🧪 Test",
+        "btn_ob_off": "📊 OFF",
+        "btn_ob_on": "📊 ON",
+        "ob_toggled_on": "Orderbook ON",
+        "ob_toggled_off": "Orderbook paused",
+        "ob_off_warning": "⚠️ MODE=orderbook; only new-market watcher remains",
+        "ob_status_off": "[paused]",
         "btn_custom": "✏️",
         "test_caption": "🧪 <b>Test alert</b> (not a real trade)",
         "stopped": "🛑 <b>Predict whale-bot stopped</b>",
@@ -1050,11 +1069,12 @@ def _menu_text(state: RuntimeState, *, mode: str = "") -> str:
     meta_bits = [f"🌐 {lang_label}"]
     if mode:
         meta_bits.append(f"⚡ <code>{html.escape(mode)}</code>")
+    ob_suffix = "" if state.orderbook_enabled else f" {t(state, 'ob_status_off')}"
     return (
         f"{t(state, 'menu_title')}\n\n"
         f"💵 {t(state, 'match_short')} <b>${fmt_decimal(state.threshold_usdt, 2)}</b>"
         f"  ｜  "
-        f"📊 {t(state, 'ob_short')} <b>${fmt_decimal(state.orderbook_threshold_usdt, 2)}</b>\n"
+        f"📊 {t(state, 'ob_short')} <b>${fmt_decimal(state.orderbook_threshold_usdt, 2)}</b>{ob_suffix}\n"
         + "  ｜  ".join(meta_bits)
     )
 
@@ -1079,12 +1099,14 @@ def _menu_keyboard(state: RuntimeState) -> Dict[str, Any]:
         cells.append({"text": t(state, "btn_custom"), "callback_data": f"custom:{prefix}"})
         return cells
 
+    ob_label = t(state, "btn_ob_off") if state.orderbook_enabled else t(state, "btn_ob_on")
     return {
         "inline_keyboard": [
             preset_row("match", "💵"),
             preset_row("book", "📊"),
             [
                 {"text": t(state, "btn_lang_switch"), "callback_data": "lang:toggle"},
+                {"text": ob_label, "callback_data": "ob:toggle"},
                 {"text": t(state, "btn_refresh"), "callback_data": "refresh"},
                 {"text": t(state, "btn_test"), "callback_data": "test"},
             ],
@@ -1458,6 +1480,31 @@ class TelegramBot:
                 return
             await self.tg.answer_callback_query(cb_id, "✓")
             await self._send_test_alert()
+            return
+
+        # 盘口监控开关：admin only。toggle 后菜单文案/按钮立即刷新。
+        if data == "ob:toggle":
+            if not self._is_admin(user_id):
+                await self.tg.answer_callback_query(cb_id, "⛔ admin only")
+                return
+            self.state.orderbook_enabled = not self.state.orderbook_enabled
+            self.state.persist()
+            toast_key = "ob_toggled_on" if self.state.orderbook_enabled else "ob_toggled_off"
+            toast = t(self.state, toast_key)
+            # mode=orderbook 时关掉等于把整个 bot 静音（除新市场监控），警告一下
+            if not self.state.orderbook_enabled and self.cfg.mode == "orderbook":
+                toast = f"{toast} · {t(self.state, 'ob_off_warning')}"
+            await self.tg.answer_callback_query(cb_id, toast)
+            if message_id:
+                await self.tg.edit_message(
+                    message_id,
+                    _menu_text(self.state, mode=self.cfg.mode),
+                    reply_markup=_menu_keyboard(self.state),
+                )
+            LOG.info(
+                "admin %s (id=%s) toggled orderbook -> %s",
+                user_label, user_id, self.state.orderbook_enabled,
+            )
             return
 
         # 其它都是写操作（改阈值），需要管理员权限
@@ -2182,9 +2229,10 @@ async def monitor_orderbook(
     tg: Telegram,
     stop: asyncio.Event,
 ) -> None:
+    ob_status_suffix = "" if state.orderbook_enabled else f" {t(state, 'ob_status_off')}"
     await tg.send(
         f"{t(state, 'ob_started')}\n"
-        f"{t(state, 'threshold')}: <b>${fmt_decimal(state.orderbook_threshold_usdt, 2)} USDT</b>\n"
+        f"{t(state, 'threshold')}: <b>${fmt_decimal(state.orderbook_threshold_usdt, 2)} USDT</b>{ob_status_suffix}\n"
         f"Mode: <code>orderbook</code>\n"
         f"{t(state, 'open_menu_hint')}",
         silent=True,
@@ -2194,6 +2242,15 @@ async def monitor_orderbook(
     backoff = 1
 
     while not stop.is_set():
+        # 盘口被菜单关掉时不连 WS、不订阅；每 10s 醒一次复查 flag。
+        # 10s 是手动 toggle 的可接受延迟；用户切完按钮等几秒就能看到生效。
+        if not state.orderbook_enabled:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                pass
+            continue
+
         subscribed: Set[int] = set()
         market_titles: Dict[int, str] = {}
 
@@ -2237,6 +2294,12 @@ async def monitor_orderbook(
                 )
 
                 async for raw in ws:
+                    # 跑着的时候被菜单关掉 → 主动断 WS，外层 while 会落到上面
+                    # 的 if 分支去 sleep。finally 里的 refresher_task 也会一起回收。
+                    if not state.orderbook_enabled:
+                        LOG.info("orderbook 已关闭，主动断开 WS")
+                        break
+
                     msg = json.loads(raw)
                     msg_type = msg.get("type")
                     topic = msg.get("topic", "")

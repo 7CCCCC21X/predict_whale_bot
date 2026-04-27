@@ -96,10 +96,6 @@ class Config:
     default_lang: str
     user_url_template: str
 
-    watch_new_markets: bool
-    new_markets_check_sec: int
-    seen_markets_path: str
-
     # 每小时摘要：默认 3600s（1 小时），运行期可用 /set_summary 改并持久化。
     # 设成 0 = 关掉自动摘要（仍可 /summary 手动查）
     summary_interval_sec: int
@@ -180,12 +176,6 @@ class Config:
                 "https://predict.fun/zh-cn/portfolio/{address}?ref=B00EA",
             ).strip(),
 
-            watch_new_markets=env_bool("WATCH_NEW_MARKETS", True),
-            new_markets_check_sec=int(os.getenv("NEW_MARKETS_CHECK_SEC", "30")),
-            seen_markets_path=os.getenv(
-                "SEEN_MARKETS_PATH", "/data/predict_seen_markets.json"
-            ).strip(),
-
             summary_interval_sec=int(os.getenv("SUMMARY_INTERVAL_SEC", "3600")),
 
             # 默认走上海时区（用户在国内）。海外用户可设 DISPLAY_TZ=America/New_York
@@ -204,6 +194,9 @@ class RuntimeState:
     usdt_wei_decimals: int
     telegram_offset: int = 0
     lang: str = "zh"
+    # 主告警频道是否暂停。True 时全局停推（fanout 仍按订阅 paused 字段为各 DM 独立判断）。
+    # 持久化在 runtime_state.json，重启续跑自动恢复。
+    paused: bool = False
     # 摘要轮播间隔（秒），可以 /set_summary 动态改并写盘
     summary_interval_sec: int = 3600
     # 主告警 chat（持久化里不存；from_config 时从 cfg 注入），用来区分"主频道 vs DM"
@@ -301,6 +294,36 @@ class RuntimeState:
             "window_seconds": window_seconds,
         }
 
+    def count_signer_alerts(self, signer: str, hours: int = 1) -> int:
+        """近 N 小时内该 signer 触发过几次告警（含当前这笔，所以 +1）。
+        当前这笔在 format_match_alert 渲染时还没 add_match_for_summary，所以补 1。"""
+        if not signer:
+            return 0
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        sig_lower = signer.lower()
+        n = sum(
+            1 for m in self.recent_matches
+            if m["ts"] >= cutoff and str(m.get("signer", "")).lower() == sig_lower
+        )
+        return n + 1
+
+    def count_market_alerts(
+        self, slug: str = "", market_id: str = "", hours: int = 1
+    ) -> int:
+        """近 N 小时该 market 触发过几次告警。优先用 slug 比对，缺 slug 用 market_id。"""
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        slug_lower = (slug or "").lower()
+        mid_str = str(market_id or "")
+        n = 0
+        for m in self.recent_matches:
+            if m["ts"] < cutoff:
+                continue
+            if slug_lower and str(m.get("slug", "")).lower() == slug_lower:
+                n += 1
+            elif not slug_lower and mid_str and str(m.get("mid", "")) == mid_str:
+                n += 1
+        return n + 1
+
     @property
     def threshold_usdt_wei(self) -> int:
         scale = Decimal(10) ** self.usdt_wei_decimals
@@ -330,6 +353,8 @@ class RuntimeState:
                     state.lang = saved["lang"]
                 if "summary_interval_sec" in saved:
                     state.summary_interval_sec = int(saved["summary_interval_sec"])
+                if "paused" in saved:
+                    state.paused = bool(saved["paused"])
                 if "subscribers" in saved and isinstance(saved["subscribers"], dict):
                     # 校验+裁掉异常项；threshold 留 str 形态在 dict 里，用时再转 Decimal
                     valid: Dict[str, Dict[str, Any]] = {}
@@ -345,6 +370,7 @@ class RuntimeState:
                             "lang": info.get("lang", "zh") if info.get("lang") in {"zh", "en"} else "zh",
                             "created_at": str(info.get("created_at", "")),
                             "last_seen": str(info.get("last_seen", "")),
+                            "paused": bool(info.get("paused", False)),
                         }
                     state.subscribers = valid
                 if "address_labels" in saved and isinstance(saved["address_labels"], dict):
@@ -366,7 +392,7 @@ class RuntimeState:
         return state
 
     def persist(self) -> None:
-        """把当前阈值 + offset + lang + summary_interval + subscribers 写盘。失败只 log。"""
+        """把当前阈值 + offset + lang + summary_interval + subscribers + paused 写盘。失败只 log。"""
         if not self._path:
             return
         save_runtime_state(self._path, {
@@ -374,6 +400,7 @@ class RuntimeState:
             "telegram_offset": self.telegram_offset,
             "lang": self.lang,
             "summary_interval_sec": self.summary_interval_sec,
+            "paused": self.paused,
             "subscribers": self.subscribers,
             "address_labels": self.address_labels,
         })
@@ -405,6 +432,24 @@ class RuntimeState:
             return info["lang"]
         return self.lang
 
+    def is_paused_for(self, chat_id: Any) -> bool:
+        """主告警频道看 state.paused；DM 看 subscribers[cid]['paused']。"""
+        key = str(chat_id)
+        if key == self.main_chat_id:
+            return self.paused
+        info = self.subscribers.get(key)
+        return bool(info.get("paused")) if info else False
+
+    def set_paused_for(self, chat_id: Any, paused: bool) -> None:
+        """主频道改全局 state.paused；DM 改自己 subscribers[cid]['paused']。"""
+        key = str(chat_id)
+        if key == self.main_chat_id:
+            self.paused = paused
+            return
+        # 用 upsert_subscriber 兜底创建条目，再设 paused
+        self.upsert_subscriber(chat_id)
+        self.subscribers[key]["paused"] = paused
+
     def upsert_subscriber(
         self,
         chat_id: Any,
@@ -425,6 +470,7 @@ class RuntimeState:
                 "lang": self.lang,
                 "created_at": now,
                 "last_seen": now,
+                "paused": False,
             }
             self.subscribers[key] = existing
             LOG.info("[subscribers] 新订阅 chat_id=%s 默认阈值=%s", key, existing["threshold_usdt"])
@@ -561,6 +607,26 @@ def fmt_money(x: Decimal) -> str:
     return f"${fmt_decimal(x, 2)}"
 
 
+def fmt_money_full(x: Decimal) -> str:
+    """钱的精确格式（带千分位 + 固定 2 位小数）：$1,948.00 / $480.97。
+    巨鲸卡片用，跟 flamy.gg 风格一致。"""
+    if x <= 0:
+        return "-"
+    q = x.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    return f"${q:,.2f}"
+
+
+def fmt_qty(x: Decimal) -> str:
+    """股数自适应：整数则无小数（2,000），有小数则保留 2 位（484.36）。
+    带千分位。"""
+    if x <= 0:
+        return "0"
+    integer_part = x.to_integral_value(rounding=ROUND_DOWN)
+    if x == integer_part:
+        return f"{int(integer_part):,}"
+    return f"{x.quantize(Decimal('0.01'), rounding=ROUND_DOWN):,.2f}"
+
+
 def fmt_compact_qty(x: Decimal) -> str:
     """股数紧凑展示：529 → "529"，3,624 → "3.6K"，1,200,000 → "1.2M"。"""
     n = abs(x)
@@ -647,41 +713,6 @@ def save_seen(path: str, seen: "OrderedDict[str, None]") -> None:
         os.replace(tmp, path)
     except Exception as exc:
         LOG.warning("保存 seen 状态失败 (%s): %s", path, exc)
-
-
-def load_seen_markets(path: str) -> Set[int]:
-    """已发过"新市场上线"告警的 market_id 集合。"""
-    if not path or not os.path.exists(path):
-        return set()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            ids = json.load(f)
-        if not isinstance(ids, list):
-            return set()
-        out: Set[int] = set()
-        for x in ids:
-            try:
-                out.add(int(x))
-            except Exception:
-                pass
-        LOG.info("已从 %s 加载 %d 条已知市场 ID", path, len(out))
-        return out
-    except Exception as exc:
-        LOG.warning("加载已知市场列表失败 (%s): %s", path, exc)
-        return set()
-
-
-def save_seen_markets(path: str, ids: Set[int]) -> None:
-    if not path:
-        return
-    tmp = f"{path}.tmp"
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(sorted(ids), f)
-        os.replace(tmp, path)
-    except Exception as exc:
-        LOG.warning("保存已知市场列表失败 (%s): %s", path, exc)
 
 
 def extract_username(event: Dict[str, Any]) -> str:
@@ -841,10 +872,9 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "shares": "股",
         "view_market": "📊 查看市场",
         "view_wallet": "👤 查看钱包",
-        "view_tx": "🔗 查看交易",
+        "view_tx": "🔗 交易哈希",
         "anon_wallet": "匿名钱包",
         "match_started": "✅ <b>Predict 成交大单监控已启动</b>",
-        "newm_started": "🆕 <b>Predict 新市场监控已启动</b>",
         "threshold": "阈值",
         "interval": "检查间隔",
         "open_menu_hint": "点底部「菜单」或发 /menu 调阈值",
@@ -856,6 +886,8 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "btn_lang_switch": "🌐 EN",
         "btn_refresh": "🔄",
         "btn_summary": "📊 摘要",
+        "btn_pause": "⏸ 暂停",
+        "btn_resume": "▶️ 恢复",
         "btn_test": "🧪 测试推送",  # 保留键以备 _send_test_alert 调用，按钮已不挂菜单
         "implied_label": "隐含",
         "fee_label": "手续费",
@@ -879,6 +911,9 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "signal_bearish": "看空",
         "card_delay_fmt": "延迟 {n}s",
         "card_anon_wallet": "匿名钱包",
+        "count_signer_fmt": "👤 钱包出现次数：近 {window} {n} 次",
+        "count_market_fmt": "📊 市场大额次数：近 {window} {n} 笔",
+        "window_1h": "1H",
         "tier_super": "超级鲸鱼单",
         "tier_big": "大鲸鱼单",
         "tier_mid": "中型鲸鱼单",
@@ -905,19 +940,19 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "🐋 <b>Predict Whale Bot</b>\n\n"
             "<b>私聊 bot</b>：自动注册，能改你<b>自己的</b>门槛、自己的语言。\n"
             "<b>主告警频道</b>：管理员才能改全局阈值。\n\n"
-            "<b>菜单按钮</b>\n"
-            "💵 预设 $100/$300/$500/$1k\n"
-            "✏️ 自定义（最低 $10）\n"
-            "🌐 切换中英文 · 🔄 刷新 · 🧪 测试推送（admin）\n\n"
-            "<b>命令</b>（任意聊天）\n"
-            "<code>/menu</code> · <code>/status</code> · <code>/summary</code>\n"
-            "<code>/whoami</code> · <code>/lang zh|en</code>\n"
-            "<code>/set_match 100</code>  改阈值（私聊改你自己的；主频道要 admin）\n"
-            "<code>/unsubscribe</code>  退订私聊推送\n"
-            "<code>/label 0x… 别名</code> · <code>/labels</code> · <code>/unlabel 0x…</code>"
-            "  地址别名（告警里替换显示）\n\n"
-            "<b>仅管理员</b>\n"
-            "<code>/set_summary 60</code> · <code>/subscribers</code>"
+            "<b>菜单按钮</b>（/menu）\n"
+            "💵 预设 $100/$300/$500/$1k · ✏️ 自定义（最低 $10）\n"
+            "🌐 中英 · 📊 摘要 · ⏸ 暂停/▶️ 恢复 · 🔄 刷新\n\n"
+            "<b>常用命令</b>\n"
+            "<code>/menu</code>  阈值 + 暂停 + 语言\n"
+            "<code>/summary</code>  当前窗口摘要\n"
+            "<code>/pause</code> · <code>/resume</code>  暂停/恢复推送\n"
+            "<code>/whoami</code> · <code>/lang zh|en</code>\n\n"
+            "<b>进阶（输全名即可）</b>\n"
+            "<code>/set_match 100</code>  改阈值（DM=自己，主频道要 admin）\n"
+            "<code>/unsubscribe</code>  退订私聊\n"
+            "<code>/label 0x… 别名</code> · <code>/labels</code> · <code>/unlabel 0x…</code>\n"
+            "<code>/set_summary 60</code> · <code>/subscribers</code>（admin）"
         ),
     },
     "en": {
@@ -929,10 +964,9 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "shares": "shares",
         "view_market": "📊 Market",
         "view_wallet": "👤 Wallet",
-        "view_tx": "🔗 Tx",
+        "view_tx": "🔗 Tx Hash",
         "anon_wallet": "Anon wallet",
         "match_started": "✅ <b>Predict match monitor started</b>",
-        "newm_started": "🆕 <b>Predict new-market watcher started</b>",
         "threshold": "Threshold",
         "interval": "Check interval",
         "open_menu_hint": "Tap “Menu” or send /menu to change thresholds",
@@ -944,6 +978,8 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "btn_lang_switch": "🌐 中",
         "btn_refresh": "🔄",
         "btn_summary": "📊 Summary",
+        "btn_pause": "⏸ Pause",
+        "btn_resume": "▶️ Resume",
         "btn_test": "🧪 Test",
         "implied_label": "Implied",
         "fee_label": "Fee",
@@ -966,6 +1002,9 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "signal_bearish": "bearish",
         "card_delay_fmt": "delay {n}s",
         "card_anon_wallet": "Anon wallet",
+        "count_signer_fmt": "👤 Wallet hits last {window}: {n}",
+        "count_market_fmt": "📊 Market hits last {window}: {n}",
+        "window_1h": "1H",
         "tier_super": "Super whale",
         "tier_big": "Big whale",
         "tier_mid": "Mid whale",
@@ -991,20 +1030,20 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "help_text": (
             "🐋 <b>Predict Whale Bot</b>\n\n"
             "<b>DM the bot</b>: auto-registers; controls <b>your own</b> threshold + language.\n"
-            "<b>Main alert chat</b>: admin only for the global threshold.\n\n"
-            "<b>Menu buttons</b>\n"
-            "💵 Presets $100/$300/$500/$1k\n"
-            "✏️ Custom (min $10)\n"
-            "🌐 Toggle zh/en · 🔄 Refresh · 🧪 Test (admin)\n\n"
-            "<b>Commands</b> (any chat)\n"
-            "<code>/menu</code> · <code>/status</code> · <code>/summary</code>\n"
-            "<code>/whoami</code> · <code>/lang zh|en</code>\n"
-            "<code>/set_match 100</code>  threshold (DM = your own; main chat = admin)\n"
+            "<b>Main alert chat</b>: admin only for global controls.\n\n"
+            "<b>Menu buttons</b> (/menu)\n"
+            "💵 $100/$300/$500/$1k presets · ✏️ Custom (min $10)\n"
+            "🌐 zh/en · 📊 Summary · ⏸ Pause/▶️ Resume · 🔄 Refresh\n\n"
+            "<b>Common</b>\n"
+            "<code>/menu</code>  threshold + pause + language\n"
+            "<code>/summary</code>  current window summary\n"
+            "<code>/pause</code> · <code>/resume</code>  stop/start alerts\n"
+            "<code>/whoami</code> · <code>/lang zh|en</code>\n\n"
+            "<b>Advanced (type full name)</b>\n"
+            "<code>/set_match 100</code>  threshold (DM = own; main = admin)\n"
             "<code>/unsubscribe</code>  stop DM alerts\n"
-            "<code>/label 0x… name</code> · <code>/labels</code> · <code>/unlabel 0x…</code>"
-            "  address aliases (shown in alerts)\n\n"
-            "<b>Admin only</b>\n"
-            "<code>/set_summary 60</code> · <code>/subscribers</code>"
+            "<code>/label 0x… name</code> · <code>/labels</code> · <code>/unlabel 0x…</code>\n"
+            "<code>/set_summary 60</code> · <code>/subscribers</code> (admin)"
         ),
     },
 }
@@ -1361,81 +1400,6 @@ class Predict:
 
         return out, True
 
-    async def fetch_open_markets(self) -> Dict[int, Dict[str, Any]]:
-        """
-        分页拉取尚未结束的市场。返回 market_id -> 原始市场对象。
-
-        过滤策略：只显式排除"已知关闭/已结算"的状态，未知状态默认收下。
-        Predict 的状态字段实际是什么值（OPEN/ACTIVE/LIVE/TRADING/...）不一定，
-        只信白名单会把没见过的状态全部丢掉，导致新市场永远不被发现。
-        """
-        markets: Dict[int, Dict[str, Any]] = {}
-        after: Optional[str] = None
-        pages = 0
-        status_counts: Dict[str, int] = {}
-        skipped_invisible = 0
-        skipped_closed = 0
-
-        while True:
-            pages += 1
-            params: Dict[str, Any] = {"first": 100}
-
-            if after:
-                params["after"] = after
-
-            data = await self.get("/v1/markets", params=params)
-            rows = data.get("data") or data.get("markets") or []
-
-            for m in rows:
-                try:
-                    mid = int(m.get("id") or m.get("marketId"))
-                except Exception:
-                    continue
-
-                visible = m.get("isVisible", True)
-                trading_status = str(m.get("tradingStatus") or m.get("status") or "").upper()
-                status_counts[trading_status or "(none)"] = status_counts.get(trading_status or "(none)", 0) + 1
-
-                if not visible:
-                    skipped_invisible += 1
-                    continue
-
-                if trading_status in CLOSED_LIKE_STATUSES:
-                    skipped_closed += 1
-                    continue
-
-                markets[mid] = m
-
-            page_info = data.get("pageInfo") or {}
-            after = (
-                data.get("cursor")
-                or data.get("nextCursor")
-                or page_info.get("endCursor")
-            )
-            has_next = bool(data.get("hasNextPage") or page_info.get("hasNextPage") or after)
-
-            if not has_next or not after or pages >= 100:
-                break
-
-        LOG.info(
-            "fetch_open_markets: 收 %d 个开放市场 (扫 %d 页，按 tradingStatus 分布 %s，跳过不可见 %d，跳过已结束 %d)",
-            len(markets), pages, status_counts, skipped_invisible, skipped_closed,
-        )
-        return markets
-
-
-# 显式排除的"已结束"状态。其它任何状态（OPEN/ACTIVE/LIVE/TRADING/PENDING/...）都收。
-CLOSED_LIKE_STATUSES = {
-    "CLOSED", "CLOSE",
-    "RESOLVED", "RESOLVING",
-    "CANCELLED", "CANCELED",
-    "EXPIRED",
-    "SETTLED", "SETTLING",
-    "ENDED",
-    "ARCHIVED",
-}
-
-
 def market_title_of(m: Dict[str, Any]) -> str:
     mid = m.get("id") or m.get("marketId") or "?"
     return str(
@@ -1468,11 +1432,17 @@ def _menu_text(
     # 临时 view-state 用来取翻译；不修改真正的 state.lang
     tmp_state = state if lang == state.lang else dataclass_replace_lang(state, lang)
     lang_label = t(tmp_state, "lang_zh") if lang == "zh" else t(tmp_state, "lang_en")
+    paused = state.is_paused_for(chat_id) if chat_id is not None else state.paused
+    if paused:
+        status_line = "\n⏸ <b>推送已暂停</b>" if lang == "zh" else "\n⏸ <b>Alerts paused</b>"
+    else:
+        status_line = ""
     return (
         f"{t(tmp_state, 'menu_title')}\n\n"
         f"{scope_hint}"
         f"💵 {t(tmp_state, 'match_short')} <b>${fmt_decimal(threshold, 2)} USDT</b>\n"
         f"🌐 {lang_label}"
+        f"{status_line}"
     )
 
 
@@ -1517,12 +1487,15 @@ def _menu_keyboard(state: RuntimeState, *, chat_id: Optional[Any] = None) -> Dic
         cells.append({"text": t(view, "btn_custom"), "callback_data": f"custom:{prefix}"})
         return cells
 
+    paused = state.is_paused_for(chat_id) if chat_id is not None else state.paused
+    pause_btn_key = "btn_resume" if paused else "btn_pause"
     return {
         "inline_keyboard": [
             preset_row("match", "💵"),
             [
                 {"text": t(view, "btn_lang_switch"), "callback_data": "lang:toggle"},
                 {"text": t(view, "btn_summary"), "callback_data": "summary"},
+                {"text": t(view, pause_btn_key), "callback_data": "pause:toggle"},
                 {"text": t(view, "btn_refresh"), "callback_data": "refresh"},
             ],
         ]
@@ -1694,17 +1667,15 @@ class TelegramBot:
             resp = await self.client.post(
                 f"{self.base}/setMyCommands",
                 json={
+                    # 这里只挂"主流程入口"，少而精；阈值/订阅/别名等都从 /menu 里走。
+                    # /set_match /unsubscribe /label /labels /unlabel /subscribers /status
+                    # 仍然可用，只是不在 / 自动补全里露出，避免菜单太长。
                     "commands": [
                         {"command": "menu", "description": "打开监控菜单"},
-                        {"command": "status", "description": "查看当前阈值"},
                         {"command": "summary", "description": "查看当前窗口摘要"},
-                        {"command": "set_match", "description": "设置成交阈值 (USDT，DM 里改自己的)"},
                         {"command": "set_summary", "description": "设置自动摘要间隔（如 60 / 2h / 0）"},
-                        {"command": "unsubscribe", "description": "退订私聊推送"},
-                        {"command": "label", "description": "给地址起别名（/label 0x... 名字）"},
-                        {"command": "labels", "description": "查看所有地址别名"},
-                        {"command": "unlabel", "description": "删除地址别名"},
-                        {"command": "subscribers", "description": "列出订阅者（admin）"},
+                        {"command": "pause", "description": "暂停推送（DM 改自己 / 主频道 admin）"},
+                        {"command": "resume", "description": "恢复推送"},
                         {"command": "whoami", "description": "查看自己的 user_id"},
                         {"command": "help", "description": "查看帮助"},
                     ]
@@ -1791,10 +1762,10 @@ class TelegramBot:
         cmd = head.split("@", 1)[0].lower()
         arg = tail.strip()
 
-        # 主频道里 /set_match / /set_summary 需要 admin。
-        # 私聊里 /set_match 是改"自己的"，不要 admin 检查。
+        # 主频道里 /set_match / /set_summary / /pause / /resume 需要 admin。
+        # 私聊里这些命令是改"自己的"，不要 admin 检查。
         admin_only_cmds = {"/set_summary"}
-        main_chat_admin_cmds = {"/set_match"}
+        main_chat_admin_cmds = {"/set_match", "/pause", "/resume"}
         if cmd in admin_only_cmds and not is_admin:
             await self.tg.send(
                 f"⛔ 仅管理员可执行此命令。当前 user_id=<code>{user_id}</code>。",
@@ -1804,7 +1775,7 @@ class TelegramBot:
             return
         if cmd in main_chat_admin_cmds and is_main and not is_admin:
             await self.tg.send(
-                f"⛔ 仅管理员可改全局阈值。私聊 bot 调你自己的就不需要管理员权限。",
+                f"⛔ 仅管理员可在主频道执行此命令。私聊 bot 调你自己的不需要管理员权限。",
                 chat_id=src,
             )
             return
@@ -1890,6 +1861,16 @@ class TelegramBot:
             await self._handle_unlabel(arg, reply_chat_id=src)
         elif cmd == "/labels":
             await self._handle_labels_list(reply_chat_id=src)
+        elif cmd == "/pause":
+            await self._handle_pause(
+                paused=True, target_chat_id=chat_id, reply_chat_id=src,
+                is_main=is_main, is_admin=is_admin,
+            )
+        elif cmd == "/resume":
+            await self._handle_pause(
+                paused=False, target_chat_id=chat_id, reply_chat_id=src,
+                is_main=is_main, is_admin=is_admin,
+            )
         elif cmd == "/help":
             await self.tg.send(
                 t(self.state, "help_text"),
@@ -1965,6 +1946,26 @@ class TelegramBot:
                 return
             await self.tg.answer_callback_query(cb_id, "✓")
             await self._send_test_alert(reply_chat_id=src)
+            return
+
+        # 暂停 / 恢复推送：主频道改全局（要 admin），DM 改自己（不要 admin）
+        if data == "pause:toggle":
+            if is_main and not self._is_admin(user_id):
+                await self.tg.answer_callback_query(cb_id, "⛔ 仅管理员可暂停全局推送")
+                return
+            cur = self.state.is_paused_for(chat_id)
+            self.state.set_paused_for(chat_id, not cur)
+            self.state.persist()
+            await self.tg.answer_callback_query(
+                cb_id, "⏸ 已暂停" if not cur else "▶️ 已恢复",
+            )
+            if message_id:
+                await self.tg.edit_message(
+                    message_id,
+                    _menu_text(self.state, chat_id=chat_id),
+                    reply_markup=_menu_keyboard(self.state, chat_id=chat_id),
+                    chat_id=src,
+                )
             return
 
         # 其它写操作（改阈值）：主频道里要 admin；DM 里改自己的不要 admin
@@ -2185,6 +2186,43 @@ class TelegramBot:
                 f"<code>{html.escape(short_addr(addr))}</code>"
             )
         await self.tg.send("\n".join(lines), chat_id=reply_chat_id)
+
+    async def _handle_pause(
+        self,
+        *,
+        paused: bool,
+        target_chat_id: Any,
+        reply_chat_id: Optional[Any] = None,
+        is_main: bool = False,
+        is_admin: bool = False,
+    ) -> None:
+        """暂停/恢复推送。主频道改全局；DM 改自己。
+        admin 检查由分发器（main_chat_admin_cmds）兜底，这里只关心写状态。"""
+        already = self.state.is_paused_for(target_chat_id)
+        self.state.set_paused_for(target_chat_id, paused)
+        self.state.persist()
+
+        scope = "全局推送" if is_main else "你的私聊推送"
+        if paused:
+            if already:
+                msg = f"⏸ {scope}已经处于暂停状态。"
+            else:
+                msg = (
+                    f"⏸ 已暂停 <b>{scope}</b>。\n"
+                    f"在此期间监控仍然在跑（不会丢数据），只是不向你推大单告警。\n"
+                    f"用 <code>/resume</code> 或菜单里的「▶️ 恢复」继续。"
+                )
+        else:
+            if not already:
+                msg = f"▶️ {scope}本来就在推送中。"
+            else:
+                msg = f"▶️ 已恢复 <b>{scope}</b>。下一笔满足阈值的大单会立刻推过来。"
+        LOG.info(
+            "[pause] target_chat_id=%s scope=%s paused=%s by %s",
+            target_chat_id, "main" if is_main else "dm", paused,
+            "admin" if is_admin else "user",
+        )
+        await self.tg.send(msg, chat_id=reply_chat_id)
 
     async def _send_test_alert(self, *, reply_chat_id: Optional[Any] = None) -> None:
         """构造一笔假成交，按当前阈值/语言渲染一遍。用于验证消息样式 + 通道。
@@ -2444,17 +2482,18 @@ def format_match_alert(
     cumulative: int = 0,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """
-    成交大单告警。卡片式布局：
-        🔴 $12,480 成交 ｜ YES @ 62.0¢
-        Lakers vs Warriors
+    flamy.gg 风格的巨鲸告警卡片，紧凑：
 
-        方向：BUY YES
-        数量：20,129 shares
-        价格：62.0¢
-        交易者：0x1234…abcd
-        时间：2026-04-27 16:42:31 UTC
+        🐳 <b>巨鲸提醒</b>
+        <b>ioup</b> 进行了一笔交易：
 
-    标题 emoji 按金额分级。底部按钮：查看市场 / 查看钱包 / 查看交易。
+        📊 <b>La Liga Winner</b>
+        Real Madrid — No
+
+        🟢 <b>买入 $480.97 @ 99.3¢</b> · 484.36 股
+        <i>20:14:15 · 延迟 1.4s</i>
+
+    底部按钮：查看市场 / 查看钱包。
     """
     market = event.get("market") or {}
     taker = event.get("taker") if isinstance(event.get("taker"), dict) else {}
@@ -2485,30 +2524,65 @@ def format_match_alert(
     if not raw_title:
         raw_title = f"Market #{mid_str}" if mid_str else "Unknown market"
 
-    # 标题逻辑：title 信息量足够 → 单行；title 太短/全是符号（如 "↓ 30,000" /
-    # "$4B"）→ 加 slug 转的"父问题"作为上下文
-    title_safe = normalize_text(raw_title)
-    title_letters = sum(1 for c in raw_title if c.isalpha())
-    informative = len(raw_title) >= 12 and title_letters >= 4
-    if informative:
-        market_line = f"<b>{title_safe}</b>"
-    else:
-        parent = slug_to_label(slug)
-        norm_title = re.sub(r"[\s\-_]+", "", raw_title.lower())
-        norm_parent = re.sub(r"[\s\-_]+", "", parent.lower()) if parent else ""
-        if parent and norm_parent != norm_title:
-            market_line = (
-                f"<b>{normalize_text(parent)}</b>\n"
-                f"<i>{title_safe}</i>"
-            )
+    # 父市场推断：slug 转标题，再把尾部的 raw_title 切掉。
+    # 例：slug=la-liga-winner-real-madrid + title=Real Madrid → parent=La Liga Winner
+    # 单结果市场（slug 整个就是 title）→ 不显示父，直接显示 title。
+    parent_full = slug_to_label(slug)
+    parent_clean = ""
+    if parent_full and raw_title:
+        # 词级正则切尾
+        m = re.search(
+            r"\s+" + re.escape(raw_title) + r"$", parent_full, re.IGNORECASE
+        )
+        if m:
+            parent_clean = parent_full[: m.start()].rstrip()
         else:
-            market_line = f"<b>{title_safe}</b>"
+            # norm 比较：去掉所有标点空格后字符相同 = 同一个市场
+            def _norm(s: str) -> str:
+                return re.sub(r"[^0-9a-z]", "", s.lower())
+            norm_p, norm_t = _norm(parent_full), _norm(raw_title)
+            if norm_p and norm_p == norm_t:
+                parent_clean = ""  # 单结果市场，title 已完整
+            elif norm_p and norm_t and norm_p.endswith(norm_t):
+                # 字符层匹配但词层正则没匹上（标点不同）。按 norm_t 长度反推切点。
+                cut = len(parent_full)
+                acc = 0
+                # 从右往左累计 alnum 字符直到等于 norm_t 长度，记录下切点
+                for i in range(len(parent_full) - 1, -1, -1):
+                    if parent_full[i].isalnum():
+                        acc += 1
+                    if acc >= len(norm_t):
+                        cut = i
+                        break
+                parent_clean = parent_full[:cut].rstrip(" -_")
+            else:
+                parent_clean = parent_full
+    elif parent_full:
+        parent_clean = parent_full
+
+    # 市场两行：父市场（粗体） + 子标题（outcome 或 raw_title — outcome）
+    title_safe = normalize_text(raw_title)
+    outcome_safe = normalize_text(outcome_name)
+    has_outcome = outcome_name and outcome_name != "-"
+    if parent_clean:
+        market_top = f"📊 <b>{normalize_text(parent_clean)}</b>"
+        if has_outcome:
+            market_sub = f"{title_safe} — {outcome_safe}"
+        else:
+            market_sub = title_safe
+        market_block = f"{market_top}\n{market_sub}"
+    else:
+        market_top = f"📊 <b>{title_safe}</b>"
+        if has_outcome:
+            market_block = f"{market_top}\n{outcome_safe}"
+        else:
+            market_block = market_top
 
     amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.shares_wei_decimals)
     notional = event_value_usdt(event, cfg)
     price = event_price_usdt(event, notional, amount)
 
-    # 方向：Ask = SELL，Bid = BUY
+    # 方向：Ask = SELL → 红，Bid = BUY → 绿
     quote_type = str(taker.get("quoteType") or event.get("quoteType") or "").strip().lower()
     if quote_type in {"bid", "buy"}:
         action_key = "buy"
@@ -2517,17 +2591,18 @@ def format_match_alert(
     else:
         action_key = "trade"
     action_label = t(state, action_key)
+    dir_emoji = "🟢" if action_key == "buy" else "🔴" if action_key == "sell" else "⚪️"
 
     signer = extract_signer(event) or ""
     username_raw = extract_username(event)
     short = short_addr(signer) if signer else ""
-    # 用户别名 > 链上 username > 短地址。
+    # 用户别名 > 链上 username > 短地址
     label = state.address_labels.get(signer.lower()) if signer else ""
-    display_name = label or username_raw
+    display_name = (label or username_raw or "").strip()
+    if not display_name and short:
+        display_name = short
 
-    fee = event_fee_usdt(event, cfg)
     tx = extract_tx_hash(event)
-
     market_link = _render_template(cfg.market_url_template, id=mid_str, slug=slug, title=raw_title)
     user_link = (
         _render_template(cfg.user_url_template, address=signer, username=username_raw)
@@ -2536,79 +2611,62 @@ def format_match_alert(
     )
     tx_link = _render_template(cfg.tx_url_template, hash=tx) if tx else ""
 
-    # ---- 第一行：方向色点 + 金额 + outcome + 价格 ----
-    # 🟢 = 买入，🔴 = 卖出，⚪️ = 未知方向。size-tier emoji 改放在金额前不显眼了，
-    # 用户更关心买/卖方向（红/绿）一眼可辨，跟交易软件一致
-    dir_emoji = "🟢" if action_key == "buy" else "🔴" if action_key == "sell" else "⚪️"
-    price_cents = price * Decimal("100")
-    notional_str = fmt_money(notional)
-    price_str = f"{fmt_decimal(price_cents, 1)}¢" if price > 0 else "-"
-    outcome_safe = normalize_text(outcome_name)
-
-    title_line = (
-        f"{dir_emoji} <b>{notional_str} {t(state, 'card_traded')}</b>"
-        f" ｜ {outcome_safe} @ {price_str}"
-    )
-
-    # ---- 卡片正文：方向 / 数量 / 价格 / 交易者 / 时间 ----
-    side_line = f"{t(state, 'card_side')}：<b>{action_label} {outcome_safe}</b>"
-    amount_line = (
-        f"{t(state, 'card_amount')}：<code>{fmt_decimal(amount, 0)}</code>"
-        f" {t(state, 'shares')}"
-    )
-    price_body_line = f"{t(state, 'card_price')}：<code>{price_str}</code>"
-
-    # 交易者：用户别名 > username > 短地址；任意一种情况下都包成可点 portfolio 链接
-    if display_name and display_name != short:
-        name_clean = display_name.strip()
-        # ASCII handle 才补 @ 前缀；中文/空格名（"巨鲸 A"、"Péter Magyar"）保留原样
-        is_handle = bool(re.fullmatch(r"[A-Za-z0-9_.\-]{2,}", name_clean))
-        if is_handle and not name_clean.startswith("@"):
-            name_clean = "@" + name_clean
-        name_html = f"<b>{normalize_text(name_clean)}</b>"
+    # ---- 抬头：交易者名称（点开钱包链接） + 「进行了一笔交易：」 ----
+    if display_name:
+        name_html = f"<b>{normalize_text(display_name)}</b>"
         if user_link:
             name_html = (
                 f'<a href="{html.escape(user_link, quote=True)}">{name_html}</a>'
             )
-        if short:
-            trader_html = f"{name_html} · <code>{html.escape(short)}</code>"
-        else:
-            trader_html = name_html
-    elif short:
-        code_html = f"<code>{html.escape(short)}</code>"
-        if user_link:
-            code_html = f'<a href="{html.escape(user_link, quote=True)}">{code_html}</a>'
-        trader_html = code_html
     else:
-        trader_html = t(state, "card_anon_wallet")
-    trader_line = f"{t(state, 'card_trader')}：{trader_html}"
+        name_html = f"<b>{t(state, 'card_anon_wallet')}</b>"
+    subject_line = f"{name_html} {t(state, 'made_trade')}"
 
-    # 时间：全日期 + DISPLAY_TZ + UTC offset 后缀 + 延迟。延迟 = now - executedAt。
+    # ---- 动作行：方向色点 + 动作 + 金额 + 价格 + 数量 ----
+    notional_str = fmt_money_full(notional)
+    price_cents = price * Decimal("100")
+    price_str = f"{fmt_decimal(price_cents, 1)}¢" if price > 0 else "-"
+    qty_str = fmt_qty(amount)
+    action_line = (
+        f"{dir_emoji} <b>{action_label} {notional_str} @ {price_str}</b>"
+        f" · {qty_str} {t(state, 'shares')}"
+    )
+
+    # ---- Footer：本地时间 + 延迟（小字斜体，不抢戏）----
     tzinfo, _tz_label = get_display_tz(cfg.display_tz)
     ts_dt = parse_iso_ts(event.get("executedAt") or event.get("createdAt"))
     if ts_dt is None:
         ts_dt = datetime.now(timezone.utc)
     local_dt = ts_dt.astimezone(tzinfo)
-    offset = local_dt.utcoffset() or timedelta(0)
-    total_minutes = int(offset.total_seconds() / 60)
-    if total_minutes == 0:
-        tz_suffix = "UTC"
-    else:
-        sign = "+" if total_minutes > 0 else "-"
-        hours, mins = divmod(abs(total_minutes), 60)
-        tz_suffix = f"UTC{sign}{hours}" + (f":{mins:02d}" if mins else "")
-    ts_str = local_dt.strftime("%Y-%m-%d %H:%M:%S") + " " + tz_suffix
     delay_secs = max(0.0, (datetime.now(timezone.utc) - ts_dt).total_seconds())
     delay_str = t(state, "card_delay_fmt").format(n=f"{delay_secs:.1f}")
-    time_line = (
-        f"{t(state, 'card_time')}：<code>{html.escape(ts_str)}</code>"
-        f" · {delay_str}"
+    time_footer = f"<i>{local_dt.strftime('%H:%M:%S')} · {delay_str}</i>"
+
+    # 频次脚注：近 1H 该 signer / 该市场 触发了几次告警。recent_matches 是内存窗口，
+    # 遍历 ≤5000 项几十微秒，对热路径无影响。signer 缺失时跳过 signer 行避免显示
+    # "0 次" 误导。
+    window_label = t(state, "window_1h")
+    market_count = state.count_market_alerts(slug=slug, market_id=mid_str, hours=1)
+    count_market_line = t(state, "count_market_fmt").format(
+        window=window_label, n=market_count,
     )
+    body_lines: List[str] = [
+        t(state, "whale_title"),
+        subject_line,
+        "",
+        market_block,
+        "",
+        action_line,
+    ]
+    if signer:
+        signer_count = state.count_signer_alerts(signer, hours=1)
+        body_lines.append(
+            t(state, "count_signer_fmt").format(window=window_label, n=signer_count)
+        )
+    body_lines.extend([count_market_line, time_footer])
+    text = "\n".join(body_lines)
 
-    body_lines = [side_line, amount_line, price_body_line, trader_line, time_line]
-    text = "\n".join([title_line, market_line, ""] + body_lines)
-
-    # ---- 按钮：单行三连（查看市场 / 查看钱包 / 查看交易），保持原版布局 ----
+    # 三个按钮：市场 / 钱包 / 交易哈希
     buttons: List[Dict[str, str]] = []
     if market_link:
         buttons.append({"text": t(state, "view_market"), "url": market_link})
@@ -2622,175 +2680,6 @@ def format_match_alert(
     )
 
     return text, markup
-
-
-def format_new_market_alert(
-    market: Dict[str, Any], cfg: Config, state: "RuntimeState"
-) -> Tuple[str, Optional[Dict[str, Any]]]:
-    mid = market.get("id") or market.get("marketId")
-    mid_str = str(mid) if mid is not None else ""
-    slug = market.get("slug") or market.get("urlSlug") or market.get("categorySlug") or ""
-    title = market_title_of(market)
-    category = market.get("categorySlug") or market.get("category") or "-"
-    end_date = (
-        market.get("endDate")
-        or market.get("expiresAt")
-        or market.get("closesAt")
-        or market.get("resolutionTime")
-        or "-"
-    )
-
-    title_safe = normalize_text(title)
-    link = _render_template(cfg.market_url_template, id=mid_str, slug=slug, title=title)
-    title_html = (
-        f'<a href="{html.escape(link, quote=True)}">{title_safe}</a>' if link else title_safe
-    )
-
-    if state.lang == "en":
-        header = "🆕 <b>New Predict market</b>"
-        market_label = "Market"
-        id_label = "ID"
-        cat_label = "Category"
-        end_label = "Closes"
-    else:
-        header = "🆕 <b>Predict 新市场上线</b>"
-        market_label = "市场"
-        id_label = "Market ID"
-        cat_label = "分类"
-        end_label = "截止"
-
-    text = "\n".join([
-        header,
-        f"{market_label}：<b>{title_html}</b>",
-        f"{id_label}：<code>{html.escape(mid_str or '-')}</code> ｜ {cat_label}：<code>{html.escape(str(category))}</code>",
-        f"{end_label}：<code>{html.escape(str(end_date))}</code>",
-    ])
-
-    markup: Optional[Dict[str, Any]] = None
-    if link:
-        markup = {"inline_keyboard": [[
-            {"text": t(state, "view_market"), "url": link},
-        ]]}
-
-    return text, markup
-
-
-async def watch_new_markets(
-    cfg: Config,
-    state: RuntimeState,
-    predict: Predict,
-    tg: Telegram,
-    stop: asyncio.Event,
-) -> None:
-    """每 NEW_MARKETS_CHECK_SEC 秒拉一次开放市场，对没见过的市场发"上线"告警。"""
-    seen_ids = load_seen_markets(cfg.seen_markets_path)
-    bootstrap = not seen_ids
-    iteration = 0
-    BURST_THRESHOLD = 20  # 单轮发现 >N 新市场 → 大概率是 seen 状态丢了；只发摘要
-
-    # 启动诊断：show seen 范围 + 最大 ID（便于人眼对照 predict.fun 上的最新市场）
-    if seen_ids:
-        sids = sorted(seen_ids)
-        LOG.info(
-            "[watch_new_markets] 启动: 已加载 %d 个 seen 市场 ID，范围 [%d..%d]，"
-            "尾部 5 个 = %s",
-            len(seen_ids), sids[0], sids[-1], sids[-5:],
-        )
-    else:
-        LOG.info("[watch_new_markets] 启动: 无 seen 文件，第一轮将 seed 不告警")
-
-    if state.lang == "en":
-        seeded_msg = (
-            f"Tracking <b>{len(seen_ids)}</b> known markets, max ID <code>{max(seen_ids)}</code>"
-            if seen_ids
-            else "First launch — seeding now, no alerts on this pass"
-        )
-    else:
-        seeded_msg = (
-            f"已记忆 <b>{len(seen_ids)}</b> 个市场，最大 ID <code>{max(seen_ids)}</code>"
-            if seen_ids
-            else "首次启动，第一轮 seed 不告警"
-        )
-
-    await tg.send(
-        f"{t(state, 'newm_started')}\n"
-        f"{t(state, 'interval')}: <code>{cfg.new_markets_check_sec}s</code>\n"
-        + seeded_msg,
-        silent=True,
-    )
-
-    while not stop.is_set():
-        iteration += 1
-        try:
-            markets = await predict.fetch_open_markets()
-            current_ids = set(markets.keys())
-
-            # 关键防御：API 临时返回 0 时不要把 seen 清空、也不要"伪 seed"，
-            # 否则下一轮恢复会把所有市场当成新市场刷屏。
-            if not current_ids:
-                LOG.warning(
-                    "[watch_new_markets] iter=%d: API 返回 0 个开放市场，本轮跳过", iteration
-                )
-            elif bootstrap:
-                LOG.info(
-                    "[watch_new_markets] iter=%d: 首次 seed %d 个已开放市场（不推送）"
-                    " 最大 ID=%d 最小 ID=%d",
-                    iteration, len(current_ids), max(current_ids), min(current_ids),
-                )
-                seen_ids = current_ids
-                bootstrap = False
-                save_seen_markets(cfg.seen_markets_path, seen_ids)
-            else:
-                new_ids = sorted(current_ids - seen_ids)
-                if new_ids:
-                    titles = [market_title_of(markets[mid]) for mid in new_ids[:5]]
-                    LOG.info(
-                        "[watch_new_markets] iter=%d: 🆕 发现 %d 个新市场, IDs=%s 标题样本=%s",
-                        iteration, len(new_ids), new_ids[:10], titles,
-                    )
-
-                    if len(new_ids) > BURST_THRESHOLD:
-                        # 大概率 seen 文件丢了 / 被 reset；不要刷屏，只发个摘要
-                        LOG.warning(
-                            "[watch_new_markets] iter=%d: 异常 burst（%d 个新市场），"
-                            "可能 seen 状态丢失。只发摘要 + 头 5 个，其余静默 seed。",
-                            iteration, len(new_ids),
-                        )
-                        burst_msg = (
-                            f"⚠️ 一次发现 <b>{len(new_ids)}</b> 个"
-                            f"新市场（异常多，可能持久化丢失）。\n"
-                            f"只推前 5 个，其余 <b>{len(new_ids) - 5}</b> 个静默 seed。"
-                            if state.lang == "zh"
-                            else f"⚠️ Detected <b>{len(new_ids)}</b> new markets in one "
-                            f"pass (unusually many — likely a persistence loss).\n"
-                            f"Showing top 5; the other <b>{len(new_ids) - 5}</b> seed silently."
-                        )
-                        await tg.send(burst_msg, silent=True)
-                        for mid in new_ids[:5]:
-                            text, markup = format_new_market_alert(markets[mid], cfg, state)
-                            await tg.send(text, reply_markup=markup)
-                    else:
-                        for mid in new_ids:
-                            text, markup = format_new_market_alert(markets[mid], cfg, state)
-                            await tg.send(text, reply_markup=markup)
-
-                    seen_ids.update(new_ids)
-                    save_seen_markets(cfg.seen_markets_path, seen_ids)
-                else:
-                    # 每 5 轮（~150s）发心跳，便于核对监控是否还活
-                    if iteration % 5 == 1:
-                        LOG.info(
-                            "[watch_new_markets] iter=%d: 无新市场（已知 %d，最大 ID=%d）",
-                            iteration, len(seen_ids), max(seen_ids) if seen_ids else 0,
-                        )
-
-        except Exception:
-            LOG.exception("[watch_new_markets] iter=%d: 失败", iteration)
-
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=cfg.new_markets_check_sec)
-        except asyncio.TimeoutError:
-            pass
 
 
 async def _dispatch_match(
@@ -2811,14 +2700,16 @@ async def _dispatch_match(
     sent_main = False
     sent_subs = 0
 
-    # 主告警频道：过全局阈值才发
-    if notional >= state.threshold_usdt:
+    # 主告警频道：过全局阈值才发；state.paused 时全局静默
+    if notional >= state.threshold_usdt and not state.paused:
         text, markup = format_match_alert(ev, cfg, state, cumulative=n)
         await tg.send(text, reply_markup=markup)
         sent_main = True
 
-    # 私聊订阅者：按各自门槛分发
+    # 私聊订阅者：按各自门槛分发；订阅者 paused 时跳过
     for sub_chat_id, info in list(state.subscribers.items()):
+        if info.get("paused"):
+            continue
         try:
             sub_threshold = Decimal(str(info.get("threshold_usdt", "0")))
         except (InvalidOperation, ValueError, TypeError):
@@ -3178,6 +3069,9 @@ async def summary_runner(
                 cutoff = datetime.now(timezone.utc) - timedelta(days=1)
                 state.recent_matches = [m for m in state.recent_matches if m["ts"] >= cutoff]
                 continue
+            if state.paused:
+                LOG.info("[summary] iter=%d 主频道已暂停，跳过推送", iteration)
+                continue
             text = format_summary_alert(summary, cfg, state)
             await tg.send(text, silent=True)
             LOG.info(
@@ -3267,10 +3161,6 @@ async def main() -> None:
 
         # 菜单/命令处理任务，与监控任务并行。
         tasks.append(asyncio.create_task(bot.run(stop)))
-
-        # 新市场上线告警，独立任务。
-        if cfg.watch_new_markets:
-            tasks.append(asyncio.create_task(watch_new_markets(cfg, state, predict, tg, stop)))
 
         # 每 N 秒推一次摘要。state.summary_interval_sec=0 时任务空转直到被打开。
         tasks.append(asyncio.create_task(summary_runner(cfg, state, tg, stop)))

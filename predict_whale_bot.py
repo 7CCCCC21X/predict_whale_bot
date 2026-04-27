@@ -1428,11 +1428,14 @@ class TelegramBot:
         state: RuntimeState,
         tg: Telegram,
         client: httpx.AsyncClient,
+        predict: "Predict",
     ) -> None:
         self.cfg = cfg
         self.state = state
         self.tg = tg
         self.client = client
+        # /speed 和 /benchmark / /ramp 直接复用 predict.client 打 API + 读 _request_log
+        self.predict = predict
         self.base = tg.base
         # 命令可以来自任何 chat（私聊 / 群 / 主告警频道）；回复就地。
         # 主告警频道（cfg.tg_chat_id）只用作告警目的地。
@@ -3237,7 +3240,7 @@ async def main() -> None:
     async with httpx.AsyncClient(timeout=timeout) as client:
         tg = Telegram(cfg, client)
         predict = Predict(cfg, client)
-        bot = TelegramBot(cfg, state, tg, client)
+        bot = TelegramBot(cfg, state, tg, client, predict)
 
         tasks: List[asyncio.Task[Any]] = []
 

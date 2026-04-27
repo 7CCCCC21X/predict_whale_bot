@@ -98,6 +98,9 @@ class Config:
 
     # 仅这些 user.id 才能改阈值。空集合 = 沿用旧行为（只看 chat_id）。
     allowed_user_ids: frozenset
+
+    # 默认语言：zh / en。运行期可用 /lang 切换。
+    default_lang: str
     user_url_template: str
 
     watch_new_markets: bool
@@ -172,6 +175,8 @@ class Config:
             ).strip(),
 
             allowed_user_ids=parse_user_id_list(os.getenv("ALLOWED_USER_IDS", "")),
+
+            default_lang=(os.getenv("LANG_BOT") or os.getenv("LANG", "zh")).strip().lower() or "zh",
             # 用户链接：默认指向 BscScan 钱包页（一定能打开）。
             # 如果将来 predict.fun 有公开的用户主页，可以覆盖成 https://predict.fun/profile/{address}
             # 模板可用占位符：{address} / {username}
@@ -197,6 +202,7 @@ class RuntimeState:
     orderbook_threshold_usdt: Decimal
     usdt_wei_decimals: int
     telegram_offset: int = 0
+    lang: str = "zh"
     _path: str = ""  # 仅内部用，不参与持久化
 
     @property
@@ -207,10 +213,12 @@ class RuntimeState:
     @classmethod
     def from_config(cls, cfg: Config) -> "RuntimeState":
         # 先按 env 默认值初始化，再用磁盘上的快照覆盖（如果有）。
+        lang = cfg.default_lang if cfg.default_lang in {"zh", "en"} else "zh"
         state = cls(
             threshold_usdt=cfg.threshold_usdt,
             orderbook_threshold_usdt=cfg.orderbook_threshold_usdt,
             usdt_wei_decimals=cfg.usdt_wei_decimals,
+            lang=lang,
             _path=cfg.runtime_state_path,
         )
 
@@ -223,10 +231,12 @@ class RuntimeState:
                     state.orderbook_threshold_usdt = Decimal(str(saved["orderbook_threshold_usdt"]))
                 if "telegram_offset" in saved:
                     state.telegram_offset = int(saved["telegram_offset"])
+                if "lang" in saved and saved["lang"] in {"zh", "en"}:
+                    state.lang = saved["lang"]
                 LOG.info(
-                    "已从 %s 恢复 runtime state: threshold=%s orderbook=%s offset=%s",
+                    "已从 %s 恢复 runtime state: threshold=%s orderbook=%s offset=%s lang=%s",
                     cfg.runtime_state_path,
-                    state.threshold_usdt, state.orderbook_threshold_usdt, state.telegram_offset,
+                    state.threshold_usdt, state.orderbook_threshold_usdt, state.telegram_offset, state.lang,
                 )
             except (InvalidOperation, ValueError, TypeError) as exc:
                 LOG.warning("runtime state 字段格式异常 (%s): %s — 用 env 默认", saved, exc)
@@ -234,13 +244,14 @@ class RuntimeState:
         return state
 
     def persist(self) -> None:
-        """把当前阈值 + offset 写盘。失败只 log，不抛异常。"""
+        """把当前阈值 + offset + lang 写盘。失败只 log，不抛异常。"""
         if not self._path:
             return
         save_runtime_state(self._path, {
             "threshold_usdt": str(self.threshold_usdt),
             "orderbook_threshold_usdt": str(self.orderbook_threshold_usdt),
             "telegram_offset": self.telegram_offset,
+            "lang": self.lang,
         })
 
 
@@ -388,27 +399,64 @@ def save_seen_markets(path: str, ids: Set[int]) -> None:
 
 
 def extract_username(event: Dict[str, Any]) -> str:
-    """从 taker / event / user 嵌套字段里取 username，找不到返回空串。"""
+    """从 taker / event / user 嵌套字段里取 username，找不到返回空串。
+
+    Predict 的实际字段名不一定是 username — 一并尝试 handle / alias /
+    nickname / displayName 等常见变体，覆盖更多可能的 schema。
+    """
     taker = event.get("taker") if isinstance(event.get("taker"), dict) else {}
     user = taker.get("user") if isinstance(taker.get("user"), dict) else {}
     profile = taker.get("profile") if isinstance(taker.get("profile"), dict) else {}
+    account = taker.get("account") if isinstance(taker.get("account"), dict) else {}
+
     candidates = (
+        # taker 直接挂的
         taker.get("username"),
         taker.get("name"),
         taker.get("displayName"),
+        taker.get("handle"),
+        taker.get("alias"),
+        taker.get("nickname"),
+        # taker.user.*
         user.get("username"),
         user.get("name"),
         user.get("displayName"),
+        user.get("handle"),
+        user.get("nickname"),
+        # taker.profile.*
         profile.get("username"),
         profile.get("name"),
+        profile.get("displayName"),
+        profile.get("handle"),
+        # taker.account.*
+        account.get("username"),
+        account.get("name"),
+        account.get("handle"),
+        # event 顶层
         event.get("takerUsername"),
+        event.get("takerName"),
+        event.get("username"),
     )
     for c in candidates:
         if c:
             s = str(c).strip()
-            if s:
+            # 过滤明显是地址的（0x 开头 + 长度），username 不会长这样
+            if s and not (s.startswith("0x") and len(s) >= 20):
                 return s
     return ""
+
+
+def slug_to_label(slug: str) -> str:
+    """把 'polymarket-fdv-one-day-after-launch' 转成 'Polymarket Fdv One Day After Launch'。
+
+    用作市场告警里"父问题"的近似显示，让标题不再光秃秃只有一个 "$4B"。
+    """
+    if not slug:
+        return ""
+    text = slug.replace("-", " ").replace("_", " ").strip()
+    if not text:
+        return ""
+    return " ".join(w.capitalize() if w else w for w in text.split())
 
 
 def extract_signer(event: Dict[str, Any]) -> str:
@@ -495,6 +543,70 @@ def normalize_text(s: Any, limit: int = 180) -> str:
     if len(text) > limit:
         text = text[: limit - 1] + "…"
     return html.escape(text)
+
+
+TRANSLATIONS: Dict[str, Dict[str, str]] = {
+    "zh": {
+        "whale_title": "🐳 <b>巨鲸提醒</b>",
+        "made_trade": "进行了一笔交易：",
+        "buy": "买入",
+        "sell": "卖出",
+        "trade": "成交",
+        "shares": "股",
+        "view_market": "📊 查看市场",
+        "view_wallet": "👤 查看钱包",
+        "view_tx": "🔗 查看交易",
+        "anon_wallet": "匿名钱包",
+        "match_started": "✅ <b>Predict 成交大单监控已启动</b>",
+        "ob_started": "✅ <b>Predict 盘口监控已启动</b>",
+        "newm_started": "🆕 <b>Predict 新市场监控已启动</b>",
+        "threshold": "阈值",
+        "interval": "检查间隔",
+        "open_menu_hint": "点底部「菜单」按钮或发 /menu 调整阈值",
+        "menu_title": "🐋 <b>Predict 监控菜单</b>",
+        "match_threshold": "成交阈值",
+        "ob_threshold": "盘口阈值",
+        "menu_hint": (
+            "点预设按钮一键设置，或点 <b>🔧 自定义</b> 弹出输入框输入任意金额。\n"
+            "也可手动发：<code>/set_match 数额</code> / <code>/set_book 数额</code>"
+        ),
+        "lang_switched": "已切换到中文。",
+        "stopped": "🛑 <b>Predict 大额监控已停止</b>",
+    },
+    "en": {
+        "whale_title": "🐳 <b>Whale Alert</b>",
+        "made_trade": "made a trade:",
+        "buy": "BUY",
+        "sell": "SELL",
+        "trade": "TRADE",
+        "shares": "shares",
+        "view_market": "📊 Market",
+        "view_wallet": "👤 Wallet",
+        "view_tx": "🔗 Tx",
+        "anon_wallet": "Anon wallet",
+        "match_started": "✅ <b>Predict match monitor started</b>",
+        "ob_started": "✅ <b>Predict orderbook monitor started</b>",
+        "newm_started": "🆕 <b>Predict new-market watcher started</b>",
+        "threshold": "Threshold",
+        "interval": "Check interval",
+        "open_menu_hint": "Tap the “Menu” button or send /menu to change thresholds",
+        "menu_title": "🐋 <b>Predict whale-bot menu</b>",
+        "match_threshold": "Match threshold",
+        "ob_threshold": "Orderbook threshold",
+        "menu_hint": (
+            "Tap a preset, or hit <b>🔧 Custom</b> to enter any amount.\n"
+            "Or send: <code>/set_match N</code> / <code>/set_book N</code>"
+        ),
+        "lang_switched": "Switched to English.",
+        "stopped": "🛑 <b>Predict whale-bot stopped</b>",
+    },
+}
+
+
+def t(state: "RuntimeState", key: str) -> str:
+    """运行期翻译查找。state.lang 不在表里则回退中文。"""
+    table = TRANSLATIONS.get(state.lang) or TRANSLATIONS["zh"]
+    return table.get(key) or TRANSLATIONS["zh"].get(key) or key
 
 
 def chunk_html_safely(text: str, limit: int = 3900) -> List[str]:
@@ -898,11 +1010,10 @@ MAX_THRESHOLD_USDT = Decimal("10000000")
 
 def _menu_text(state: RuntimeState) -> str:
     return (
-        "🐋 <b>Predict 监控菜单</b>\n"
-        f"成交阈值：<b>${fmt_decimal(state.threshold_usdt, 2)} USDT</b>\n"
-        f"盘口阈值：<b>${fmt_decimal(state.orderbook_threshold_usdt, 2)} USDT</b>\n\n"
-        "点预设按钮一键设置，或点 <b>🔧 自定义</b> 弹出输入框输入任意金额。\n"
-        "也可手动发：<code>/set_match 数额</code> / <code>/set_book 数额</code>"
+        f"{t(state, 'menu_title')}\n"
+        f"{t(state, 'match_threshold')}: <b>${fmt_decimal(state.threshold_usdt, 2)} USDT</b>\n"
+        f"{t(state, 'ob_threshold')}: <b>${fmt_decimal(state.orderbook_threshold_usdt, 2)} USDT</b>\n\n"
+        f"{t(state, 'menu_hint')}"
     )
 
 
@@ -1211,6 +1322,22 @@ class TelegramBot:
                 f"用户名：<code>{html.escape(str(user_label))}</code>\n"
                 f"管理员权限：<b>{'✅ 是' if is_admin else '❌ 否'}</b>"
             )
+        elif cmd == "/lang":
+            # /lang zh / /lang en — 改语言；不带参数 = 显示当前
+            wanted = arg.strip().lower()
+            if wanted in {"zh", "cn", "chinese", "中文"}:
+                self.state.lang = "zh"
+                self.state.persist()
+                await self.tg.send(t(self.state, "lang_switched"))
+            elif wanted in {"en", "english", "英文"}:
+                self.state.lang = "en"
+                self.state.persist()
+                await self.tg.send(t(self.state, "lang_switched"))
+            else:
+                await self.tg.send(
+                    f"Current language: <b>{self.state.lang}</b>\n"
+                    "Usage: <code>/lang zh</code> 或 <code>/lang en</code>"
+                )
         elif cmd == "/set_match":
             await self._set_threshold("match", arg)
             LOG.info("admin %s (id=%s) /set_match -> %s", user_label, user_id, arg)
@@ -1363,14 +1490,14 @@ def _render_template(template: str, **kwargs: Any) -> str:
 
 
 def format_match_alert(
-    event: Dict[str, Any], cfg: Config
+    event: Dict[str, Any], cfg: Config, state: "RuntimeState"
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """
     巨鲸提醒风格的成交告警。返回 (text, reply_markup)。
 
-    设计目标：一眼看清"谁在哪里以多少价格做了什么"，省略 Market ID / 手续费 /
-    完整时间戳 / Tx hash 等次要信息（这些通过底部按钮跳到 predict.fun 和钱包
-    主页就能查到）。
+    设计目标：一眼看清"谁在哪里以多少价格做了什么"。省略 Market ID / 手续费 /
+    完整时间戳 / 方向字段 / Taker 地址行 / Makers 数 — 这些细节都已经能从底部
+    "查看市场 / 查看钱包 / 查看交易"按钮跳进去看到。
     """
     market = event.get("market") or {}
     taker = event.get("taker") if isinstance(event.get("taker"), dict) else {}
@@ -1392,6 +1519,7 @@ def format_match_alert(
     )
     mid = market.get("id") or event.get("marketId")
     mid_str = str(mid) if mid is not None else ""
+    # categorySlug 在 Predict 实际响应里通常是市场专属 slug（"polymarket-fdv-..."）
     slug = (
         market.get("slug")
         or market.get("urlSlug")
@@ -1401,6 +1529,21 @@ def format_match_alert(
     if not raw_title:
         raw_title = f"Market #{mid_str}" if mid_str else "Unknown market"
 
+    # 把 slug 渲染成"父问题"标题，让单独看 "$4B" 这种短 title 时也知道是什么市场
+    parent_label = slug_to_label(slug)
+    # 如果父标题等价于子标题就不重复（比如 title="GC Hit Jun 2026" / slug="gc-hit-jun-2026"）
+    norm_title = re.sub(r"[\s\-_]+", "", raw_title.lower())
+    norm_parent = re.sub(r"[\s\-_]+", "", parent_label.lower())
+    if parent_label and norm_parent != norm_title:
+        market_line = (
+            f"📊 <b>{normalize_text(parent_label)}</b>\n"
+            f"<b>{normalize_text(raw_title)}</b> — <b>{normalize_text(outcome_name)}</b>"
+        )
+    else:
+        market_line = (
+            f"📊 <b>{normalize_text(raw_title)}</b> — <b>{normalize_text(outcome_name)}</b>"
+        )
+
     amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.shares_wei_decimals)
     price = to_decimal(event.get("priceExecuted") or taker.get("price"), cfg.usdt_wei_decimals)
     notional = event_value_usdt(event, cfg)
@@ -1408,20 +1551,22 @@ def format_match_alert(
     # 方向：Ask = 卖出（红），Bid = 买入（绿）
     quote_type = str(taker.get("quoteType") or event.get("quoteType") or "").strip().lower()
     if quote_type in {"bid", "buy"}:
-        action_label = "买入"
+        action_label = t(state, "buy")
         action_emoji = "🟢"
     elif quote_type in {"ask", "sell"}:
-        action_label = "卖出"
+        action_label = t(state, "sell")
         action_emoji = "🔴"
     else:
-        action_label = "成交"
+        action_label = t(state, "trade")
         action_emoji = "⚪"
 
     signer = extract_signer(event) or ""
     username_raw = extract_username(event)
     # 没有 username 就用截短地址；都没有则匿名
     if not username_raw:
-        username_raw = short_addr(signer) if signer else "匿名钱包"
+        username_raw = short_addr(signer) if signer else t(state, "anon_wallet")
+
+    tx = extract_tx_hash(event)
 
     market_link = _render_template(cfg.market_url_template, id=mid_str, slug=slug, title=raw_title)
     user_link = (
@@ -1429,39 +1574,40 @@ def format_match_alert(
         if signer
         else ""
     )
+    tx_link = _render_template(cfg.tx_url_template, hash=tx) if tx else ""
 
-    title_safe = normalize_text(raw_title)
-    outcome_safe = normalize_text(outcome_name)
     username_safe = normalize_text(username_raw)
 
-    # 价格按 image 1 风格用美分（× 100），主体金额保持 USD 美元
+    # 价格按"美分"展示（× 100，一位小数），符合 image 1 风格
     price_cents = price * Decimal("100")
 
     lines = [
-        "🐳 <b>巨鲸提醒</b>",
+        t(state, "whale_title"),
         "",
-        f"<b>{username_safe}</b> 进行了一笔交易：",
+        f"<b>{username_safe}</b> {t(state, 'made_trade')}",
         "",
-        f"📊 <b>{title_safe}</b> — <b>{outcome_safe}</b>",
+        market_line,
         "",
         (
             f"{action_emoji} <b>{action_label}</b> "
             f"${fmt_decimal(notional, 2)} @ {fmt_decimal(price_cents, 1)}¢ · "
-            f"{fmt_decimal(amount, 1)} 股"
+            f"{fmt_decimal(amount, 1)} {t(state, 'shares')}"
         ),
     ]
 
     text = "\n".join(lines)
 
-    # 底部 inline 按钮：查看市场 + 查看钱包
-    button_row: List[Dict[str, str]] = []
+    # 底部 inline 按钮：查看市场 / 查看钱包 / 查看交易
+    buttons: List[Dict[str, str]] = []
     if market_link:
-        button_row.append({"text": "📊 查看市场", "url": market_link})
+        buttons.append({"text": t(state, "view_market"), "url": market_link})
     if user_link:
-        button_row.append({"text": "👤 查看钱包", "url": user_link})
+        buttons.append({"text": t(state, "view_wallet"), "url": user_link})
+    if tx_link:
+        buttons.append({"text": t(state, "view_tx"), "url": tx_link})
 
     markup: Optional[Dict[str, Any]] = (
-        {"inline_keyboard": [button_row]} if button_row else None
+        {"inline_keyboard": [buttons]} if buttons else None
     )
 
     return text, markup
@@ -1499,6 +1645,7 @@ def format_new_market_alert(market: Dict[str, Any], cfg: Config) -> str:
 
 async def watch_new_markets(
     cfg: Config,
+    state: RuntimeState,
     predict: Predict,
     tg: Telegram,
     stop: asyncio.Event,
@@ -1509,14 +1656,23 @@ async def watch_new_markets(
     bootstrap = not seen_ids
     iteration = 0
 
-    await tg.send(
-        "🆕 <b>Predict 新市场监控已启动</b>\n"
-        f"检查间隔：<code>{cfg.new_markets_check_sec}s</code>\n"
-        + (
+    if state.lang == "en":
+        seeded_msg = (
+            f"Tracking <b>{len(seen_ids)}</b> known markets; new listings push live"
+            if seen_ids
+            else "First launch — seeding now, no alerts on this pass"
+        )
+    else:
+        seeded_msg = (
             f"已记忆 <b>{len(seen_ids)}</b> 个市场，新上线即推送"
             if seen_ids
             else "首次启动，第一轮 seed 不告警"
-        ),
+        )
+
+    await tg.send(
+        f"{t(state, 'newm_started')}\n"
+        f"{t(state, 'interval')}: <code>{cfg.new_markets_check_sec}s</code>\n"
+        + seeded_msg,
         silent=True,
     )
 
@@ -1584,10 +1740,10 @@ async def monitor_matches(
     raw_logged = False  # 只对第一笔事件记一次原始字段，便于调试解码
 
     await tg.send(
-        f"✅ <b>Predict 成交大单监控已启动</b>\n"
-        f"阈值：<b>${fmt_decimal(state.threshold_usdt, 2)} USDT</b>\n"
-        f"模式：<code>matches</code> ｜ 轮询：<code>{cfg.poll_interval_sec}s</code>\n"
-        f"点底部「菜单」按钮或发 /menu 调整阈值",
+        f"{t(state, 'match_started')}\n"
+        f"{t(state, 'threshold')}: <b>${fmt_decimal(state.threshold_usdt, 2)} USDT</b>\n"
+        f"Mode: <code>matches</code> ｜ Poll: <code>{cfg.poll_interval_sec}s</code>\n"
+        f"{t(state, 'open_menu_hint')}",
         silent=True,
         reply_markup=_persistent_keyboard(),
     )
@@ -1655,7 +1811,7 @@ async def monitor_matches(
             elif fresh:
                 # 接口通常按 executedAt DESC 排序，反转后按时间先后发送。
                 for ev in reversed(fresh):
-                    text, markup = format_match_alert(ev, cfg)
+                    text, markup = format_match_alert(ev, cfg, state)
                     await tg.send(text, reply_markup=markup)
 
             startup = False
@@ -1865,10 +2021,10 @@ async def monitor_orderbook(
     stop: asyncio.Event,
 ) -> None:
     await tg.send(
-        f"✅ <b>Predict 盘口监控已启动</b>\n"
-        f"阈值：<b>${fmt_decimal(state.orderbook_threshold_usdt, 2)} USDT</b>\n"
-        f"模式：<code>orderbook</code>\n"
-        f"点底部「菜单」按钮或发 /menu 调整阈值",
+        f"{t(state, 'ob_started')}\n"
+        f"{t(state, 'threshold')}: <b>${fmt_decimal(state.orderbook_threshold_usdt, 2)} USDT</b>\n"
+        f"Mode: <code>orderbook</code>\n"
+        f"{t(state, 'open_menu_hint')}",
         silent=True,
         reply_markup=_persistent_keyboard(),
     )
@@ -2066,7 +2222,7 @@ async def main() -> None:
 
         # 新市场上线告警，独立任务，跟 mode 解耦。
         if cfg.watch_new_markets:
-            tasks.append(asyncio.create_task(watch_new_markets(cfg, predict, tg, stop)))
+            tasks.append(asyncio.create_task(watch_new_markets(cfg, state, predict, tg, stop)))
 
         await stop.wait()
 
@@ -2075,7 +2231,7 @@ async def main() -> None:
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
-        await tg.send("🛑 <b>Predict 大额监控已停止</b>", silent=True)
+        await tg.send(t(state, "stopped"), silent=True)
 
 
 if __name__ == "__main__":

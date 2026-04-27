@@ -21,7 +21,8 @@ import re
 import signal
 import sys
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from itertools import count
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -210,7 +211,23 @@ class RuntimeState:
     # 运行期开关：盘口监控可以从菜单一键暂停（保留连接配置，但不连 WS、不告警）。
     # 默认 True，向后兼容旧 runtime_state.json（缺字段时仍是 True）。
     orderbook_enabled: bool = True
+    # 内存里维护"本会话每个钱包大单计数"。重启清零（不持久化），FIFO 限 5000。
+    cumulative_trades: "OrderedDict[str, int]" = field(default_factory=OrderedDict)
     _path: str = ""  # 仅内部用，不参与持久化
+
+    _CUMULATIVE_CAP = 5000
+
+    def bump_cumulative(self, signer: str) -> int:
+        """大单触发后递增。返回这是该签名地址本轮第几笔（>=1）。"""
+        if not signer:
+            return 0
+        key = signer.lower()
+        n = self.cumulative_trades.get(key, 0) + 1
+        self.cumulative_trades[key] = n
+        # FIFO 限上限避免长跑内存泄漏
+        while len(self.cumulative_trades) > self._CUMULATIVE_CAP:
+            self.cumulative_trades.popitem(last=False)
+        return n
 
     @property
     def threshold_usdt_wei(self) -> int:
@@ -589,6 +606,14 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "ob_toggled_off": "盘口监控已暂停",
         "ob_off_warning": "⚠️ MODE=orderbook，关闭后只剩新市场监控",
         "ob_status_off": "[暂停]",
+        "implied_label": "隐含",
+        "fee_label": "手续费",
+        "makers_label": "对手方",
+        "time_just_now": "刚刚",
+        "time_ago_s_fmt": "{n}秒前",
+        "time_ago_m_fmt": "{n}分钟前",
+        "time_ago_h_fmt": "{n}小时前",
+        "cumulative_fmt": "本轮第 {n} 笔",
         "btn_custom": "✏️",
         "test_caption": "🧪 <b>测试推送</b>（不是真实成交）",
         "stopped": "🛑 <b>Predict 大额监控已停止</b>",
@@ -638,6 +663,14 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "ob_toggled_off": "Orderbook paused",
         "ob_off_warning": "⚠️ MODE=orderbook; only new-market watcher remains",
         "ob_status_off": "[paused]",
+        "implied_label": "Implied",
+        "fee_label": "Fee",
+        "makers_label": "Makers",
+        "time_just_now": "just now",
+        "time_ago_s_fmt": "{n}s ago",
+        "time_ago_m_fmt": "{n}m ago",
+        "time_ago_h_fmt": "{n}h ago",
+        "cumulative_fmt": "trade #{n} this session",
         "btn_custom": "✏️",
         "test_caption": "🧪 <b>Test alert</b> (not a real trade)",
         "stopped": "🛑 <b>Predict whale-bot stopped</b>",
@@ -1571,8 +1604,10 @@ class TelegramBot:
         self.state.persist()
 
     async def _send_test_alert(self) -> None:
-        """构造一笔假成交，按当前阈值/语言渲染一遍。用于验证消息样式 + 通道。"""
-        # 用当前 match 阈值 + 一些方便心算的数（500 股 × 0.5 = 250 USDT）
+        """构造一笔假成交，按当前阈值/语言渲染一遍。用于验证消息样式 + 通道。
+        故意填上 makers 多人、手续费、刚刚的 executedAt、cumulative=3，让 🧪 一键
+        看到所有增强字段的样子。不调 bump_cumulative，避免污染真实计数器。"""
+        # 用当前 match 阈值 + 0.5 价格凑整（threshold/$0.5 = 份额）
         sample_notional = self.state.threshold_usdt
         sample_price = Decimal("0.5")  # 50¢
         sample_shares = sample_notional / sample_price if sample_price > 0 else Decimal("100")
@@ -1580,11 +1615,14 @@ class TelegramBot:
         scale_shares = Decimal(10) ** self.cfg.shares_wei_decimals
         scale_usdt = Decimal(10) ** self.cfg.usdt_wei_decimals
 
+        # 用 takerAssetId=0 + takerAmountFilled 构造，配合 Phase 1 新解码路径
         fake_event = {
             "transactionHash": "0x" + "ab" * 32,
-            "executedAt": "2026-01-01T00:00:00.000Z",
+            "executedAt": datetime.now(timezone.utc).isoformat(),
             "amountFilled": str(int((sample_shares * scale_shares).to_integral_value(rounding=ROUND_DOWN))),
-            "priceExecuted": str(int((sample_price * scale_usdt).to_integral_value(rounding=ROUND_DOWN))),
+            "takerAmountFilled": str(int((sample_notional * scale_usdt).to_integral_value(rounding=ROUND_DOWN))),
+            "takerAssetId": "0",
+            "makerAssetId": "12345",
             "market": {
                 "id": 0,
                 "title": "Test Market",
@@ -1595,11 +1633,22 @@ class TelegramBot:
                 "username": "predict_bot_test",
                 "outcome": {"name": "Yes"},
                 "quoteType": "Bid",
+                "fee": {
+                    "amount": str(int(
+                        (sample_notional * Decimal("0.001") * scale_usdt).to_integral_value(rounding=ROUND_DOWN)
+                    )),
+                },
             },
-            "makers": [],
+            # 演示对手方计数（>1 才会渲染）
+            "makers": [
+                {"signer": "0xa" * 40},
+                {"signer": "0xb" * 40},
+                {"signer": "0xc" * 40},
+            ],
         }
 
-        text, markup = format_match_alert(fake_event, self.cfg, self.state)
+        # 演示"本轮第 N 笔"行（不通过 bump_cumulative，避免污染真实计数器）
+        text, markup = format_match_alert(fake_event, self.cfg, self.state, cumulative=3)
         # 加个"测试推送"前缀，让用户分清这不是真单
         text = f"{t(self.state, 'test_caption')}\n\n{text}"
         await self.tg.send(text, reply_markup=markup)
@@ -1665,6 +1714,73 @@ def event_value_usdt(event: Dict[str, Any], cfg: Config) -> Decimal:
     return Decimal("0")
 
 
+def to_usdt_strict(value: Any, decimals: int) -> Decimal:
+    """
+    严格模式 wei→Decimal：整数永远缩放（不依赖大小启发式）。
+    适合"我已经知道这字段是 wei 编码 USDT"的场景，比如手续费（小到 1e15 wei）。
+    `to_decimal` 的 wei_hint 启发式对小金额会失灵。
+    """
+    if value is None:
+        return Decimal("0")
+    s = str(value).strip().replace(",", "")
+    if not s or s.lower() in {"none", "null", "nan"}:
+        return Decimal("0")
+    if s.startswith("$"):
+        s = s[1:]
+    try:
+        out = Decimal(s)
+    except InvalidOperation:
+        return Decimal("0")
+    # 没有小数点 → 整数 wei，无条件按 decimals 缩放
+    if "." not in s:
+        out = out / (Decimal(10) ** decimals)
+    return out
+
+
+def event_fee_usdt(event: Dict[str, Any], cfg: Config) -> Decimal:
+    """从 taker.fee.amount / event.fee.amount 抓出手续费（USDT）。找不到返回 0。"""
+    taker = event.get("taker") if isinstance(event.get("taker"), dict) else {}
+    candidates = (
+        (taker.get("fee") or {}).get("amount") if isinstance(taker.get("fee"), dict) else None,
+        (event.get("fee") or {}).get("amount") if isinstance(event.get("fee"), dict) else None,
+        taker.get("feeAmount"),
+        event.get("feeAmount"),
+    )
+    for raw in candidates:
+        if raw is not None:
+            # 手续费经常是 1e15 量级（$0.001~$0.01），到不了 to_decimal 的 wei_hint
+            # 阈值（1e16），所以用 strict 模式避免显示成 1377600000000000 这种数。
+            return to_usdt_strict(raw, cfg.usdt_wei_decimals)
+    return Decimal("0")
+
+
+def format_time_ago(state: "RuntimeState", iso_ts: Optional[str]) -> str:
+    """ISO 时间戳 → 'X 秒前 / X 分钟前 / X 小时前'。差超过 24h 或异常返回 ''。"""
+    if not iso_ts:
+        return ""
+    try:
+        s = str(iso_ts).strip().replace("Z", "+00:00")
+        ts = datetime.fromisoformat(s)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+    except Exception:
+        return ""
+    delta = datetime.now(timezone.utc) - ts
+    secs = int(delta.total_seconds())
+    if secs < 0:
+        # 时钟漂移，clamp 成"刚刚"
+        return t(state, "time_just_now")
+    if secs < 5:
+        return t(state, "time_just_now")
+    if secs < 60:
+        return t(state, "time_ago_s_fmt").format(n=secs)
+    if secs < 3600:
+        return t(state, "time_ago_m_fmt").format(n=secs // 60)
+    if secs < 86400:
+        return t(state, "time_ago_h_fmt").format(n=secs // 3600)
+    return ""  # > 24h，看着像坏的，不显示
+
+
 def event_price_usdt(event: Dict[str, Any], notional: Decimal, amount: Decimal) -> Decimal:
     """
     解每股成交价：notional / amount。notional 不可用时返回 0 让 alert 显示 "-"。
@@ -1694,7 +1810,11 @@ def _render_template(template: str, **kwargs: Any) -> str:
 
 
 def format_match_alert(
-    event: Dict[str, Any], cfg: Config, state: "RuntimeState"
+    event: Dict[str, Any],
+    cfg: Config,
+    state: "RuntimeState",
+    *,
+    cumulative: int = 0,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """
     巨鲸提醒风格的成交告警。返回 (text, reply_markup)。
@@ -1790,6 +1910,28 @@ def format_match_alert(
     notional_str = f"${fmt_decimal(notional, 2)}" if notional > 0 else "-"
     price_str = f"{fmt_decimal(price_cents, 1)}¢" if price > 0 else "-"
 
+    # === 增强行 1：隐含概率 + 手续费 ===
+    enrich_a_bits: List[str] = []
+    if price > 0:
+        # price 是 0..1 的 USDT/share，× 100 = 隐含概率 %
+        enrich_a_bits.append(
+            f"{t(state, 'implied_label')} {fmt_decimal(price * Decimal('100'), 1)}%"
+        )
+    fee = event_fee_usdt(event, cfg)
+    if fee > 0:
+        enrich_a_bits.append(f"{t(state, 'fee_label')} ${fmt_decimal(fee, 4)}")
+
+    # === 增强行 2：对手方数（>1）+ 时间 + 本轮第 N 笔 ===
+    enrich_b_bits: List[str] = []
+    makers_count = len(event.get("makers") or [])
+    if makers_count > 1:
+        enrich_b_bits.append(f"{t(state, 'makers_label')} {makers_count}")
+    time_ago = format_time_ago(state, event.get("executedAt") or event.get("createdAt"))
+    if time_ago:
+        enrich_b_bits.append(time_ago)
+    if cumulative >= 2:
+        enrich_b_bits.append(t(state, "cumulative_fmt").format(n=cumulative))
+
     lines = [
         t(state, "whale_title"),
         "",
@@ -1803,6 +1945,10 @@ def format_match_alert(
             f"{fmt_decimal(amount, 1)} {t(state, 'shares')}"
         ),
     ]
+    if enrich_a_bits:
+        lines.append("└ " + " · ".join(enrich_a_bits))
+    if enrich_b_bits:
+        lines.append("└ " + " · ".join(enrich_b_bits))
 
     text = "\n".join(lines)
 
@@ -2020,7 +2166,11 @@ async def monitor_matches(
             elif fresh:
                 # 接口通常按 executedAt DESC 排序，反转后按时间先后发送。
                 for ev in reversed(fresh):
-                    text, markup = format_match_alert(ev, cfg, state)
+                    # 只对实际告警的事件累加计数（去重 + 阈值过滤后），保证
+                    # "本轮第 N 笔" 只反映被推送的大单。
+                    signer = extract_signer(ev) or ""
+                    n = state.bump_cumulative(signer) if signer else 0
+                    text, markup = format_match_alert(ev, cfg, state, cumulative=n)
                     await tg.send(text, reply_markup=markup)
 
             startup = False

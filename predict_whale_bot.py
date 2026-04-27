@@ -1559,33 +1559,74 @@ class TelegramBot:
 
 
 def event_value_usdt(event: Dict[str, Any], cfg: Config) -> Decimal:
-    # 优先使用 API 里可能直接给出的成交额字段。
+    """
+    解出本笔成交的 USDT 总额。优先级：
+    (1) API 直接给的 valueUsdt / notionalUsdt / valueUsdtWei 等字段
+    (2) 链上 OrderFilled 同名字段：takerAmountFilled（当 takerAssetId=0）
+        或 makerAmountFilled（当 makerAssetId=0）— 0 在 Predict 的 ConditionalTokens
+        语义里是 collateral（USDT）
+    (3) 其它直接的 USDT 金额字段：collateralAmount / usdtAmount / usdAmount
+    (4) 都没有 → 返回 0 + 写 warning，让 alert 显示 "-"，**禁止再用
+        amountFilled × priceExecuted 兜底**：实测 priceExecuted 不是 per-share
+        价格，会算出离谱的天文数字。
+    """
+
+    # (1) 顶层显式 USDT 字段
     for key in (
-        "valueUsdt",
-        "valueUSDT",
-        "valueUsdtWei",
-        "notionalUsdt",
-        "notionalUsdtWei",
-        "totalValueUsdt",
-        "totalValueUsdtWei",
+        "valueUsdt", "valueUSDT", "valueUsdtWei",
+        "notionalUsdt", "notionalUsdtWei",
+        "totalValueUsdt", "totalValueUsdtWei",
     ):
         if event.get(key) is not None:
             return to_decimal(event.get(key), cfg.usdt_wei_decimals)
 
-    taker = event.get("taker") or {}
+    # (1') taker 嵌套的 USDT 字段
+    taker = event.get("taker") if isinstance(event.get("taker"), dict) else {}
     for key in (
-        "valueUsdt",
-        "valueUSDT",
-        "valueUsdtWei",
-        "notionalUsdt",
-        "notionalUsdtWei",
+        "valueUsdt", "valueUSDT", "valueUsdtWei",
+        "notionalUsdt", "notionalUsdtWei",
     ):
         if taker.get(key) is not None:
             return to_decimal(taker.get(key), cfg.usdt_wei_decimals)
 
-    amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.shares_wei_decimals)
-    price = to_decimal(event.get("priceExecuted") or taker.get("price"), cfg.usdt_wei_decimals)
-    return amount * price if amount and price else Decimal("0")
+    # (2) 链上 OrderFilled 风格字段
+    # taker_asset_id == 0 → takerAmountFilled 就是 USDT
+    # 与之配对：当 makerAssetId == 0，makerAmountFilled 才是 USDT。
+    def _maybe_int(v: Any) -> Optional[int]:
+        try:
+            return int(str(v))
+        except (TypeError, ValueError):
+            return None
+
+    taker_asset_id = _maybe_int(event.get("takerAssetId"))
+    maker_asset_id = _maybe_int(event.get("makerAssetId"))
+    if taker_asset_id == 0 and event.get("takerAmountFilled") is not None:
+        return to_decimal(event.get("takerAmountFilled"), cfg.usdt_wei_decimals)
+    if maker_asset_id == 0 and event.get("makerAmountFilled") is not None:
+        return to_decimal(event.get("makerAmountFilled"), cfg.usdt_wei_decimals)
+
+    # (3) 其它直接 USDT 金额字段
+    for key in ("collateralAmount", "collateralAmountFilled", "usdtAmount", "usdAmount"):
+        if event.get(key) is not None:
+            return to_decimal(event.get(key), cfg.usdt_wei_decimals)
+
+    # (4) 兜底：放弃 amount × priceExecuted 这条死路，记 warning
+    LOG.warning(
+        "event_value_usdt 找不到 USDT 字段；不再用 amount×price 兜底。事件 keys=%s",
+        sorted(event.keys()),
+    )
+    return Decimal("0")
+
+
+def event_price_usdt(event: Dict[str, Any], notional: Decimal, amount: Decimal) -> Decimal:
+    """
+    解每股成交价：notional / amount。notional 不可用时返回 0 让 alert 显示 "-"。
+    不再退回 priceExecuted —— 它在某些市场是限价单的原始 limit price 编码而不是
+    per-share 价格，会算出离谱数（e.g. 200,000,000,000,000,000¢）。
+    """
+    if notional > 0 and amount > 0:
+        return notional / amount
+    return Decimal("0")
 
 
 def _render_template(template: str, **kwargs: Any) -> str:
@@ -1661,8 +1702,9 @@ def format_match_alert(
         )
 
     amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.shares_wei_decimals)
-    price = to_decimal(event.get("priceExecuted") or taker.get("price"), cfg.usdt_wei_decimals)
     notional = event_value_usdt(event, cfg)
+    # 价格用 notional/amount 反算最可靠；priceExecuted 在某些市场会编码出离谱数。
+    price = event_price_usdt(event, notional, amount)
 
     # 方向：Ask = 卖出（红），Bid = 买入（绿）
     quote_type = str(taker.get("quoteType") or event.get("quoteType") or "").strip().lower()
@@ -1697,6 +1739,10 @@ def format_match_alert(
     # 价格按"美分"展示（× 100，一位小数），符合 image 1 风格
     price_cents = price * Decimal("100")
 
+    # notional / price 找不到合理值时显示 "-" 而不是 $0.00 / 0.0¢，避免误导
+    notional_str = f"${fmt_decimal(notional, 2)}" if notional > 0 else "-"
+    price_str = f"{fmt_decimal(price_cents, 1)}¢" if price > 0 else "-"
+
     lines = [
         t(state, "whale_title"),
         "",
@@ -1706,7 +1752,7 @@ def format_match_alert(
         "",
         (
             f"{action_emoji} <b>{action_label}</b> "
-            f"${fmt_decimal(notional, 2)} @ {fmt_decimal(price_cents, 1)}¢ · "
+            f"{notional_str} @ {price_str} · "
             f"{fmt_decimal(amount, 1)} {t(state, 'shares')}"
         ),
     ]

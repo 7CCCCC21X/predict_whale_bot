@@ -1,0 +1,7 @@
+[build]
+builder = "RAILPACK"
+
+[deploy]
+startCommand = "python -u predict_whale_bot.py"
+restartPolicyType = "ALWAYS"
+numReplicas = 1

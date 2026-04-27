@@ -60,6 +60,7 @@ class Config:
     mode: str
     threshold_usdt: Decimal
     usdt_wei_decimals: int
+    shares_wei_decimals: int
 
     poll_interval_sec: float
     matches_page_size: int
@@ -114,6 +115,9 @@ class Config:
             mode=mode,
             threshold_usdt=env_decimal("THRESHOLD_USDT", "1000"),
             usdt_wei_decimals=int(os.getenv("USDT_WEI_DECIMALS", "18")),
+            # Predict 的 amountFilled / fee.amount / taker.amount 等"份额量"字段实测是 12 位
+            # 小数编码（份额 × 1e12），而不是常见的 18 位 wei。如果后续接口改了再调整。
+            shares_wei_decimals=int(os.getenv("SHARES_WEI_DECIMALS", "12")),
 
             poll_interval_sec=float(os.getenv("POLL_INTERVAL_SEC", "3")),
             matches_page_size=int(os.getenv("MATCHES_PAGE_SIZE", "100")),
@@ -136,7 +140,7 @@ class Config:
 
             # 默认按 predict.fun 前端 + BNB Chain 浏览器拼接，覆盖默认即可换链或换路径。
             market_url_template=os.getenv(
-                "MARKET_URL_TEMPLATE", "https://predict.fun/event/{slug}"
+                "MARKET_URL_TEMPLATE", "https://predict.fun/zh-cn/market/{slug}"
             ).strip(),
             tx_url_template=os.getenv(
                 "TX_URL_TEMPLATE", "https://bscscan.com/tx/{hash}"
@@ -1021,7 +1025,7 @@ def event_value_usdt(event: Dict[str, Any], cfg: Config) -> Decimal:
         if taker.get(key) is not None:
             return to_decimal(taker.get(key), cfg.usdt_wei_decimals)
 
-    amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.usdt_wei_decimals)
+    amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.shares_wei_decimals)
     price = to_decimal(event.get("priceExecuted") or taker.get("price"), cfg.usdt_wei_decimals)
     return amount * price if amount and price else Decimal("0")
 
@@ -1073,11 +1077,11 @@ def format_match_alert(event: Dict[str, Any], cfg: Config) -> str:
 
     category = market.get("categorySlug") or market.get("category") or "-"
 
-    amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.usdt_wei_decimals)
+    amount = to_decimal(event.get("amountFilled") or taker.get("amount"), cfg.shares_wei_decimals)
     price = to_decimal(event.get("priceExecuted") or taker.get("price"), cfg.usdt_wei_decimals)
     notional = event_value_usdt(event, cfg)
 
-    fee_amount = to_decimal(fee.get("amount"), cfg.usdt_wei_decimals)
+    fee_amount = to_decimal(fee.get("amount"), cfg.shares_wei_decimals)
     signer = extract_signer(event) or "-"
     username = extract_username(event)
     makers = event.get("makers") or []
@@ -1251,6 +1255,7 @@ async def monitor_matches(
     # 历史事件已经在 seen 里了，"新事件"自然就是上次保存之后才发生的，可以直接告警。
     resumed_from_disk = bool(seen)
     startup = True
+    raw_logged = False  # 只对第一笔事件记一次原始字段，便于调试解码
 
     await tg.send(
         f"✅ <b>Predict 成交大单监控已启动</b>\n"
@@ -1279,6 +1284,23 @@ async def monitor_matches(
                     "成交速率高于轮询能力，考虑减小 POLL_INTERVAL_SEC 或增大 MATCHES_MAX_PAGES",
                     max_pages,
                 )
+
+            # 第一次拿到事件时把所有可能跟金额相关的字段原样写日志，
+            # 万一以后 Predict 改了字段编码（比如 amount 不再是 1e12 而是 1e18），
+            # 看一眼日志就能直接判断该把 SHARES_WEI_DECIMALS 调成几。
+            if events and not raw_logged:
+                ev0 = events[0]
+                taker0 = ev0.get("taker") or {}
+                fee0 = taker0.get("fee") or ev0.get("fee") or {}
+                LOG.info(
+                    "[match raw] amountFilled=%r priceExecuted=%r taker.amount=%r taker.price=%r "
+                    "fee.amount=%r valueUsdt=%r valueUsdtWei=%r",
+                    ev0.get("amountFilled"), ev0.get("priceExecuted"),
+                    taker0.get("amount"), taker0.get("price"),
+                    fee0.get("amount"),
+                    ev0.get("valueUsdt"), ev0.get("valueUsdtWei"),
+                )
+                raw_logged = True
 
             # 客户端按 notional value 过滤（API 不靠谱，见 fetch_new_matches 注释）。
             threshold = state.threshold_usdt
@@ -1353,7 +1375,7 @@ def parse_level(level: Any, cfg: Config) -> Optional[Tuple[Decimal, Decimal]]:
         return None
 
     price = to_decimal(price_raw, cfg.usdt_wei_decimals)
-    size = to_decimal(size_raw, cfg.usdt_wei_decimals)
+    size = to_decimal(size_raw, cfg.shares_wei_decimals)
 
     if price <= 0 or size <= 0:
         return None

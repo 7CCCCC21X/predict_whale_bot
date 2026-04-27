@@ -141,7 +141,10 @@ class Config:
             usdt_wei_decimals=int(os.getenv("USDT_WEI_DECIMALS", "18")),
             # Predict 的 amountFilled / fee.amount / taker.amount 等"份额量"字段实测是 12 位
             # 小数编码（份额 × 1e12），而不是常见的 18 位 wei。如果后续接口改了再调整。
-            shares_wei_decimals=int(os.getenv("SHARES_WEI_DECIMALS", "12")),
+            # Predict 的 amountFilled / fee.amount / orderbook size 等"份额量"字段
+            # 实测是 18 位小数（份额 × 1e18），跟 USDT 一样。早期版本曾按 12 位
+            # 解，会让份额数和 amount×price 算出来的成交价值放大 1e6 倍。
+            shares_wei_decimals=int(os.getenv("SHARES_WEI_DECIMALS", "18")),
 
             poll_interval_sec=float(os.getenv("POLL_INTERVAL_SEC", "3")),
             matches_page_size=int(os.getenv("MATCHES_PAGE_SIZE", "100")),
@@ -166,9 +169,10 @@ class Config:
             request_timeout_sec=float(os.getenv("REQUEST_TIMEOUT_SEC", "12")),
             api_max_retries=int(os.getenv("API_MAX_RETRIES", "5")),
 
-            # 默认按 predict.fun 前端 + BNB Chain 浏览器拼接，覆盖默认即可换链或换路径。
+            # 默认指向 predict.fun 前端 + BNB Chain 浏览器；末尾带推荐 ref 参数。
+            # 自定义请保留 {slug} / {address} 占位符；ref 参数可改也可去掉。
             market_url_template=os.getenv(
-                "MARKET_URL_TEMPLATE", "https://predict.fun/zh-cn/market/{slug}"
+                "MARKET_URL_TEMPLATE", "https://predict.fun/zh-cn/market/{slug}?ref=B00EA"
             ).strip(),
             tx_url_template=os.getenv(
                 "TX_URL_TEMPLATE", "https://bscscan.com/tx/{hash}"
@@ -177,11 +181,11 @@ class Config:
             allowed_user_ids=parse_user_id_list(os.getenv("ALLOWED_USER_IDS", "")),
 
             default_lang=(os.getenv("LANG_BOT") or os.getenv("LANG", "zh")).strip().lower() or "zh",
-            # 用户链接：默认指向 BscScan 钱包页（一定能打开）。
-            # 如果将来 predict.fun 有公开的用户主页，可以覆盖成 https://predict.fun/profile/{address}
-            # 模板可用占位符：{address} / {username}
+            # 用户链接：默认指向 predict.fun 自家的 portfolio 页（带 ref）。
+            # 想换 BscScan 钱包页就覆盖成 https://bscscan.com/address/{address}
             user_url_template=os.getenv(
-                "USER_URL_TEMPLATE", "https://bscscan.com/address/{address}"
+                "USER_URL_TEMPLATE",
+                "https://predict.fun/zh-cn/portfolio/{address}?ref=B00EA",
             ).strip(),
 
             watch_new_markets=env_bool("WATCH_NEW_MARKETS", True),

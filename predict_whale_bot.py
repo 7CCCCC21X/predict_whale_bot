@@ -947,6 +947,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "dfreq_set_off_ok": "✅ 已关闭自动汇总（仍可点 📊 摘要 手动看）",
         "dfreq_short": "汇总频率",
         "btn_test": "🧪 测试推送",  # 保留键以备 _send_test_alert 调用，按钮已不挂菜单
+        "btn_order_alerts": "🔔 订单成交提醒 → @predictfun007_bot",
         "implied_label": "隐含",
         "fee_label": "手续费",
         "makers_label": "对手方",
@@ -1009,7 +1010,8 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "<code>/label 0x… 别名</code> · <code>/labels</code> · <code>/unlabel 0x…</code>\n"
             "<code>/whoami</code>  看自己的 user_id 与当前设置\n"
             "<code>/subscribers</code>  订阅者列表（admin）\n\n"
-            "<i>私聊里改的都是你自己的，互不影响；主告警频道仅管理员可改全局设置。</i>"
+            "<i>私聊里改的都是你自己的，互不影响；主告警频道仅管理员可改全局设置。</i>\n\n"
+            "🔔 想要每个订单都提醒？→ <a href=\"https://t.me/predictfun007_bot\">@predictfun007_bot</a>"
         ),
     },
     "en": {
@@ -1054,6 +1056,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "dfreq_set_off_ok": "✅ Auto-digest off (you can still tap 📊 Summary anytime)",
         "dfreq_short": "Digest freq",
         "btn_test": "🧪 Test",
+        "btn_order_alerts": "🔔 Per-trade alerts → @predictfun007_bot",
         "implied_label": "Implied",
         "fee_label": "Fee",
         "makers_label": "Makers",
@@ -1115,7 +1118,8 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "<code>/label 0x… name</code> · <code>/labels</code> · <code>/unlabel 0x…</code>\n"
             "<code>/whoami</code>  show your user_id and current settings\n"
             "<code>/subscribers</code>  subscriber list (admin)\n\n"
-            "<i>DMs only touch your own subscription; the main alert chat is admin-only for global controls.</i>"
+            "<i>DMs only touch your own subscription; the main alert chat is admin-only for global controls.</i>\n\n"
+            "🔔 Want a ping on every trade? → <a href=\"https://t.me/predictfun007_bot\">@predictfun007_bot</a>"
         ),
     },
 }
@@ -1577,6 +1581,9 @@ def _menu_keyboard(state: RuntimeState, *, chat_id: Optional[Any] = None) -> Dic
                 {"text": t(view, "btn_lang_switch"), "callback_data": "lang:toggle"},
                 {"text": t(view, pause_btn_key), "callback_data": "pause:toggle"},
                 {"text": t(view, "btn_refresh"), "callback_data": "refresh"},
+            ],
+            [
+                {"text": t(view, "btn_order_alerts"), "url": "https://t.me/predictfun007_bot"},
             ],
         ]
     }

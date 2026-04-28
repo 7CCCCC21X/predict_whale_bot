@@ -659,7 +659,7 @@ def fmt_money_full(x: Decimal) -> str:
 
 
 def fmt_qty(x: Decimal) -> str:
-    """股数自适应：整数则无小数（2,000），有小数则保留 2 位（484.36）。
+    """份额数量自适应：整数则无小数（2,000），有小数则保留 2 位（484.36）。
     带千分位。"""
     if x <= 0:
         return "0"
@@ -670,7 +670,7 @@ def fmt_qty(x: Decimal) -> str:
 
 
 def fmt_compact_qty(x: Decimal) -> str:
-    """股数紧凑展示：529 → "529"，3,624 → "3.6K"，1,200,000 → "1.2M"。"""
+    """份额紧凑展示：529 → "529"，3,624 → "3.6K"，1,200,000 → "1.2M"。"""
     n = abs(x)
     if n < Decimal("1000"):
         return fmt_decimal(x, 0)
@@ -805,17 +805,36 @@ def extract_username(event: Dict[str, Any]) -> str:
     return ""
 
 
+_SLUG_ACRONYMS: frozenset = frozenset({
+    "ET", "PT", "CT", "MT", "PM", "AM", "UTC", "EST", "PST", "GMT",
+    "BTC", "ETH", "SOL", "USD", "USDT", "USDC", "NFT", "FDV",
+    "IPO", "CEO", "CFO", "CTO",
+    "NFL", "NBA", "MLB", "NHL", "UFC", "F1", "MLS",
+    "AI", "ML", "US", "UK", "EU", "UN", "GDP", "FED", "SEC", "ETF",
+    "API", "CPI", "DAO", "DEX",
+})
+
+
 def slug_to_label(slug: str) -> str:
-    """把 'polymarket-fdv-one-day-after-launch' 转成 'Polymarket Fdv One Day After Launch'。
+    """把 'polymarket-fdv-one-day-after-launch' 转成 'Polymarket FDV One Day After Launch'。
 
     用作市场告警里"父问题"的近似显示，让标题不再光秃秃只有一个 "$4B"。
+    常见缩写（ET/PM/UTC/BTC...）整词大写，避免被 capitalize() 弄成 Et/Pm。
     """
     if not slug:
         return ""
     text = slug.replace("-", " ").replace("_", " ").strip()
     if not text:
         return ""
-    return " ".join(w.capitalize() if w else w for w in text.split())
+    out: List[str] = []
+    for w in text.split():
+        if not w:
+            continue
+        if w.upper() in _SLUG_ACRONYMS:
+            out.append(w.upper())
+        else:
+            out.append(w.capitalize())
+    return " ".join(out)
 
 
 def extract_signer(event: Dict[str, Any]) -> str:
@@ -911,7 +930,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "buy": "买入",
         "sell": "卖出",
         "trade": "成交",
-        "shares": "股",
+        "shares": "份额",
         "view_market": "📊 查看市场",
         "view_wallet": "👤 查看钱包",
         "view_tx": "🔗 交易哈希",
@@ -2639,7 +2658,7 @@ def format_time_ago(state: "RuntimeState", iso_ts: Optional[str]) -> str:
 
 def event_price_usdt(event: Dict[str, Any], notional: Decimal, amount: Decimal) -> Decimal:
     """
-    解每股成交价：notional / amount。notional 不可用时返回 0 让 alert 显示 "-"。
+    解每份额成交价：notional / amount。notional 不可用时返回 0 让 alert 显示 "-"。
     不再退回 priceExecuted —— 它在某些市场是限价单的原始 limit price 编码而不是
     per-share 价格，会算出离谱数（e.g. 200,000,000,000,000,000¢）。
     """
@@ -2701,7 +2720,7 @@ def format_match_alert(
         📊 <b>La Liga Winner</b>
         Real Madrid — No
 
-        🟢 <b>买入 $480.97 @ 99.3¢</b> · 484.36 股
+        🟢 <b>买入 $480.97 @ 99.3¢</b> · 484.36 份额
         <i>20:14:15 · 延迟 1.4s</i>
 
     底部按钮：查看市场 / 查看钱包。
@@ -2767,7 +2786,18 @@ def format_match_alert(
                         break
                 parent_clean = parent_full[:cut].rstrip(" -_")
             else:
-                parent_clean = parent_full
+                # 词集合包含：title 的每个词都在 parent 里（即 slug 只是把
+                # title 的所有词拼了进去再加点限定词，比如多了"2026"），
+                # 此时父行只是冗余，直接跳过。比 endswith 更宽松，能处理
+                # parent 里在 title 词中间塞了年份/分类的情况。
+                title_words = {_norm(w) for w in raw_title.split()}
+                title_words.discard("")
+                parent_words = {_norm(w) for w in parent_full.split()}
+                parent_words.discard("")
+                if title_words and title_words.issubset(parent_words):
+                    parent_clean = ""
+                else:
+                    parent_clean = parent_full
     elif parent_full:
         parent_clean = parent_full
 

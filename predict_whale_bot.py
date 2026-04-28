@@ -995,23 +995,21 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "shares_unit": "笔",
         "stopped": "🛑 <b>Predict 大额监控已停止</b>",
         "help_text": (
-            "🐋 <b>Predict Whale Bot</b>\n\n"
-            "<b>私聊 bot</b>：自动注册，能改你<b>自己的</b>门槛、自己的语言。\n"
-            "<b>主告警频道</b>：管理员才能改全局阈值。\n\n"
-            "<b>菜单按钮</b>（/menu）\n"
-            "💵 预设 $100/$300/$500/$1k · ✏️ 自定义（最低 $10）\n"
-            "📊 摘要 · ⏱ 汇总频率 · 🌐 中英 · ⏸ 暂停/▶️ 恢复 · 🔄 刷新\n\n"
-            "<b>常用命令</b>\n"
-            "<code>/menu</code>  阈值 + 频率 + 暂停 + 语言\n"
+            "🐋 <b>Predict Whale Bot</b>\n"
+            "盯 predict.fun 大单成交，超过你设的阈值就推给你。\n\n"
+            "👉 <b>直接点 /menu 就够了</b>，里面能改阈值、汇总频率、语言、暂停。\n\n"
+            "<b>常用</b>\n"
+            "<code>/menu</code>  打开主菜单\n"
             "<code>/summary</code>  立刻看一次摘要\n"
-            "<code>/dfreq</code>  汇总推送频率（按钮选档位）\n"
-            "<code>/pause</code> · <code>/resume</code>  暂停/恢复推送\n"
-            "<code>/whoami</code> · <code>/lang zh|en</code>\n\n"
-            "<b>进阶（输全名即可）</b>\n"
-            "<code>/set_match 100</code>  改阈值（DM=自己，主频道要 admin）\n"
-            "<code>/unsubscribe</code>  退订私聊\n"
+            "<code>/pause</code> · <code>/resume</code>  暂停 / 恢复推送\n"
+            "<code>/lang zh|en</code>  中英切换\n"
+            "<code>/unsubscribe</code>  退订私聊\n\n"
+            "<b>进阶</b>\n"
+            "<code>/set_match 100</code>  直接改阈值（USDT；私聊只改你自己）\n"
             "<code>/label 0x… 别名</code> · <code>/labels</code> · <code>/unlabel 0x…</code>\n"
-            "<code>/subscribers</code>（admin）"
+            "<code>/whoami</code>  看自己的 user_id 与当前设置\n"
+            "<code>/subscribers</code>  订阅者列表（admin）\n\n"
+            "<i>私聊里改的都是你自己的，互不影响；主告警频道仅管理员可改全局设置。</i>"
         ),
     },
     "en": {
@@ -1103,23 +1101,21 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "shares_unit": "trades",
         "stopped": "🛑 <b>Predict whale-bot stopped</b>",
         "help_text": (
-            "🐋 <b>Predict Whale Bot</b>\n\n"
-            "<b>DM the bot</b>: auto-registers; controls <b>your own</b> threshold + language.\n"
-            "<b>Main alert chat</b>: admin only for global controls.\n\n"
-            "<b>Menu buttons</b> (/menu)\n"
-            "💵 $100/$300/$500/$1k presets · ✏️ Custom (min $10)\n"
-            "📊 Summary · ⏱ Digest freq · 🌐 zh/en · ⏸ Pause/▶️ Resume · 🔄 Refresh\n\n"
+            "🐋 <b>Predict Whale Bot</b>\n"
+            "Watches large trades on predict.fun and pings you when they cross your threshold.\n\n"
+            "👉 <b>Just tap /menu</b> — it covers threshold, digest freq, language, pause.\n\n"
             "<b>Common</b>\n"
-            "<code>/menu</code>  threshold + freq + pause + language\n"
+            "<code>/menu</code>  open main menu\n"
             "<code>/summary</code>  one-shot summary right now\n"
-            "<code>/dfreq</code>  digest push frequency (button picker)\n"
-            "<code>/pause</code> · <code>/resume</code>  stop/start alerts\n"
-            "<code>/whoami</code> · <code>/lang zh|en</code>\n\n"
-            "<b>Advanced (type full name)</b>\n"
-            "<code>/set_match 100</code>  threshold (DM = own; main = admin)\n"
-            "<code>/unsubscribe</code>  stop DM alerts\n"
+            "<code>/pause</code> · <code>/resume</code>  stop / start alerts\n"
+            "<code>/lang zh|en</code>  switch language\n"
+            "<code>/unsubscribe</code>  stop DM alerts\n\n"
+            "<b>Advanced</b>\n"
+            "<code>/set_match 100</code>  set threshold directly (USDT; DM = your own)\n"
             "<code>/label 0x… name</code> · <code>/labels</code> · <code>/unlabel 0x…</code>\n"
-            "<code>/subscribers</code> (admin)"
+            "<code>/whoami</code>  show your user_id and current settings\n"
+            "<code>/subscribers</code>  subscriber list (admin)\n\n"
+            "<i>DMs only touch your own subscription; the main alert chat is admin-only for global controls.</i>"
         ),
     },
 }

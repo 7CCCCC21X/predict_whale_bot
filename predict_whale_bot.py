@@ -427,6 +427,17 @@ class RuntimeState:
                     state.summary_interval_sec, len(state.subscribers),
                     len(state.address_labels),
                 )
+                # 启动基线：把每个订阅者的阈值打到日志里，方便对比 redeploy 前后是否被改
+                if state.subscribers:
+                    detail = ", ".join(
+                        f"{cid}=${info.get('threshold_usdt', '?')}"
+                        for cid, info in sorted(state.subscribers.items())
+                    )
+                    LOG.info("[persist] loaded subs: %s", detail)
+                    state._persist_snap = {
+                        cid: info.get("threshold_usdt", "?")
+                        for cid, info in state.subscribers.items()
+                    }
             except (InvalidOperation, ValueError, TypeError) as exc:
                 LOG.warning("runtime state 字段格式异常 (%s): %s — 用 env 默认", saved, exc)
 
@@ -436,6 +447,23 @@ class RuntimeState:
         """把当前阈值 + offset + lang + summary_interval + subscribers + paused 写盘。失败只 log。"""
         if not self._path:
             return
+        # 订阅者阈值快照对比上次：变化时打日志，方便回溯哪个 chat 何时改的阈值
+        # （只在变化时打，避免 pollers 高频触发 persist 时刷屏）
+        snap = {
+            cid: info.get("threshold_usdt", "?")
+            for cid, info in self.subscribers.items()
+        }
+        prev = getattr(self, "_persist_snap", None)
+        if snap != prev:
+            if snap:
+                detail = ", ".join(f"{cid}=${v}" for cid, v in sorted(snap.items()))
+            else:
+                detail = "(无)"
+            LOG.info(
+                "[persist] subs snapshot: %s (global=$%s)",
+                detail, self.threshold_usdt,
+            )
+            self._persist_snap = snap
         save_runtime_state(self._path, {
             "threshold_usdt": str(self.threshold_usdt),
             "telegram_offset": self.telegram_offset,
@@ -3436,6 +3464,15 @@ async def main() -> None:
             task.cancel()
 
         await asyncio.gather(*tasks, return_exceptions=True)
+
+        # SIGTERM 抵达后，pending Telegram callback 可能刚把订阅者阈值改完但还没
+        # 走到 self.state.persist()。这里在所有 task 退出后再强制写一次，确保
+        # 用户最后一次操作不会因为容器被强杀而丢失。
+        try:
+            state.persist()
+            LOG.info("[persist] final flush on shutdown ok")
+        except Exception as exc:
+            LOG.warning("[persist] final flush on shutdown 失败: %s", exc)
 
         await tg.send(t(state, "stopped"), silent=True)
 

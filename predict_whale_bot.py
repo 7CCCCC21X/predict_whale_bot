@@ -3051,6 +3051,9 @@ async def monitor_matches(
     resumed_from_disk = bool(seen)
     startup = True
     raw_logged = False  # 只对第一笔事件记一次原始字段，便于调试解码
+    # API 连续失败标志：只在 healthy→error 跳变时报警一次，恢复时再报一次，
+    # 避免 Predict 持续挂掉时每轮都往 Telegram 刷"成交监控错误"。
+    monitor_unhealthy = False
 
     await tg.send(
         f"{t(state, 'match_started')}\n"
@@ -3205,14 +3208,23 @@ async def monitor_matches(
             if fresh:
                 save_seen(cfg.seen_state_path, seen)
 
+            # 这一轮跑通了：如果之前处于中断状态，发一条恢复通知并清标志
+            if monitor_unhealthy:
+                monitor_unhealthy = False
+                await tg.send("✅ <b>Predict 成交监控已恢复</b>", silent=True)
+
         except Exception as exc:
             LOG.exception("监控成交大单出错")
 
-            await tg.send(
-                f"⚠️ <b>Predict 成交监控错误</b>\n"
-                f"<code>{html.escape(str(exc))}</code>",
-                silent=True,
-            )
+            # 只在第一次进入中断时提醒一次；持续失败期间静默，等恢复再通知
+            if not monitor_unhealthy:
+                monitor_unhealthy = True
+                await tg.send(
+                    f"⚠️ <b>Predict 成交监控中断</b>\n"
+                    f"<code>{html.escape(str(exc))}</code>\n"
+                    f"<i>恢复后会再通知一次，期间不再重复提醒。</i>",
+                    silent=True,
+                )
 
             await asyncio.sleep(min(30, max(1, cfg.poll_interval_sec * 2)))
 

@@ -205,6 +205,9 @@ class RuntimeState:
     # 主告警频道是否暂停。True 时全局停推（fanout 仍按订阅 paused 字段为各 DM 独立判断）。
     # 持久化在 runtime_state.json，重启续跑自动恢复。
     paused: bool = False
+    # 主告警频道的"交易者展示模式": "name" = GraphQL 解析用户名优先，
+    # "addr" = 直接显示短地址 0xabc…123。DM 各自在 subscribers[cid]["name_display"]。
+    name_display: str = "name"
     # 摘要轮播间隔（秒），可以 /set_summary 动态改并写盘
     summary_interval_sec: int = 3600
     # "汇总基线" — 用户最近一次激活/重置自动摘要的时间。auto summary_runner 会
@@ -396,6 +399,8 @@ class RuntimeState:
                     state.summary_baseline_iso = str(saved["summary_baseline_iso"])
                 if "paused" in saved:
                     state.paused = bool(saved["paused"])
+                if saved.get("name_display") in {"name", "addr"}:
+                    state.name_display = saved["name_display"]
                 if "subscribers" in saved and isinstance(saved["subscribers"], dict):
                     # 校验+裁掉异常项；threshold 留 str 形态在 dict 里，用时再转 Decimal
                     valid: Dict[str, Dict[str, Any]] = {}
@@ -412,6 +417,7 @@ class RuntimeState:
                             "created_at": str(info.get("created_at", "")),
                             "last_seen": str(info.get("last_seen", "")),
                             "paused": bool(info.get("paused", False)),
+                            "name_display": info.get("name_display") if info.get("name_display") in {"name", "addr"} else "name",
                         }
                     state.subscribers = valid
                 if "address_labels" in saved and isinstance(saved["address_labels"], dict):
@@ -471,6 +477,7 @@ class RuntimeState:
             "summary_interval_sec": self.summary_interval_sec,
             "summary_baseline_iso": self.summary_baseline_iso,
             "paused": self.paused,
+            "name_display": self.name_display,
             "subscribers": self.subscribers,
             "address_labels": self.address_labels,
         })
@@ -510,6 +517,28 @@ class RuntimeState:
         info = self.subscribers.get(key)
         return bool(info.get("paused")) if info else False
 
+    def get_name_display_for(self, chat_id: Any) -> str:
+        """主告警频道用 state.name_display；DM 用 subscribers[cid]['name_display']。
+        返回 'name' 或 'addr'，未识别值兜底成 'name'。"""
+        key = str(chat_id) if chat_id is not None else ""
+        if not key or key == self.main_chat_id:
+            return self.name_display if self.name_display in {"name", "addr"} else "name"
+        info = self.subscribers.get(key)
+        if info and info.get("name_display") in {"name", "addr"}:
+            return info["name_display"]
+        return "name"
+
+    def set_name_display_for(self, chat_id: Any, mode: str) -> None:
+        """主频道改全局 state.name_display；DM 改自己的。"""
+        if mode not in {"name", "addr"}:
+            return
+        key = str(chat_id)
+        if key == self.main_chat_id:
+            self.name_display = mode
+            return
+        self.upsert_subscriber(chat_id)
+        self.subscribers[key]["name_display"] = mode
+
     def set_paused_for(self, chat_id: Any, paused: bool) -> None:
         """主频道改全局 state.paused；DM 改自己 subscribers[cid]['paused']。"""
         key = str(chat_id)
@@ -541,6 +570,7 @@ class RuntimeState:
                 "created_at": now,
                 "last_seen": now,
                 "paused": False,
+                "name_display": "name",
             }
             self.subscribers[key] = existing
             LOG.info("[subscribers] 新订阅 chat_id=%s 默认阈值=%s", key, existing["threshold_usdt"])
@@ -995,6 +1025,8 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "dfreq_short": "汇总频率",
         "btn_test": "🧪 测试推送",  # 保留键以备 _send_test_alert 调用，按钮已不挂菜单
         "btn_order_alerts": "🔔 订单成交提醒 → @predictfun007_bot",
+        "btn_name_display_name": "👤 用户名",
+        "btn_name_display_addr": "🆔 地址",
         "implied_label": "隐含",
         "fee_label": "手续费",
         "makers_label": "对手方",
@@ -1104,6 +1136,8 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "dfreq_short": "Digest freq",
         "btn_test": "🧪 Test",
         "btn_order_alerts": "🔔 Per-trade alerts → @predictfun007_bot",
+        "btn_name_display_name": "👤 Name",
+        "btn_name_display_addr": "🆔 Address",
         "implied_label": "Implied",
         "fee_label": "Fee",
         "makers_label": "Makers",
@@ -1379,18 +1413,65 @@ class Predict:
     # Predict 官方限速：240 req/min = 4 RPS（mainnet 默认 / testnet）
     RATE_LIMIT_PER_MIN = 240
 
+    GRAPHQL_URL = "https://graphql.predict.fun/graphql"
+    # 地址→用户名缓存：命中名字缓存 24h，未命中（空）缓存 1h 让用户改名后能续到
+    _USERNAME_TTL_HIT = 24 * 3600
+    _USERNAME_TTL_MISS = 3600
+
     def __init__(self, cfg: Config, client: httpx.AsyncClient) -> None:
         self.cfg = cfg
         self.client = client
         # 滑动窗口：API 请求时间戳，用来周期性报实际 req/min
         self._request_log: List[float] = []
         self._rate_log_last = 0.0
+        # address_lower → (name, fetched_at_monotonic)
+        self._username_cache: Dict[str, Tuple[str, float]] = {}
 
     @property
     def headers(self) -> Dict[str, str]:
         if self.cfg.predict_api_key:
             return {"x-api-key": self.cfg.predict_api_key}
         return {}
+
+    async def resolve_username(self, address: str) -> str:
+        """从 graphql.predict.fun 查 account.name，返回用户名，找不到返回空串。
+        24h 命中缓存 / 1h 未命中缓存，避免每条 alert 都打一次 GraphQL。"""
+        if not address:
+            return ""
+        import time as _time
+        key = address.lower()
+        now = _time.monotonic()
+        cached = self._username_cache.get(key)
+        if cached is not None:
+            name, ts = cached
+            ttl = self._USERNAME_TTL_HIT if name else self._USERNAME_TTL_MISS
+            if now - ts < ttl:
+                return name
+        payload = {
+            "query": "query G($a: Address!) { account(address: $a) { name } }",
+            "variables": {"a": address},
+        }
+        try:
+            resp = await self.client.post(
+                self.GRAPHQL_URL,
+                json=payload,
+                headers={"content-type": "application/json"},
+                timeout=httpx.Timeout(5.0),
+            )
+        except Exception as exc:
+            LOG.warning("[graphql] resolve_username %s 网络异常: %s", address[:10], exc)
+            return cached[0] if cached else ""
+        if resp.status_code != 200:
+            LOG.warning("[graphql] resolve_username %s status=%s", address[:10], resp.status_code)
+            return cached[0] if cached else ""
+        try:
+            data = resp.json()
+        except Exception:
+            return cached[0] if cached else ""
+        account = ((data.get("data") or {}).get("account") or {}) if isinstance(data, dict) else {}
+        name = str(account.get("name") or "").strip()
+        self._username_cache[key] = (name, now)
+        return name
 
     def _record_request(self) -> None:
         """记录一次 API 调用，每 5 分钟把窗口内总数 + 平均 RPS 写一条日志。"""
@@ -1617,12 +1698,15 @@ def _menu_keyboard(state: RuntimeState, *, chat_id: Optional[Any] = None) -> Dic
 
     paused = state.is_paused_for(chat_id) if chat_id is not None else state.paused
     pause_btn_key = "btn_resume" if paused else "btn_pause"
+    name_mode = state.get_name_display_for(chat_id)
+    name_btn_key = "btn_name_display_addr" if name_mode == "addr" else "btn_name_display_name"
     return {
         "inline_keyboard": [
             preset_row("match", "💵"),
             [
                 {"text": t(view, "btn_summary"), "callback_data": "summary"},
                 {"text": t(view, "btn_dfreq"), "callback_data": "dfreq:open"},
+                {"text": t(view, name_btn_key), "callback_data": "namedisp:toggle"},
             ],
             [
                 {"text": t(view, "btn_lang_switch"), "callback_data": "lang:toggle"},
@@ -2196,6 +2280,26 @@ class TelegramBot:
             await self.tg.send(ack, chat_id=src)
             return
 
+        # 切换交易者展示模式：主频道改全局（要 admin），DM 改自己（不要 admin）
+        if data == "namedisp:toggle":
+            if is_main and not self._is_admin(user_id):
+                await self.tg.answer_callback_query(cb_id, "⛔ 仅管理员可改全局显示")
+                return
+            cur = self.state.get_name_display_for(chat_id)
+            new_mode = "addr" if cur == "name" else "name"
+            self.state.set_name_display_for(chat_id, new_mode)
+            self.state.persist()
+            ack = "✓ 👤 用户名" if new_mode == "name" else "✓ 🆔 地址"
+            await self.tg.answer_callback_query(cb_id, ack)
+            if message_id:
+                await self.tg.edit_message(
+                    message_id,
+                    _menu_text(self.state, chat_id=chat_id),
+                    reply_markup=_menu_keyboard(self.state, chat_id=chat_id),
+                    chat_id=src,
+                )
+            return
+
         # 暂停 / 恢复推送：主频道改全局（要 admin），DM 改自己（不要 admin）
         if data == "pause:toggle":
             if is_main and not self._is_admin(user_id):
@@ -2738,6 +2842,8 @@ def format_match_alert(
     state: "RuntimeState",
     *,
     cumulative: int = 0,
+    resolved_username: str = "",
+    chat_id: Optional[Any] = None,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """
     flamy.gg 风格的巨鲸告警卡片，紧凑：
@@ -2865,16 +2971,23 @@ def format_match_alert(
     signer = extract_signer(event) or ""
     username_raw = extract_username(event)
     short = short_addr(signer) if signer else ""
-    # 用户别名 > 链上 username > 短地址
+    # 优先级：用户别名 > [name 模式] GraphQL 解析名 / 事件 username > 短地址。
+    # name_display="addr" 时强制跳过 GraphQL 名字，直接显示短地址（label 仍优先）。
     label = state.address_labels.get(signer.lower()) if signer else ""
-    display_name = (label or username_raw or "").strip()
-    if not display_name and short:
-        display_name = short
+    mode = state.get_name_display_for(chat_id)
+    if mode == "addr":
+        display_name = (label or short).strip()
+    else:
+        display_name = (label or resolved_username or username_raw or short).strip()
 
     tx = extract_tx_hash(event)
     market_link = _render_template(cfg.market_url_template, id=mid_str, slug=slug, title=raw_title)
     user_link = (
-        _render_template(cfg.user_url_template, address=signer, username=username_raw)
+        _render_template(
+            cfg.user_url_template,
+            address=signer,
+            username=resolved_username or username_raw,
+        )
         if signer
         else ""
     )
@@ -2956,6 +3069,7 @@ async def _dispatch_match(
     cfg: Config,
     state: "RuntimeState",
     tg: "Telegram",
+    predict: "Predict",
 ) -> Tuple[bool, int]:
     """
     分发一笔成交告警：主频道（过全局阈值）+ 私聊订阅者（按各自门槛）。
@@ -2966,12 +3080,19 @@ async def _dispatch_match(
     n = state.bump_cumulative(signer) if signer else 0
     notional = event_value_usdt(ev, cfg)
 
+    # 每笔事件只查一次 GraphQL（命中缓存就更快），渲染给所有收件人复用
+    resolved_username = await predict.resolve_username(signer) if signer else ""
+
     sent_main = False
     sent_subs = 0
 
     # 主告警频道：过全局阈值才发；state.paused 时全局静默
     if notional >= state.threshold_usdt and not state.paused:
-        text, markup = format_match_alert(ev, cfg, state, cumulative=n)
+        text, markup = format_match_alert(
+            ev, cfg, state, cumulative=n,
+            resolved_username=resolved_username,
+            chat_id=state.main_chat_id,
+        )
         await tg.send(text, reply_markup=markup)
         sent_main = True
 
@@ -2990,7 +3111,11 @@ async def _dispatch_match(
             state if sub_lang == state.lang
             else dataclass_replace_lang(state, sub_lang)
         )
-        text, markup = format_match_alert(ev, cfg, view, cumulative=n)
+        text, markup = format_match_alert(
+            ev, cfg, view, cumulative=n,
+            resolved_username=resolved_username,
+            chat_id=sub_chat_id,
+        )
         try:
             mid = await tg.send(text, reply_markup=markup, chat_id=sub_chat_id)
             if mid is not None:
@@ -3174,7 +3299,7 @@ async def monitor_matches(
                 for ev in reversed(fresh):
                     try:
                         sent_to_main, sent_to_subs = await _dispatch_match(
-                            ev, cfg, state, tg,
+                            ev, cfg, state, tg, predict,
                         )
                         sent_main += int(sent_to_main)
                         sent_subs += sent_to_subs

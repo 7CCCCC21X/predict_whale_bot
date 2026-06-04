@@ -1456,7 +1456,7 @@ class Predict:
                 self.GRAPHQL_URL,
                 json=payload,
                 headers={"content-type": "application/json"},
-                timeout=httpx.Timeout(3.0),
+                timeout=httpx.Timeout(1.5),
             )
         except Exception as exc:
             LOG.warning("[graphql] resolve_username %s 网络异常: %s", address[:10], exc)
@@ -3097,6 +3097,11 @@ async def _dispatch_match(
     sent_main = False
     sent_subs = 0
 
+    # 收集本笔事件所有要发的 (target_label, send_coro)。target_label="__main__"
+    # 标记主频道，其它就是 sub_chat_id。先全部构造完，再 asyncio.gather 一次性
+    # 并行发出，把"主+N 订阅者"的发送时间从 sum 压成 max，显著降低人感延迟。
+    targets: List[Tuple[str, Any]] = []
+
     # 主告警频道：过全局阈值才发；state.paused 时全局静默
     if notional >= state.threshold_usdt and not state.paused:
         text, markup = format_match_alert(
@@ -3104,8 +3109,7 @@ async def _dispatch_match(
             resolved_username=resolved_username,
             chat_id=state.main_chat_id,
         )
-        await tg.send(text, reply_markup=markup)
-        sent_main = True
+        targets.append(("__main__", tg.send(text, reply_markup=markup)))
 
     # 私聊订阅者：按各自门槛分发；订阅者 paused 时跳过
     for sub_chat_id, info in list(state.subscribers.items()):
@@ -3127,17 +3131,31 @@ async def _dispatch_match(
             resolved_username=resolved_username,
             chat_id=sub_chat_id,
         )
-        try:
-            mid = await tg.send(text, reply_markup=markup, chat_id=sub_chat_id)
-            if mid is not None:
-                sent_subs += 1
+        targets.append(
+            (str(sub_chat_id), tg.send(text, reply_markup=markup, chat_id=sub_chat_id))
+        )
+
+    if targets:
+        results = await asyncio.gather(
+            *(coro for _, coro in targets), return_exceptions=True,
+        )
+        for (label, _), result in zip(targets, results):
+            if isinstance(result, Exception):
+                if label == "__main__":
+                    LOG.warning("[fanout] 主频道发送异常: %s", result)
+                else:
+                    LOG.warning("[fanout] 发给 chat %s 异常: %s", label, result)
+                continue
+            if label == "__main__":
+                sent_main = True
             else:
-                LOG.warning(
-                    "[fanout] 发给 chat %s 失败（4xx/timeout）— bot 可能被 block 或 chat 失效",
-                    sub_chat_id,
-                )
-        except Exception as exc:
-            LOG.warning("[fanout] 发给 chat %s 异常: %s", sub_chat_id, exc)
+                if result is not None:
+                    sent_subs += 1
+                else:
+                    LOG.warning(
+                        "[fanout] 发给 chat %s 失败（4xx/timeout）— bot 可能被 block 或 chat 失效",
+                        label,
+                    )
 
     # 记入摘要滚动窗口（聚合用），不影响 alert 发送
     if notional > 0:

@@ -1456,7 +1456,7 @@ class Predict:
                 self.GRAPHQL_URL,
                 json=payload,
                 headers={"content-type": "application/json"},
-                timeout=httpx.Timeout(5.0),
+                timeout=httpx.Timeout(1.5),
             )
         except Exception as exc:
             LOG.warning("[graphql] resolve_username %s 网络异常: %s", address[:10], exc)
@@ -1472,6 +1472,15 @@ class Predict:
         name = str(account.get("name") or "").strip()
         self._username_cache[key] = (name, now)
         return name
+
+    def cached_username(self, address: str) -> str:
+        """同步读取 GraphQL 用户名缓存，永远不发请求。
+        dispatch 热路径用这个避免被 GraphQL 拖慢；缓存预热由 monitor_matches
+        在分发前用 asyncio.gather 并行 resolve_username 完成。"""
+        if not address:
+            return ""
+        cached = self._username_cache.get(address.lower())
+        return cached[0] if cached else ""
 
     def _record_request(self) -> None:
         """记录一次 API 调用，每 5 分钟把窗口内总数 + 平均 RPS 写一条日志。"""
@@ -3080,11 +3089,18 @@ async def _dispatch_match(
     n = state.bump_cumulative(signer) if signer else 0
     notional = event_value_usdt(ev, cfg)
 
-    # 每笔事件只查一次 GraphQL（命中缓存就更快），渲染给所有收件人复用
-    resolved_username = await predict.resolve_username(signer) if signer else ""
+    # 读已缓存的 GraphQL 用户名（缓存预热由 monitor_matches 在分发前并行做完）。
+    # 这里走同步缓存读取而不是 await，避免 GraphQL 慢/挂时拖垮 dispatch 导致
+    # 事件来不及发就被 max_alert_age_sec 过滤掉、或抛异常时事件已入 seen 永久丢失。
+    resolved_username = predict.cached_username(signer)
 
     sent_main = False
     sent_subs = 0
+
+    # 收集本笔事件所有要发的 (target_label, send_coro)。target_label="__main__"
+    # 标记主频道，其它就是 sub_chat_id。先全部构造完，再 asyncio.gather 一次性
+    # 并行发出，把"主+N 订阅者"的发送时间从 sum 压成 max，显著降低人感延迟。
+    targets: List[Tuple[str, Any]] = []
 
     # 主告警频道：过全局阈值才发；state.paused 时全局静默
     if notional >= state.threshold_usdt and not state.paused:
@@ -3093,8 +3109,7 @@ async def _dispatch_match(
             resolved_username=resolved_username,
             chat_id=state.main_chat_id,
         )
-        await tg.send(text, reply_markup=markup)
-        sent_main = True
+        targets.append(("__main__", tg.send(text, reply_markup=markup)))
 
     # 私聊订阅者：按各自门槛分发；订阅者 paused 时跳过
     for sub_chat_id, info in list(state.subscribers.items()):
@@ -3116,17 +3131,31 @@ async def _dispatch_match(
             resolved_username=resolved_username,
             chat_id=sub_chat_id,
         )
-        try:
-            mid = await tg.send(text, reply_markup=markup, chat_id=sub_chat_id)
-            if mid is not None:
-                sent_subs += 1
+        targets.append(
+            (str(sub_chat_id), tg.send(text, reply_markup=markup, chat_id=sub_chat_id))
+        )
+
+    if targets:
+        results = await asyncio.gather(
+            *(coro for _, coro in targets), return_exceptions=True,
+        )
+        for (label, _), result in zip(targets, results):
+            if isinstance(result, Exception):
+                if label == "__main__":
+                    LOG.warning("[fanout] 主频道发送异常: %s", result)
+                else:
+                    LOG.warning("[fanout] 发给 chat %s 异常: %s", label, result)
+                continue
+            if label == "__main__":
+                sent_main = True
             else:
-                LOG.warning(
-                    "[fanout] 发给 chat %s 失败（4xx/timeout）— bot 可能被 block 或 chat 失效",
-                    sub_chat_id,
-                )
-        except Exception as exc:
-            LOG.warning("[fanout] 发给 chat %s 异常: %s", sub_chat_id, exc)
+                if result is not None:
+                    sent_subs += 1
+                else:
+                    LOG.warning(
+                        "[fanout] 发给 chat %s 失败（4xx/timeout）— bot 可能被 block 或 chat 失效",
+                        label,
+                    )
 
     # 记入摘要滚动窗口（聚合用），不影响 alert 发送
     if notional > 0:
@@ -3295,6 +3324,17 @@ async def monitor_matches(
                     len(fresh),
                 )
             elif fresh:
+                # 分发前并行预热 GraphQL 用户名缓存：dispatch 热路径只读缓存
+                # 不再 await，避免任何 GraphQL 抖动影响发推。所有异常吞掉，
+                # 拿不到用户名的事件自然 fallback 到短地址。
+                unique_signers = {extract_signer(ev) for ev in fresh}
+                unique_signers.discard("")
+                if unique_signers:
+                    await asyncio.gather(
+                        *(predict.resolve_username(s) for s in unique_signers),
+                        return_exceptions=True,
+                    )
+
                 # 接口通常按 executedAt DESC 排序，反转后按时间先后发送。
                 for ev in reversed(fresh):
                     try:

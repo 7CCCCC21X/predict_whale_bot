@@ -1456,7 +1456,7 @@ class Predict:
                 self.GRAPHQL_URL,
                 json=payload,
                 headers={"content-type": "application/json"},
-                timeout=httpx.Timeout(5.0),
+                timeout=httpx.Timeout(3.0),
             )
         except Exception as exc:
             LOG.warning("[graphql] resolve_username %s 网络异常: %s", address[:10], exc)
@@ -1472,6 +1472,15 @@ class Predict:
         name = str(account.get("name") or "").strip()
         self._username_cache[key] = (name, now)
         return name
+
+    def cached_username(self, address: str) -> str:
+        """同步读取 GraphQL 用户名缓存，永远不发请求。
+        dispatch 热路径用这个避免被 GraphQL 拖慢；缓存预热由 monitor_matches
+        在分发前用 asyncio.gather 并行 resolve_username 完成。"""
+        if not address:
+            return ""
+        cached = self._username_cache.get(address.lower())
+        return cached[0] if cached else ""
 
     def _record_request(self) -> None:
         """记录一次 API 调用，每 5 分钟把窗口内总数 + 平均 RPS 写一条日志。"""
@@ -3080,8 +3089,10 @@ async def _dispatch_match(
     n = state.bump_cumulative(signer) if signer else 0
     notional = event_value_usdt(ev, cfg)
 
-    # 每笔事件只查一次 GraphQL（命中缓存就更快），渲染给所有收件人复用
-    resolved_username = await predict.resolve_username(signer) if signer else ""
+    # 读已缓存的 GraphQL 用户名（缓存预热由 monitor_matches 在分发前并行做完）。
+    # 这里走同步缓存读取而不是 await，避免 GraphQL 慢/挂时拖垮 dispatch 导致
+    # 事件来不及发就被 max_alert_age_sec 过滤掉、或抛异常时事件已入 seen 永久丢失。
+    resolved_username = predict.cached_username(signer)
 
     sent_main = False
     sent_subs = 0
@@ -3295,6 +3306,17 @@ async def monitor_matches(
                     len(fresh),
                 )
             elif fresh:
+                # 分发前并行预热 GraphQL 用户名缓存：dispatch 热路径只读缓存
+                # 不再 await，避免任何 GraphQL 抖动影响发推。所有异常吞掉，
+                # 拿不到用户名的事件自然 fallback 到短地址。
+                unique_signers = {extract_signer(ev) for ev in fresh}
+                unique_signers.discard("")
+                if unique_signers:
+                    await asyncio.gather(
+                        *(predict.resolve_username(s) for s in unique_signers),
+                        return_exceptions=True,
+                    )
+
                 # 接口通常按 executedAt DESC 排序，反转后按时间先后发送。
                 for ev in reversed(fresh):
                     try:

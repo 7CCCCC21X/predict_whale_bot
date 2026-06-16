@@ -229,6 +229,13 @@ class RuntimeState:
     # 监控心跳：monitor_matches 每轮把最新一轮统计放这里，方便日后再加诊断命令
     # 直接读取。重启清零，不持久化。
     last_iter_stats: Dict[str, Any] = field(default_factory=dict)
+    # 主告警频道屏蔽的市场：token → 展示标题。token 由 market_block_token() 算出。
+    # 命中后该市场的大单不再推到主频道。DM 各自存在 subscribers[cid]["blocked_markets"]。
+    # 持久化在 runtime_state.json。
+    blocked_markets: Dict[str, str] = field(default_factory=dict)
+    # token → 市场标题 的内存缓存（格式化卡片时写入），给"屏蔽"回调取标题用。
+    # 重启清零、不持久化；屏蔽列表本身在 blocked_markets 里已存了标题快照。
+    market_meta: "OrderedDict[str, str]" = field(default_factory=OrderedDict)
     _path: str = ""  # 仅内部用，不参与持久化
 
     _CUMULATIVE_CAP = 5000
@@ -418,8 +425,16 @@ class RuntimeState:
                             "last_seen": str(info.get("last_seen", "")),
                             "paused": bool(info.get("paused", False)),
                             "name_display": info.get("name_display") if info.get("name_display") in {"name", "addr"} else "name",
+                            "blocked_markets": {
+                                str(k): str(v)[:80]
+                                for k, v in info["blocked_markets"].items()
+                            } if isinstance(info.get("blocked_markets"), dict) else {},
                         }
                     state.subscribers = valid
+                if "blocked_markets" in saved and isinstance(saved["blocked_markets"], dict):
+                    state.blocked_markets = {
+                        str(k): str(v)[:80] for k, v in saved["blocked_markets"].items()
+                    }
                 if "address_labels" in saved and isinstance(saved["address_labels"], dict):
                     state.address_labels = {
                         str(k).lower(): str(v)[:30]
@@ -480,6 +495,7 @@ class RuntimeState:
             "name_display": self.name_display,
             "subscribers": self.subscribers,
             "address_labels": self.address_labels,
+            "blocked_markets": self.blocked_markets,
         })
 
     # ---------- 私聊订阅者（每个 chat 自己的阈值 / 语言） ----------
@@ -571,6 +587,7 @@ class RuntimeState:
                 "last_seen": now,
                 "paused": False,
                 "name_display": "name",
+                "blocked_markets": {},
             }
             self.subscribers[key] = existing
             LOG.info("[subscribers] 新订阅 chat_id=%s 默认阈值=%s", key, existing["threshold_usdt"])
@@ -609,6 +626,63 @@ class RuntimeState:
     def get_address_label(self, address: str) -> str:
         key = (address or "").strip().lower()
         return self.address_labels.get(key, "")
+
+    # ---------- 市场屏蔽（主频道全局 / DM 各自） ----------
+
+    def remember_market(self, token: str, title: str) -> None:
+        """格式化卡片时把 token → 标题 记进内存缓存，供"屏蔽"回调取展示名。"""
+        if not token:
+            return
+        self.market_meta[token] = (title or token)[:80]
+        while len(self.market_meta) > 2000:
+            self.market_meta.popitem(last=False)
+
+    def get_blocked_markets_for(self, chat_id: Any) -> Dict[str, str]:
+        """返回该 chat 的 token→标题 屏蔽表。主频道用全局，DM 用各自的。"""
+        key = str(chat_id) if chat_id is not None else ""
+        if not key or key == self.main_chat_id:
+            return self.blocked_markets
+        info = self.subscribers.get(key)
+        if info and isinstance(info.get("blocked_markets"), dict):
+            return info["blocked_markets"]
+        return {}
+
+    def is_token_blocked_for(self, chat_id: Any, token: str) -> bool:
+        if not token:
+            return False
+        return token in self.get_blocked_markets_for(chat_id)
+
+    def block_token_for(self, chat_id: Any, token: str, title: str = "") -> None:
+        """把市场加入该 chat 的屏蔽表。主频道改全局，DM 改自己（兜底创建订阅条目）。"""
+        if not token:
+            return
+        display = (title or token)[:80]
+        key = str(chat_id)
+        if key == self.main_chat_id:
+            self.blocked_markets[token] = display
+            return
+        self.upsert_subscriber(chat_id)
+        self.subscribers[key].setdefault("blocked_markets", {})[token] = display
+
+    def unblock_token_for(self, chat_id: Any, token: str) -> bool:
+        key = str(chat_id)
+        if key == self.main_chat_id:
+            if token in self.blocked_markets:
+                del self.blocked_markets[token]
+                return True
+            return False
+        info = self.subscribers.get(key)
+        if info and isinstance(info.get("blocked_markets"), dict) and token in info["blocked_markets"]:
+            del info["blocked_markets"][token]
+            return True
+        return False
+
+    def clear_blocked_for(self, chat_id: Any) -> int:
+        """清空该 chat 的屏蔽表，返回清掉的条数。"""
+        bm = self.get_blocked_markets_for(chat_id)
+        n = len(bm)
+        bm.clear()
+        return n
 
 
 def load_runtime_state(path: str) -> Optional[Dict[str, Any]]:
@@ -780,6 +854,20 @@ def short_addr(addr: Any) -> str:
     if len(s) <= 14:
         return s or "-"
     return f"{s[:6]}…{s[-6:]}"
+
+
+def market_block_token(market_id: Any = "", slug: Any = "") -> str:
+    """为"屏蔽某市场"算一个稳定且短的 token（优先 market_id，回退 slug）。
+
+    token 会进 Telegram callback_data（上限 64 字节），所以过长的 base 用
+    sha256 前 16 位压短。同一市场每次都得到相同 token，保证屏蔽/取消屏蔽匹配。
+    """
+    base = str(market_id or "").strip() or str(slug or "").strip().lower()
+    if not base:
+        return ""
+    if len(base) <= 48:
+        return base
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
 
 
 def load_seen(path: str, max_size: int) -> "OrderedDict[str, None]":
@@ -992,6 +1080,16 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "view_market": "📊 查看市场",
         "view_wallet": "👤 查看钱包",
         "view_tx": "🔗 交易哈希",
+        "btn_block_market": "🚫 屏蔽该市场",
+        "btn_unblock_market": "✅ 取消屏蔽",
+        "btn_blocked_list": "🚫 屏蔽列表",
+        "blocked_title": "🚫 <b>已屏蔽的市场</b>",
+        "blocked_empty": "（暂无屏蔽的市场，可在大单卡片上点「🚫 屏蔽该市场」）",
+        "blocked_hint": "这些市场的大单不会再推给你。点下方按钮取消屏蔽：",
+        "btn_blocked_clear": "🗑 清空全部",
+        "blocked_ack_on": "🚫 已屏蔽，不再推送该市场",
+        "blocked_ack_off": "✅ 已取消屏蔽该市场",
+        "blocked_cleared": "✅ 已清空屏蔽列表",
         "anon_wallet": "匿名钱包",
         "match_started": "✅ <b>Predict 成交大单监控已启动</b>",
         "threshold": "阈值",
@@ -1086,6 +1184,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "<code>/unsubscribe</code>  退订私聊\n\n"
             "<b>进阶</b>\n"
             "<code>/set_match 100</code>  直接改阈值（USDT；私聊只改你自己）\n"
+            "<code>/blocked</code>  屏蔽的市场列表（卡片上点「🚫 屏蔽该市场」加入）\n"
             "<code>/label 0x… 别名</code> · <code>/labels</code> · <code>/unlabel 0x…</code>\n"
             "<code>/whoami</code>  看自己的 user_id 与当前设置\n"
             "<code>/subscribers</code>  订阅者列表（admin）\n\n"
@@ -1103,6 +1202,16 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "view_market": "📊 Market",
         "view_wallet": "👤 Wallet",
         "view_tx": "🔗 Tx Hash",
+        "btn_block_market": "🚫 Mute market",
+        "btn_unblock_market": "✅ Unmute",
+        "btn_blocked_list": "🚫 Muted",
+        "blocked_title": "🚫 <b>Muted markets</b>",
+        "blocked_empty": "(No muted markets — tap “🚫 Mute market” on any whale card)",
+        "blocked_hint": "Big trades from these markets won't be sent to you. Tap to unmute:",
+        "btn_blocked_clear": "🗑 Clear all",
+        "blocked_ack_on": "🚫 Muted — no more alerts for this market",
+        "blocked_ack_off": "✅ Unmuted this market",
+        "blocked_cleared": "✅ Muted list cleared",
         "anon_wallet": "Anon wallet",
         "match_started": "✅ <b>Predict match monitor started</b>",
         "threshold": "Threshold",
@@ -1196,6 +1305,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "<code>/unsubscribe</code>  stop DM alerts\n\n"
             "<b>Advanced</b>\n"
             "<code>/set_match 100</code>  set threshold directly (USDT; DM = your own)\n"
+            "<code>/blocked</code>  muted markets (tap “🚫 Mute market” on a card to add)\n"
             "<code>/label 0x… name</code> · <code>/labels</code> · <code>/unlabel 0x…</code>\n"
             "<code>/whoami</code>  show your user_id and current settings\n"
             "<code>/subscribers</code>  subscriber list (admin)\n\n"
@@ -1396,6 +1506,31 @@ class Telegram:
                     LOG.warning("editMessageText 失败: %s %s", resp.status_code, body)
         except Exception as exc:
             LOG.warning("editMessageText 异常: %s", exc)
+
+    async def edit_message_reply_markup(
+        self,
+        message_id: int,
+        reply_markup: Optional[Dict[str, Any]],
+        *,
+        chat_id: Optional[Any] = None,
+    ) -> None:
+        """只改一条消息的内联键盘，不动正文（用于翻转巨鲸卡片上的屏蔽按钮）。"""
+        payload: Dict[str, Any] = {
+            "chat_id": str(chat_id) if chat_id is not None else self.cfg.tg_chat_id,
+            "message_id": message_id,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = json.dumps(reply_markup)
+        try:
+            resp = await self.client.post(
+                f"{self.base}/editMessageReplyMarkup", json=payload
+            )
+            if resp.status_code >= 400:
+                body = resp.text[:300]
+                if "message is not modified" not in body:
+                    LOG.warning("editMessageReplyMarkup 失败: %s %s", resp.status_code, body)
+        except Exception as exc:
+            LOG.warning("editMessageReplyMarkup 异常: %s", exc)
 
     async def answer_callback_query(
         self, callback_query_id: str, text: str = ""
@@ -1679,6 +1814,8 @@ def dataclass_replace_lang(state: RuntimeState, lang: str) -> RuntimeState:
         subscribers=state.subscribers,
         cumulative_trades=state.cumulative_trades,
         recent_matches=state.recent_matches,
+        blocked_markets=state.blocked_markets,
+        market_meta=state.market_meta,
         _path="",  # 不让 view 副本碰盘
     )
     return clone
@@ -1716,6 +1853,9 @@ def _menu_keyboard(state: RuntimeState, *, chat_id: Optional[Any] = None) -> Dic
                 {"text": t(view, "btn_summary"), "callback_data": "summary"},
                 {"text": t(view, "btn_dfreq"), "callback_data": "dfreq:open"},
                 {"text": t(view, name_btn_key), "callback_data": "namedisp:toggle"},
+            ],
+            [
+                {"text": t(view, "btn_blocked_list"), "callback_data": "blk:list"},
             ],
             [
                 {"text": t(view, "btn_lang_switch"), "callback_data": "lang:toggle"},
@@ -1778,6 +1918,33 @@ def _digest_freq_keyboard(
     row2 = [cell(s, k) for s, k in DIGEST_FREQ_PRESETS[4:]]
     back_row = [{"text": t(view, "btn_dfreq_back"), "callback_data": "dfreq:back"}]
     return {"inline_keyboard": [row1, row2, back_row]}
+
+
+def _blocked_list_text(state: RuntimeState, *, chat_id: Optional[Any] = None) -> str:
+    """屏蔽列表子菜单的标题/说明。"""
+    lang = state.get_lang_for(chat_id) if chat_id is not None else state.lang
+    view = state if lang == state.lang else dataclass_replace_lang(state, lang)
+    blocked = state.get_blocked_markets_for(chat_id)
+    if not blocked:
+        return f"{t(view, 'blocked_title')}\n\n{t(view, 'blocked_empty')}"
+    return f"{t(view, 'blocked_title')}\n\n{t(view, 'blocked_hint')}"
+
+
+def _blocked_list_keyboard(
+    state: RuntimeState, *, chat_id: Optional[Any] = None
+) -> Dict[str, Any]:
+    """每个被屏蔽市场一行「❌ 标题」按钮（取消屏蔽）+ 清空 + 返回。"""
+    lang = state.get_lang_for(chat_id) if chat_id is not None else state.lang
+    view = state if lang == state.lang else dataclass_replace_lang(state, lang)
+    blocked = state.get_blocked_markets_for(chat_id)
+    rows: List[List[Dict[str, str]]] = []
+    for token, title in list(blocked.items())[:20]:
+        label = (title or token)[:40]
+        rows.append([{"text": f"❌ {label}", "callback_data": f"ublk:{token}"}])
+    if blocked:
+        rows.append([{"text": t(view, "btn_blocked_clear"), "callback_data": "blk:clear"}])
+    rows.append([{"text": t(view, "btn_dfreq_back"), "callback_data": "blk:back"}])
+    return {"inline_keyboard": rows}
 
 
 # 自定义输入提示里的标记文字。_handle_message 通过 reply_to_message 检测到
@@ -2146,6 +2313,12 @@ class TelegramBot:
             await self._handle_unlabel(arg, reply_chat_id=src)
         elif cmd == "/labels":
             await self._handle_labels_list(reply_chat_id=src)
+        elif cmd == "/blocked":
+            await self.tg.send(
+                _blocked_list_text(self.state, chat_id=chat_id),
+                reply_markup=_blocked_list_keyboard(self.state, chat_id=chat_id),
+                chat_id=src,
+            )
         elif cmd == "/pause":
             await self._handle_pause(
                 paused=True, target_chat_id=chat_id, reply_chat_id=src,
@@ -2330,6 +2503,96 @@ class TelegramBot:
                     reply_markup=_menu_keyboard(self.state, chat_id=chat_id),
                     chat_id=src,
                 )
+            return
+
+        # ---- 市场屏蔽 ----
+        # 打开屏蔽列表子菜单（只读，任何人可看自己的列表）
+        if data == "blk:list":
+            await self.tg.answer_callback_query(cb_id, "✓")
+            if message_id:
+                await self.tg.edit_message(
+                    message_id,
+                    _blocked_list_text(self.state, chat_id=chat_id),
+                    reply_markup=_blocked_list_keyboard(self.state, chat_id=chat_id),
+                    chat_id=src,
+                )
+            return
+        if data == "blk:back":
+            await self.tg.answer_callback_query(cb_id, "✓")
+            if message_id:
+                await self.tg.edit_message(
+                    message_id,
+                    _menu_text(self.state, chat_id=chat_id),
+                    reply_markup=_menu_keyboard(self.state, chat_id=chat_id),
+                    chat_id=src,
+                )
+            return
+        if data == "blk:clear":
+            # 主频道清空全局屏蔽要 admin；DM 清自己的不需要
+            if is_main and not self._is_admin(user_id):
+                await self.tg.answer_callback_query(cb_id, "⛔ 仅管理员可改全局屏蔽")
+                return
+            self.state.clear_blocked_for(chat_id)
+            self.state.persist()
+            await self.tg.answer_callback_query(cb_id, t(self.state, "blocked_cleared"))
+            if message_id:
+                await self.tg.edit_message(
+                    message_id,
+                    _blocked_list_text(self.state, chat_id=chat_id),
+                    reply_markup=_blocked_list_keyboard(self.state, chat_id=chat_id),
+                    chat_id=src,
+                )
+            return
+        if data.startswith("ublk:"):
+            # 从列表里取消屏蔽某市场
+            if is_main and not self._is_admin(user_id):
+                await self.tg.answer_callback_query(cb_id, "⛔ 仅管理员可改全局屏蔽")
+                return
+            token = data.split(":", 1)[1]
+            self.state.unblock_token_for(chat_id, token)
+            self.state.persist()
+            await self.tg.answer_callback_query(cb_id, t(self.state, "blocked_ack_off"))
+            if message_id:
+                await self.tg.edit_message(
+                    message_id,
+                    _blocked_list_text(self.state, chat_id=chat_id),
+                    reply_markup=_blocked_list_keyboard(self.state, chat_id=chat_id),
+                    chat_id=src,
+                )
+            return
+        if data.startswith("blk:"):
+            # 巨鲸卡片上的「屏蔽 / 取消屏蔽该市场」开关
+            if is_main and not self._is_admin(user_id):
+                await self.tg.answer_callback_query(cb_id, "⛔ 仅管理员可改全局屏蔽")
+                return
+            token = data.split(":", 1)[1]
+            if self.state.is_token_blocked_for(chat_id, token):
+                self.state.unblock_token_for(chat_id, token)
+                now_blocked = False
+                ack = t(self.state, "blocked_ack_off")
+            else:
+                title = self.state.market_meta.get(token, "")
+                self.state.block_token_for(chat_id, token, title)
+                now_blocked = True
+                ack = t(self.state, "blocked_ack_on")
+            self.state.persist()
+            await self.tg.answer_callback_query(cb_id, ack)
+            # 就地翻转卡片上那颗按钮的文案（保留其它 url 按钮）
+            if message_id:
+                existing = (cb.get("message") or {}).get("reply_markup") or {}
+                kb = existing.get("inline_keyboard")
+                if isinstance(kb, list):
+                    new_label = t(
+                        self.state,
+                        "btn_unblock_market" if now_blocked else "btn_block_market",
+                    )
+                    for row in kb:
+                        for btn in row:
+                            if btn.get("callback_data") == data:
+                                btn["text"] = new_label
+                    await self.tg.edit_message_reply_markup(
+                        message_id, {"inline_keyboard": kb}, chat_id=src,
+                    )
             return
 
         # 其它写操作（改阈值）：主频道里要 admin；DM 里改自己的不要 admin
@@ -3066,8 +3329,23 @@ def format_match_alert(
     if tx_link:
         buttons.append({"text": t(state, "view_tx"), "url": tx_link})
 
+    # 第二行：屏蔽 / 取消屏蔽该市场。token 记进内存缓存，点按钮时回调能取到标题。
+    rows: List[List[Dict[str, str]]] = []
+    if buttons:
+        rows.append(buttons)
+    block_token = market_block_token(mid_str, slug)
+    if block_token:
+        block_title = (parent_clean or raw_title or "").strip()
+        state.remember_market(block_token, block_title)
+        already = state.is_token_blocked_for(chat_id, block_token)
+        block_key = "btn_unblock_market" if already else "btn_block_market"
+        rows.append([{
+            "text": t(state, block_key),
+            "callback_data": f"blk:{block_token}",
+        }])
+
     markup: Optional[Dict[str, Any]] = (
-        {"inline_keyboard": [buttons]} if buttons else None
+        {"inline_keyboard": rows} if rows else None
     )
 
     return text, markup
@@ -3089,6 +3367,17 @@ async def _dispatch_match(
     n = state.bump_cumulative(signer) if signer else 0
     notional = event_value_usdt(ev, cfg)
 
+    # 市场屏蔽 token：主频道和每个订阅者各自判断是否屏蔽了这个市场。
+    ev_market = ev.get("market") or {}
+    ev_mid = str(ev_market.get("id") or ev.get("marketId") or "")
+    ev_slug = str(
+        ev_market.get("slug")
+        or ev_market.get("urlSlug")
+        or ev_market.get("categorySlug")
+        or ""
+    )
+    block_token = market_block_token(ev_mid, ev_slug)
+
     # 读已缓存的 GraphQL 用户名（缓存预热由 monitor_matches 在分发前并行做完）。
     # 这里走同步缓存读取而不是 await，避免 GraphQL 慢/挂时拖垮 dispatch 导致
     # 事件来不及发就被 max_alert_age_sec 过滤掉、或抛异常时事件已入 seen 永久丢失。
@@ -3102,8 +3391,12 @@ async def _dispatch_match(
     # 并行发出，把"主+N 订阅者"的发送时间从 sum 压成 max，显著降低人感延迟。
     targets: List[Tuple[str, Any]] = []
 
-    # 主告警频道：过全局阈值才发；state.paused 时全局静默
-    if notional >= state.threshold_usdt and not state.paused:
+    # 主告警频道：过全局阈值才发；state.paused 时全局静默；屏蔽的市场跳过
+    if (
+        notional >= state.threshold_usdt
+        and not state.paused
+        and not state.is_token_blocked_for(state.main_chat_id, block_token)
+    ):
         text, markup = format_match_alert(
             ev, cfg, state, cumulative=n,
             resolved_username=resolved_username,
@@ -3120,6 +3413,8 @@ async def _dispatch_match(
         except (InvalidOperation, ValueError, TypeError):
             continue
         if notional < sub_threshold:
+            continue
+        if state.is_token_blocked_for(sub_chat_id, block_token):
             continue
         sub_lang = info.get("lang", state.lang)
         view = (

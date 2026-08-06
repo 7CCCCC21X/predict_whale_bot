@@ -20,6 +20,7 @@ import random
 import re
 import signal
 import sys
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -108,6 +109,12 @@ class Config:
     # 重启回放、API 滞后、用户切阈值导致的补发）。0 = 关闭过滤（推所有 fresh）。
     max_alert_age_sec: int
 
+    # 监控中断/恢复通知的抖动防护：
+    # - 恢复后需持续稳定这么多秒才发"已恢复"（API 闪断闪恢复不刷消息对）
+    # - 发过一次"中断"后，冷却期内再次中断只记日志不发消息
+    monitor_recovery_stable_sec: float
+    monitor_alert_cooldown_sec: float
+
     @property
     def threshold_usdt_wei(self) -> int:
         scale = Decimal(10) ** self.usdt_wei_decimals
@@ -189,6 +196,11 @@ class Config:
             # 默认 120s = 2 分钟。正常延迟中位 ~2s，p95 < 30s，120s 给足宽容；
             # 但 7+ 分钟的事件几乎肯定是回放/补发，过滤掉。设 0 关闭。
             max_alert_age_sec=int(os.getenv("MAX_ALERT_AGE_SEC", "120")),
+
+            # API 抖动时（反复 断→通→断）不刷"中断/恢复"消息对：
+            # 恢复需稳定 120s 才通知；中断提醒 30 分钟内最多一次。
+            monitor_recovery_stable_sec=float(os.getenv("MONITOR_RECOVERY_STABLE_SEC", "120")),
+            monitor_alert_cooldown_sec=float(os.getenv("MONITOR_ALERT_COOLDOWN_SEC", "1800")),
         )
 
 
@@ -3502,7 +3514,15 @@ async def monitor_matches(
     raw_logged = False  # 只对第一笔事件记一次原始字段，便于调试解码
     # API 连续失败标志：只在 healthy→error 跳变时报警一次，恢复时再报一次，
     # 避免 Predict 持续挂掉时每轮都往 Telegram 刷"成交监控错误"。
+    # 抖动防护（断→通→断 反复横跳时不刷消息对）：
+    # - 恢复需持续稳定 monitor_recovery_stable_sec 秒才发"已恢复"
+    # - "中断"提醒发过一次后，monitor_alert_cooldown_sec 内的新中断只记日志
+    # - 中断提醒被冷却抑制的那次故障，恢复时也不发"已恢复"（不发孤立恢复消息）
     monitor_unhealthy = False
+    down_alert_sent = False          # 本次中断是否真的发过 Telegram 提醒
+    down_since = 0.0                 # 本次中断开始时刻（monotonic）
+    healthy_since = 0.0              # 中断后首次成功的时刻，0 = 尚未成功
+    last_down_alert_ts: Optional[float] = None  # 上次发"中断"提醒的时刻
 
     await tg.send(
         f"{t(state, 'match_started')}\n"
@@ -3668,23 +3688,60 @@ async def monitor_matches(
             if fresh:
                 save_seen(cfg.seen_state_path, seen)
 
-            # 这一轮跑通了：如果之前处于中断状态，发一条恢复通知并清标志
+            # 这一轮跑通了：如果之前处于中断状态，不急着宣布恢复——先观察一段
+            # 稳定期（monitor_recovery_stable_sec）。API 抖动时经常"通一轮又断"，
+            # 立刻发"已恢复"会跟下一条"中断"凑成消息对刷屏。
             if monitor_unhealthy:
-                monitor_unhealthy = False
-                await tg.send("✅ <b>Predict 成交监控已恢复</b>", silent=True)
+                now_mono = time.monotonic()
+                if healthy_since <= 0.0:
+                    healthy_since = now_mono
+                if now_mono - healthy_since >= cfg.monitor_recovery_stable_sec:
+                    monitor_unhealthy = False
+                    outage_sec = int(healthy_since - down_since)
+                    healthy_since = 0.0
+                    if down_alert_sent:
+                        await tg.send(
+                            f"✅ <b>Predict 成交监控已恢复</b>\n"
+                            f"<i>本次中断约 {_format_duration_label(max(outage_sec, 1))}，"
+                            f"已稳定运行 {_format_duration_label(int(cfg.monitor_recovery_stable_sec))}。</i>",
+                            silent=True,
+                        )
+                    down_alert_sent = False
 
         except Exception as exc:
             LOG.exception("监控成交大单出错")
 
-            # 只在第一次进入中断时提醒一次；持续失败期间静默，等恢复再通知
+            now_mono = time.monotonic()
+            # 稳定期内又失败了 → 恢复观察作废，仍视为同一次中断，不发任何消息
+            healthy_since = 0.0
+
+            # 只在 healthy→error 跳变时提醒；且加冷却：上次"中断"提醒之后
+            # monitor_alert_cooldown_sec 内的新中断只记日志不发消息（对应的
+            # "已恢复"也静默），避免 API 反复抖动时每分钟刷一对消息。
             if not monitor_unhealthy:
                 monitor_unhealthy = True
-                await tg.send(
-                    f"⚠️ <b>Predict 成交监控中断</b>\n"
-                    f"<code>{html.escape(str(exc))}</code>\n"
-                    f"<i>恢复后会再通知一次，期间不再重复提醒。</i>",
-                    silent=True,
+                down_since = now_mono
+                in_cooldown = (
+                    last_down_alert_ts is not None
+                    and now_mono - last_down_alert_ts < cfg.monitor_alert_cooldown_sec
                 )
+                if in_cooldown:
+                    down_alert_sent = False
+                    LOG.warning(
+                        "监控再次中断，但距上次提醒不足 %.0fs，冷却期内静默",
+                        cfg.monitor_alert_cooldown_sec,
+                    )
+                else:
+                    down_alert_sent = True
+                    last_down_alert_ts = now_mono
+                    cooldown_label = _format_duration_label(int(cfg.monitor_alert_cooldown_sec))
+                    await tg.send(
+                        f"⚠️ <b>Predict 成交监控中断</b>\n"
+                        f"<code>{html.escape(str(exc))}</code>\n"
+                        f"<i>恢复并稳定后会再通知一次；若持续抖动，"
+                        f"{cooldown_label}内不再重复提醒。</i>",
+                        silent=True,
+                    )
 
             await asyncio.sleep(min(30, max(1, cfg.poll_interval_sec * 2)))
 

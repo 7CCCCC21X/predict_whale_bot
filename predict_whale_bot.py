@@ -21,11 +21,11 @@ import re
 import signal
 import sys
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -109,12 +109,6 @@ class Config:
     # 重启回放、API 滞后、用户切阈值导致的补发）。0 = 关闭过滤（推所有 fresh）。
     max_alert_age_sec: int
 
-    # 监控中断/恢复通知的抖动防护：
-    # - 恢复后需持续稳定这么多秒才发"已恢复"（API 闪断闪恢复不刷消息对）
-    # - 发过一次"中断"后，冷却期内再次中断只记日志不发消息
-    monitor_recovery_stable_sec: float
-    monitor_alert_cooldown_sec: float
-
     @property
     def threshold_usdt_wei(self) -> int:
         scale = Decimal(10) ** self.usdt_wei_decimals
@@ -196,11 +190,6 @@ class Config:
             # 默认 120s = 2 分钟。正常延迟中位 ~2s，p95 < 30s，120s 给足宽容；
             # 但 7+ 分钟的事件几乎肯定是回放/补发，过滤掉。设 0 关闭。
             max_alert_age_sec=int(os.getenv("MAX_ALERT_AGE_SEC", "120")),
-
-            # API 抖动时（反复 断→通→断）不刷"中断/恢复"消息对：
-            # 恢复需稳定 120s 才通知；中断提醒 30 分钟内最多一次。
-            monitor_recovery_stable_sec=float(os.getenv("MONITOR_RECOVERY_STABLE_SEC", "120")),
-            monitor_alert_cooldown_sec=float(os.getenv("MONITOR_ALERT_COOLDOWN_SEC", "1800")),
         )
 
 
@@ -293,15 +282,7 @@ class RuntimeState:
 
     def get_summary_baseline(self) -> Optional[datetime]:
         """解析 summary_baseline_iso（None / 解析失败都返回 None）。"""
-        if not self.summary_baseline_iso:
-            return None
-        try:
-            ts = datetime.fromisoformat(self.summary_baseline_iso)
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            return ts
-        except Exception:
-            return None
+        return parse_iso_ts(self.summary_baseline_iso)
 
     def reset_summary_baseline(self) -> None:
         """把汇总基线推到"现在"。下次自动汇总只统计这之后的大单。"""
@@ -783,16 +764,6 @@ def fmt_decimal(x: Decimal, places: int = 2) -> str:
     return f"{x:,.{places}f}"
 
 
-def fmt_money(x: Decimal) -> str:
-    """钱的自适应格式：≥ $100 不要小数（$12,480），< $100 保留 2 位（$50.50）。
-    告警标题用得到，避免 "$12,480.00" 这种累赘。"""
-    if x <= 0:
-        return "-"
-    if x >= 100:
-        return f"${int(x.to_integral_value(rounding=ROUND_DOWN)):,}"
-    return f"${fmt_decimal(x, 2)}"
-
-
 def fmt_money_full(x: Decimal) -> str:
     """钱的精确格式（带千分位 + 固定 2 位小数）：$1,948.00 / $480.97。
     巨鲸卡片用，跟 flamy.gg 风格一致。"""
@@ -811,16 +782,6 @@ def fmt_qty(x: Decimal) -> str:
     if x == integer_part:
         return f"{int(integer_part):,}"
     return f"{x.quantize(Decimal('0.01'), rounding=ROUND_DOWN):,.2f}"
-
-
-def fmt_compact_qty(x: Decimal) -> str:
-    """份额紧凑展示：529 → "529"，3,624 → "3.6K"，1,200,000 → "1.2M"。"""
-    n = abs(x)
-    if n < Decimal("1000"):
-        return fmt_decimal(x, 0)
-    if n < Decimal("1000000"):
-        return f"{(x / Decimal('1000')).quantize(Decimal('0.1'), rounding=ROUND_DOWN)}K"
-    return f"{(x / Decimal('1000000')).quantize(Decimal('0.1'), rounding=ROUND_DOWN)}M"
 
 
 def get_display_tz(name: str) -> Tuple[Any, str]:
@@ -845,20 +806,6 @@ def parse_iso_ts(raw: Any) -> Optional[datetime]:
         return ts
     except Exception:
         return None
-
-
-def infer_signal(action: str, outcome: str) -> str:
-    """二元市场（YES/NO）下推断方向：买 YES / 卖 NO = 看涨；买 NO / 卖 YES = 看空。
-    多结果市场（候选人/数字）outcome 不是 yes/no，返回空串让上层跳过这一行。"""
-    out = (outcome or "").strip().lower()
-    if out not in {"yes", "no", "y", "n"}:
-        return ""
-    is_yes = out in {"yes", "y"}
-    if action == "buy":
-        return "bullish" if is_yes else "bearish"
-    if action == "sell":
-        return "bearish" if is_yes else "bullish"
-    return ""
 
 
 def short_addr(addr: Any) -> str:
@@ -1137,36 +1084,13 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "btn_order_alerts": "🔔 订单成交提醒 → @predictfun007_bot",
         "btn_name_display_name": "👤 用户名",
         "btn_name_display_addr": "🆔 地址",
-        "implied_label": "隐含",
-        "fee_label": "手续费",
-        "makers_label": "对手方",
-        "time_just_now": "刚刚",
-        "time_ago_s_fmt": "{n}秒前",
-        "time_ago_m_fmt": "{n}分钟前",
-        "time_ago_h_fmt": "{n}小时前",
-        "cumulative_fmt": "本轮第 {n} 笔",
         "btn_custom": "✏️ 自定义",
         "test_caption": "🧪 <b>测试推送</b>（不是真实成交）",
-        # 卡片内字段标签
-        "card_side": "方向",
-        "card_amount": "数量",
-        "card_price": "价格",
-        "card_trader": "交易者",
-        "card_time": "时间",
-        "card_traded": "成交",
-        "card_signal": "信号",
-        "signal_bullish": "看涨",
-        "signal_bearish": "看空",
         "card_delay_fmt": "延迟 {n}s",
         "card_anon_wallet": "匿名钱包",
         "count_signer_fmt": "👤 钱包出现次数：近 {window} {n} 次",
         "count_market_fmt": "📊 市场大额次数：近 {window} {n} 笔",
         "window_1h": "1H",
-        "tier_super": "超级鲸鱼单",
-        "tier_big": "大鲸鱼单",
-        "tier_mid": "中型鲸鱼单",
-        "tier_normal": "普通大单",
-        "tier_small": "小单",
         "summary_title": "📊 <b>Predict Whale 摘要</b>",
         "summary_period_fmt": "过去 {label}：",
         "summary_total_count": "总大单",
@@ -1259,35 +1183,13 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "btn_order_alerts": "🔔 Per-trade alerts → @predictfun007_bot",
         "btn_name_display_name": "👤 Name",
         "btn_name_display_addr": "🆔 Address",
-        "implied_label": "Implied",
-        "fee_label": "Fee",
-        "makers_label": "Makers",
-        "time_just_now": "just now",
-        "time_ago_s_fmt": "{n}s ago",
-        "time_ago_m_fmt": "{n}m ago",
-        "time_ago_h_fmt": "{n}h ago",
-        "cumulative_fmt": "trade #{n} this session",
         "btn_custom": "✏️ Custom",
         "test_caption": "🧪 <b>Test alert</b> (not a real trade)",
-        "card_side": "Side",
-        "card_amount": "Amount",
-        "card_price": "Price",
-        "card_trader": "Trader",
-        "card_time": "Time",
-        "card_traded": "trade",
-        "card_signal": "Signal",
-        "signal_bullish": "bullish",
-        "signal_bearish": "bearish",
         "card_delay_fmt": "delay {n}s",
         "card_anon_wallet": "Anon wallet",
         "count_signer_fmt": "👤 Wallet hits last {window}: {n}",
         "count_market_fmt": "📊 Market hits last {window}: {n}",
         "window_1h": "1H",
-        "tier_super": "Super whale",
-        "tier_big": "Big whale",
-        "tier_mid": "Mid whale",
-        "tier_normal": "Whale",
-        "tier_small": "Small",
         "summary_title": "📊 <b>Predict Whale Summary</b>",
         "summary_period_fmt": "Past {label}:",
         "summary_total_count": "Total trades",
@@ -1377,7 +1279,15 @@ class Telegram:
         self.cfg = cfg
         self.client = client
         self.base = f"https://api.telegram.org/bot{cfg.tg_bot_token}"
-        self._lock = asyncio.Lock()
+        # 按 chat 一把锁：同一 chat 内串行（保消息顺序、共享限流退避），
+        # 不同 chat 之间可以真正并行 —— fanout 的 asyncio.gather 才有意义。
+        self._chat_locks: Dict[str, asyncio.Lock] = {}
+
+    def _lock_for(self, chat_id: str) -> asyncio.Lock:
+        lock = self._chat_locks.get(chat_id)
+        if lock is None:
+            lock = self._chat_locks[chat_id] = asyncio.Lock()
+        return lock
 
     async def send(
         self,
@@ -1395,8 +1305,8 @@ class Telegram:
         last_message_id: Optional[int] = None
         target_chat = str(chat_id) if chat_id is not None else self.cfg.tg_chat_id
 
-        # 串行发送，避免多个监控任务并发触发 Telegram 限流。
-        async with self._lock:
+        # 同一 chat 串行发送（保顺序 + 避免对单 chat 并发触发 Telegram 限流）。
+        async with self._lock_for(target_chat):
             for idx, chunk in enumerate(chunks):
                 # markup 只附在最后一片，否则按钮会被前面的分片覆盖。
                 markup = reply_markup if idx == len(chunks) - 1 else None
@@ -1569,7 +1479,7 @@ class Predict:
         self.cfg = cfg
         self.client = client
         # 滑动窗口：API 请求时间戳，用来周期性报实际 req/min
-        self._request_log: List[float] = []
+        self._request_log: "deque[float]" = deque()
         self._rate_log_last = 0.0
         # address_lower → (name, fetched_at_monotonic)
         self._username_cache: Dict[str, Tuple[str, float]] = {}
@@ -1585,9 +1495,8 @@ class Predict:
         24h 命中缓存 / 1h 未命中缓存，避免每条 alert 都打一次 GraphQL。"""
         if not address:
             return ""
-        import time as _time
         key = address.lower()
-        now = _time.monotonic()
+        now = time.monotonic()
         cached = self._username_cache.get(key)
         if cached is not None:
             name, ts = cached
@@ -1631,12 +1540,12 @@ class Predict:
 
     def _record_request(self) -> None:
         """记录一次 API 调用，每 5 分钟把窗口内总数 + 平均 RPS 写一条日志。"""
-        import time as _time
-        now = _time.monotonic()
+        now = time.monotonic()
         self._request_log.append(now)
         # 只保留最近 60 秒
         cutoff = now - 60
-        self._request_log = [t for t in self._request_log if t >= cutoff]
+        while self._request_log and self._request_log[0] < cutoff:
+            self._request_log.popleft()
         # 每 300 秒报一次
         if now - self._rate_log_last >= 300:
             self._rate_log_last = now
@@ -1714,10 +1623,10 @@ class Predict:
 
     async def fetch_new_matches(
         self,
-        seen_ids: Set[str],
+        seen_ids: "OrderedDict[str, None]",
         page_size: int,
         max_pages: int,
-    ) -> Tuple[List[Dict[str, Any]], bool]:
+    ) -> Tuple[List[Tuple[str, Dict[str, Any]]], bool]:
         """
         从最新往旧翻页拉取成交，遇到已 seen 的事件即停止。
 
@@ -1725,9 +1634,11 @@ class Predict:
         会把"低份额 × 高单价"的真大单（如 100 shares × $50 = $5000）一并丢掉。
         因此服务端不过滤，全部交给客户端按 notional value 过滤。
 
-        返回 (按时间倒序排列的新事件, 是否翻满 max_pages 仍未追上)。
+        seen_ids 直接以只读方式做成员判断（O(1)），不复制。
+        返回 (按时间倒序排列的 (event_id, event) 列表, 是否翻满 max_pages 仍未追上)。
+        event_id 在这里算好一次，调用方直接复用，避免重复 sha256。
         """
-        out: List[Dict[str, Any]] = []
+        out: List[Tuple[str, Dict[str, Any]]] = []
         after: Optional[str] = None
 
         for _ in range(max(1, max_pages)):
@@ -1741,9 +1652,10 @@ class Predict:
                 return out, False
 
             for ev in rows:
-                if stable_event_id(ev) in seen_ids:
+                eid = stable_event_id(ev)
+                if eid in seen_ids:
                     return out, False
-                out.append(ev)
+                out.append((eid, ev))
 
             # 不到一页说明已经到尽头
             if len(rows) < page_size:
@@ -2693,12 +2605,6 @@ class TelegramBot:
             chat_id=reply_chat_id,
         )
 
-    async def _apply_threshold(self, kind: str, amount: Decimal) -> None:
-        """旧 API，保留做向后兼容。新代码请用 _set_threshold(target_chat_id=...)"""
-        self.state.threshold_usdt = amount
-        LOG.info("成交阈值更新为 %s USDT", amount)
-        self.state.persist()
-
     async def _send_summary(self, *, reply_chat_id: Optional[Any] = None) -> None:
         """渲染当前窗口摘要并发到指定 chat（无指定 = 主告警频道）。"""
         # 用当前自动间隔做窗口；间隔 = 0（关闭）时仍按"过去 1 小时"快查
@@ -3005,73 +2911,6 @@ def event_value_usdt(event: Dict[str, Any], cfg: Config) -> Decimal:
     return Decimal("0")
 
 
-def to_usdt_strict(value: Any, decimals: int) -> Decimal:
-    """
-    严格模式 wei→Decimal：整数永远缩放（不依赖大小启发式）。
-    适合"我已经知道这字段是 wei 编码 USDT"的场景，比如手续费（小到 1e15 wei）。
-    `to_decimal` 的 wei_hint 启发式对小金额会失灵。
-    """
-    if value is None:
-        return Decimal("0")
-    s = str(value).strip().replace(",", "")
-    if not s or s.lower() in {"none", "null", "nan"}:
-        return Decimal("0")
-    if s.startswith("$"):
-        s = s[1:]
-    try:
-        out = Decimal(s)
-    except InvalidOperation:
-        return Decimal("0")
-    # 没有小数点 → 整数 wei，无条件按 decimals 缩放
-    if "." not in s:
-        out = out / (Decimal(10) ** decimals)
-    return out
-
-
-def event_fee_usdt(event: Dict[str, Any], cfg: Config) -> Decimal:
-    """从 taker.fee.amount / event.fee.amount 抓出手续费（USDT）。找不到返回 0。"""
-    taker = event.get("taker") if isinstance(event.get("taker"), dict) else {}
-    candidates = (
-        (taker.get("fee") or {}).get("amount") if isinstance(taker.get("fee"), dict) else None,
-        (event.get("fee") or {}).get("amount") if isinstance(event.get("fee"), dict) else None,
-        taker.get("feeAmount"),
-        event.get("feeAmount"),
-    )
-    for raw in candidates:
-        if raw is not None:
-            # 手续费经常是 1e15 量级（$0.001~$0.01），到不了 to_decimal 的 wei_hint
-            # 阈值（1e16），所以用 strict 模式避免显示成 1377600000000000 这种数。
-            return to_usdt_strict(raw, cfg.usdt_wei_decimals)
-    return Decimal("0")
-
-
-def format_time_ago(state: "RuntimeState", iso_ts: Optional[str]) -> str:
-    """ISO 时间戳 → 'X 秒前 / X 分钟前 / X 小时前'。差超过 24h 或异常返回 ''。"""
-    if not iso_ts:
-        return ""
-    try:
-        s = str(iso_ts).strip().replace("Z", "+00:00")
-        ts = datetime.fromisoformat(s)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-    except Exception:
-        return ""
-    delta = datetime.now(timezone.utc) - ts
-    secs = int(delta.total_seconds())
-    if secs < 0:
-        # 时钟漂移，clamp 成"刚刚"
-        return t(state, "time_just_now")
-    if secs < 5:
-        return t(state, "time_just_now")
-    if secs < 60:
-        return t(state, "time_ago_s_fmt").format(n=secs)
-    if secs < 3600:
-        return t(state, "time_ago_m_fmt").format(n=secs // 60)
-    if secs < 86400:
-        return t(state, "time_ago_h_fmt").format(n=secs // 3600)
-    return ""  # > 24h，看着像坏的，不显示
-
-
 def event_price_usdt(event: Dict[str, Any], notional: Decimal, amount: Decimal) -> Decimal:
     """
     解每份额成交价：notional / amount。notional 不可用时返回 0 让 alert 显示 "-"。
@@ -3098,26 +2937,6 @@ def _render_template(template: str, **kwargs: Any) -> str:
         return template.format(**{k: str(v) for k, v in kwargs.items()})
     except Exception:
         return ""
-
-
-def whale_tier(notional: Decimal, state: "RuntimeState") -> Tuple[str, str]:
-    """
-    根据成交价值返回 (emoji, 等级标签)。
-      🟣 $100k+   超级鲸鱼单
-      🔴 $20k+    大鲸鱼单
-      🟠 $5k+     中型鲸鱼单
-      🟡 $1k+     普通大单
-      🟢 < $1k    小单（用户阈值低于 $1k 时也能用）
-    """
-    if notional >= Decimal("100000"):
-        return "🟣", t(state, "tier_super")
-    if notional >= Decimal("20000"):
-        return "🔴", t(state, "tier_big")
-    if notional >= Decimal("5000"):
-        return "🟠", t(state, "tier_mid")
-    if notional >= Decimal("1000"):
-        return "🟡", t(state, "tier_normal")
-    return "🟢", t(state, "tier_small")
 
 
 def format_match_alert(
@@ -3369,15 +3188,16 @@ async def _dispatch_match(
     state: "RuntimeState",
     tg: "Telegram",
     predict: "Predict",
+    notional: Decimal,
 ) -> Tuple[bool, int]:
     """
     分发一笔成交告警：主频道（过全局阈值）+ 私聊订阅者（按各自门槛）。
     单笔的所有副作用都封装在这里，让 monitor_matches 干净。
+    notional 由调用方在过滤阶段算好传入，避免重复解析。
     返回 (是否发到主频道, 发到几个订阅者)。
     """
     signer = extract_signer(ev) or ""
     n = state.bump_cumulative(signer) if signer else 0
-    notional = event_value_usdt(ev, cfg)
 
     # 市场屏蔽 token：主频道和每个订阅者各自判断是否屏蔽了这个市场。
     ev_market = ev.get("market") or {}
@@ -3476,15 +3296,10 @@ async def _dispatch_match(
                 or ""
             )
             title = market_title_of(market) if isinstance(market, dict) else "?"
-            ts_raw = ev.get("executedAt") or ev.get("createdAt") or ""
-            ts: datetime = datetime.now(timezone.utc)
-            if ts_raw:
-                try:
-                    ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
-                    if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=timezone.utc)
-                except Exception:
-                    pass
+            ts = (
+                parse_iso_ts(ev.get("executedAt") or ev.get("createdAt"))
+                or datetime.now(timezone.utc)
+            )
             state.add_match_for_summary(
                 market_title=title,
                 market_slug=slug,
@@ -3512,17 +3327,6 @@ async def monitor_matches(
     resumed_from_disk = bool(seen)
     startup = True
     raw_logged = False  # 只对第一笔事件记一次原始字段，便于调试解码
-    # API 连续失败标志：只在 healthy→error 跳变时报警一次，恢复时再报一次，
-    # 避免 Predict 持续挂掉时每轮都往 Telegram 刷"成交监控错误"。
-    # 抖动防护（断→通→断 反复横跳时不刷消息对）：
-    # - 恢复需持续稳定 monitor_recovery_stable_sec 秒才发"已恢复"
-    # - "中断"提醒发过一次后，monitor_alert_cooldown_sec 内的新中断只记日志
-    # - 中断提醒被冷却抑制的那次故障，恢复时也不发"已恢复"（不发孤立恢复消息）
-    monitor_unhealthy = False
-    down_alert_sent = False          # 本次中断是否真的发过 Telegram 提醒
-    down_since = 0.0                 # 本次中断开始时刻（monotonic）
-    healthy_since = 0.0              # 中断后首次成功的时刻，0 = 尚未成功
-    last_down_alert_ts: Optional[float] = None  # 上次发"中断"提醒的时刻
 
     await tg.send(
         f"{t(state, 'match_started')}\n"
@@ -3539,8 +3343,8 @@ async def monitor_matches(
             # 没有"已知"事件而连翻 max_pages 把全站历史都拉下来。
             max_pages = 1 if (startup and not resumed_from_disk) else cfg.matches_max_pages
 
-            events, hit_max = await predict.fetch_new_matches(
-                seen_ids=set(seen.keys()),
+            fetched, hit_max = await predict.fetch_new_matches(
+                seen_ids=seen,
                 page_size=cfg.matches_page_size,
                 max_pages=max_pages,
             )
@@ -3554,26 +3358,42 @@ async def monitor_matches(
 
             # 每次会话第一笔成交，把完整 JSON 写到日志（截断 4000 字符）。
             # 这样金额编码、tx 哈希字段、用户名字段任何位置改了，都能从日志一眼看出。
-            if events and not raw_logged:
+            if fetched and not raw_logged:
+                ev0 = fetched[0][1]
                 try:
-                    raw_dump = json.dumps(events[0], ensure_ascii=False, default=str, sort_keys=True)
+                    raw_dump = json.dumps(ev0, ensure_ascii=False, default=str, sort_keys=True)
                 except Exception:
-                    raw_dump = repr(events[0])
+                    raw_dump = repr(ev0)
                 LOG.info("[match raw event] %s", raw_dump[:4000])
                 # 列出我们目前提取出来的关键字段，跟原始 JSON 对照
                 LOG.info(
                     "[match parsed] tx=%s signer=%s amount=%s price=%s notional=%s",
-                    extract_tx_hash(events[0]),
-                    extract_signer(events[0]),
-                    to_decimal(events[0].get("amountFilled") or (events[0].get("taker") or {}).get("amount"), cfg.shares_wei_decimals),
-                    to_decimal(events[0].get("priceExecuted") or (events[0].get("taker") or {}).get("price"), cfg.usdt_wei_decimals),
-                    event_value_usdt(events[0], cfg),
+                    extract_tx_hash(ev0),
+                    extract_signer(ev0),
+                    to_decimal(ev0.get("amountFilled") or (ev0.get("taker") or {}).get("amount"), cfg.shares_wei_decimals),
+                    to_decimal(ev0.get("priceExecuted") or (ev0.get("taker") or {}).get("price"), cfg.usdt_wei_decimals),
+                    event_value_usdt(ev0, cfg),
                 )
                 raw_logged = True
 
+            # 关键：所有拉到的事件先记 seen（不管金额大小）。否则低于阈值的小单
+            # 永远不进 seen，会被下一轮重复拉取、重复解析、重复打日志——
+            # 行情清淡时等于每轮都在做无用功，还可能虚假触发 hit_max。
+            fetched_n = len(fetched)
+            new_events: List[Dict[str, Any]] = []
+            for eid, ev in fetched:
+                if eid in seen:
+                    continue
+                seen[eid] = None
+                new_events.append(ev)
+            new_n = len(new_events)
+
+            while len(seen) > cfg.max_seen_ids:
+                seen.popitem(last=False)
+
             # 客户端按 notional value 过滤。门槛取"全局 + 所有订阅者中最低值"，
             # 让每个订阅者都能拿到 ≥ 自己门槛的成交。后续在分发处再按各自门槛二次筛。
-            fetched_n = len(events)
+            # notional 在这里算一次，随事件一路传到 _dispatch_match，不再重复解析。
             min_threshold = state.threshold_usdt
             for _info in state.subscribers.values():
                 try:
@@ -3582,19 +3402,12 @@ async def monitor_matches(
                         min_threshold = sub_th
                 except (InvalidOperation, ValueError, TypeError):
                     continue
-            events = [ev for ev in events if event_value_usdt(ev, cfg) >= min_threshold]
-            filtered_n = len(events)
-
-            fresh: List[Dict[str, Any]] = []
-            for ev in events:
-                eid = stable_event_id(ev)
-                if eid in seen:
-                    continue
-                seen[eid] = None
-                fresh.append(ev)
-
-            while len(seen) > cfg.max_seen_ids:
-                seen.popitem(last=False)
+            fresh: List[Tuple[Dict[str, Any], Decimal]] = []
+            for ev in new_events:
+                notional = event_value_usdt(ev, cfg)
+                if notional >= min_threshold:
+                    fresh.append((ev, notional))
+            filtered_n = len(fresh)
 
             # 实时性过滤：丢掉 executedAt 距 now 超过 max_alert_age_sec 的事件。
             # 触发场景：bot 重启回放、Predict API 滞后追溯、用户切阈值后 fanout 才命中
@@ -3603,14 +3416,14 @@ async def monitor_matches(
             if fresh and cfg.max_alert_age_sec > 0:
                 now_utc = datetime.now(timezone.utc)
                 limit_sec = cfg.max_alert_age_sec
-                fresh_realtime: List[Dict[str, Any]] = []
+                fresh_realtime: List[Tuple[Dict[str, Any], Decimal]] = []
                 stale_n = 0
-                for ev in fresh:
+                for ev, notional in fresh:
                     ts = parse_iso_ts(ev.get("executedAt") or ev.get("createdAt"))
                     if ts is not None and (now_utc - ts).total_seconds() > limit_sec:
                         stale_n += 1
                         continue
-                    fresh_realtime.append(ev)
+                    fresh_realtime.append((ev, notional))
                 if stale_n:
                     LOG.info(
                         "[matches] 丢弃 %d 个过时事件（>%ds 旧），保留 %d 个实时",
@@ -3642,7 +3455,7 @@ async def monitor_matches(
                 # 分发前并行预热 GraphQL 用户名缓存：dispatch 热路径只读缓存
                 # 不再 await，避免任何 GraphQL 抖动影响发推。所有异常吞掉，
                 # 拿不到用户名的事件自然 fallback 到短地址。
-                unique_signers = {extract_signer(ev) for ev in fresh}
+                unique_signers = {extract_signer(ev) for ev, _ in fresh}
                 unique_signers.discard("")
                 if unique_signers:
                     await asyncio.gather(
@@ -3651,10 +3464,10 @@ async def monitor_matches(
                     )
 
                 # 接口通常按 executedAt DESC 排序，反转后按时间先后发送。
-                for ev in reversed(fresh):
+                for ev, notional in reversed(fresh):
                     try:
                         sent_to_main, sent_to_subs = await _dispatch_match(
-                            ev, cfg, state, tg, predict,
+                            ev, cfg, state, tg, predict, notional,
                         )
                         sent_main += int(sent_to_main)
                         sent_subs += sent_to_subs
@@ -3668,6 +3481,7 @@ async def monitor_matches(
             iter_stats = {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "fetched": fetched_n,
+                "new": new_n,
                 "filtered": filtered_n,
                 "min_threshold": str(min_threshold),
                 "fresh": len(fresh),
@@ -3678,71 +3492,22 @@ async def monitor_matches(
             }
             state.last_iter_stats = iter_stats
             LOG.info(
-                "[matches] fetched=%d filtered=%d(min_th=$%s) fresh=%d → main=%d subs=%d/%d",
-                fetched_n, filtered_n, min_threshold, len(fresh),
+                "[matches] fetched=%d new=%d filtered=%d(min_th=$%s) fresh=%d → main=%d subs=%d/%d",
+                fetched_n, new_n, filtered_n, min_threshold, len(fresh),
                 sent_main, sent_subs, len(state.subscribers),
             )
 
             startup = False
 
-            if fresh:
-                save_seen(cfg.seen_state_path, seen)
+            # seen 落盘放到线程池：文件可到几百 KB，同步写会卡住整个事件循环
+            # （包括 Telegram 应答和 fanout）。
+            if new_n:
+                await asyncio.to_thread(save_seen, cfg.seen_state_path, seen)
 
-            # 这一轮跑通了：如果之前处于中断状态，不急着宣布恢复——先观察一段
-            # 稳定期（monitor_recovery_stable_sec）。API 抖动时经常"通一轮又断"，
-            # 立刻发"已恢复"会跟下一条"中断"凑成消息对刷屏。
-            if monitor_unhealthy:
-                now_mono = time.monotonic()
-                if healthy_since <= 0.0:
-                    healthy_since = now_mono
-                if now_mono - healthy_since >= cfg.monitor_recovery_stable_sec:
-                    monitor_unhealthy = False
-                    outage_sec = int(healthy_since - down_since)
-                    healthy_since = 0.0
-                    if down_alert_sent:
-                        await tg.send(
-                            f"✅ <b>Predict 成交监控已恢复</b>\n"
-                            f"<i>本次中断约 {_format_duration_label(max(outage_sec, 1))}，"
-                            f"已稳定运行 {_format_duration_label(int(cfg.monitor_recovery_stable_sec))}。</i>",
-                            silent=True,
-                        )
-                    down_alert_sent = False
-
-        except Exception as exc:
+        except Exception:
+            # 监控异常只记日志，不再往 Telegram 推"中断/恢复"提醒
+            # （用户反馈是噪音；API 抖动靠 get() 的退避重试自愈即可）。
             LOG.exception("监控成交大单出错")
-
-            now_mono = time.monotonic()
-            # 稳定期内又失败了 → 恢复观察作废，仍视为同一次中断，不发任何消息
-            healthy_since = 0.0
-
-            # 只在 healthy→error 跳变时提醒；且加冷却：上次"中断"提醒之后
-            # monitor_alert_cooldown_sec 内的新中断只记日志不发消息（对应的
-            # "已恢复"也静默），避免 API 反复抖动时每分钟刷一对消息。
-            if not monitor_unhealthy:
-                monitor_unhealthy = True
-                down_since = now_mono
-                in_cooldown = (
-                    last_down_alert_ts is not None
-                    and now_mono - last_down_alert_ts < cfg.monitor_alert_cooldown_sec
-                )
-                if in_cooldown:
-                    down_alert_sent = False
-                    LOG.warning(
-                        "监控再次中断，但距上次提醒不足 %.0fs，冷却期内静默",
-                        cfg.monitor_alert_cooldown_sec,
-                    )
-                else:
-                    down_alert_sent = True
-                    last_down_alert_ts = now_mono
-                    cooldown_label = _format_duration_label(int(cfg.monitor_alert_cooldown_sec))
-                    await tg.send(
-                        f"⚠️ <b>Predict 成交监控中断</b>\n"
-                        f"<code>{html.escape(str(exc))}</code>\n"
-                        f"<i>恢复并稳定后会再通知一次；若持续抖动，"
-                        f"{cooldown_label}内不再重复提醒。</i>",
-                        silent=True,
-                    )
-
             await asyncio.sleep(min(30, max(1, cfg.poll_interval_sec * 2)))
 
         try:
@@ -3857,23 +3622,25 @@ async def summary_runner(
         _format_duration_label(state.summary_interval_sec),
     )
     iteration = 0
+    # 每 10 秒醒一次对比"距上次推送是否已满 interval"，而不是一觉睡满整个
+    # interval —— 这样用户把 24h 改成 30m 后 10 秒内就生效，不用等旧周期走完。
+    last_fire = time.monotonic()
     while not stop.is_set():
-        iteration += 1
-        # 每次循环都重新读 summary_interval_sec —— 用户随时可能改
-        interval = state.summary_interval_sec
-        if interval <= 0:
-            # 关闭状态：每 10 秒醒一次复查
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=10)
-            except asyncio.TimeoutError:
-                pass
-            continue
-
         try:
-            await asyncio.wait_for(stop.wait(), timeout=interval)
+            await asyncio.wait_for(stop.wait(), timeout=10)
             return  # stop set
         except asyncio.TimeoutError:
             pass
+
+        interval = state.summary_interval_sec
+        if interval <= 0:
+            # 关闭状态：基线跟着走，重新打开后从"打开时刻"起算
+            last_fire = time.monotonic()
+            continue
+        if time.monotonic() - last_fire < interval:
+            continue
+        last_fire = time.monotonic()
+        iteration += 1
 
         try:
             window = state.summary_interval_sec  # 用最新值（可能刚被 /set_summary 改过）

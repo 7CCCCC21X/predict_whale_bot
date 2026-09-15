@@ -86,6 +86,7 @@ class Config:
 
     request_timeout_sec: float
     api_max_retries: int
+    predict_rate_limit_per_min: int
 
     market_url_template: str
     tx_url_template: str
@@ -139,13 +140,16 @@ class Config:
             # 实测是 18 位小数（份额 × 1e18），跟 USDT 一样。
             shares_wei_decimals=int(os.getenv("SHARES_WEI_DECIMALS", "18")),
 
-            # 0.4s 轮询。Predict 官方限速 240 req/min = 4 RPS。
-            # 0.4s × matches = 2.5 RPS = 150/min（占预算 63%）。
-            # 剩 90/min 给：新市场（2/min）+ 翻页保险（fetch_new_matches 遇 seen
-            # 就停，正常 1 页/轮）+ 偶发 /summary。429 时 get() 自动退避 + 重试。
-            # 想进一步压可以 0.3（83%）但翻页冲突会更易触发 429。
-            poll_interval_sec=float(os.getenv("POLL_INTERVAL_SEC", "0.4")),
-            matches_page_size=int(os.getenv("MATCHES_PAGE_SIZE", "100")),
+            # 0.2s 轮询。Predict 控制台"通用"桶实测限速 5000 req/min（约 83 RPS），
+            # 0.2s × matches = 5 RPS = 300/min，只占预算 6%，429 风险可忽略。
+            # 翻页保险（fetch_new_matches 遇 seen 就停，正常 1 页/轮）+ 偶发
+            # /summary 都在余量之内。429 时 get() 自动退避 + 重试。
+            # 再压到 0.1s 收益已经很小（延迟主要来自链上撮合 → API 入库），不建议。
+            poll_interval_sec=float(os.getenv("POLL_INTERVAL_SEC", "0.2")),
+            # 每轮拉 30 条：正常一轮只有个位数新成交，100 条意味着 90%+ 的响应体
+            # 都是在重复传已 seen 的旧数据。30 × MATCHES_MAX_PAGES(5) = 150 条/轮
+            # 仍能覆盖突发；真追不上时 hit_max 会有 warning。
+            matches_page_size=int(os.getenv("MATCHES_PAGE_SIZE", "30")),
             matches_max_pages=int(os.getenv("MATCHES_MAX_PAGES", "5")),
             # 默认开：seen 持久化后，重启不会重复推送，所以 startup 告警是安全的。
             # 真正的"首次空 seen"会有特殊路径，不会刷屏。
@@ -161,6 +165,9 @@ class Config:
 
             request_timeout_sec=float(os.getenv("REQUEST_TIMEOUT_SEC", "12")),
             api_max_retries=int(os.getenv("API_MAX_RETRIES", "5")),
+            # 只用于日志里"占用 X%"的分母，不做客户端限流。控制台"通用"桶
+            # 目前是 5000/min；等级升级或申请提额后在这里同步。
+            predict_rate_limit_per_min=int(os.getenv("PREDICT_RATE_LIMIT_PER_MIN", "5000")),
 
             # 默认指向 predict.fun 前端 + BNB Chain 浏览器；末尾带推荐 ref 参数。
             # 自定义请保留 {slug} / {address} 占位符；ref 参数可改也可去掉。
@@ -1467,9 +1474,6 @@ class Telegram:
 
 
 class Predict:
-    # Predict 官方限速：240 req/min = 4 RPS（mainnet 默认 / testnet）
-    RATE_LIMIT_PER_MIN = 240
-
     GRAPHQL_URL = "https://graphql.predict.fun/graphql"
     # 地址→用户名缓存：命中名字缓存 24h，未命中（空）缓存 1h 让用户改名后能续到
     _USERNAME_TTL_HIT = 24 * 3600
@@ -1550,10 +1554,11 @@ class Predict:
         if now - self._rate_log_last >= 300:
             self._rate_log_last = now
             count_60s = len(self._request_log)
-            pct = count_60s * 100 // self.RATE_LIMIT_PER_MIN
+            limit = max(1, self.cfg.predict_rate_limit_per_min)
+            pct = count_60s * 100 // limit
             LOG.info(
                 "[predict-api] 最近 60s = %d 次调用（限速 %d/min，占用 %d%%）",
-                count_60s, self.RATE_LIMIT_PER_MIN, pct,
+                count_60s, limit, pct,
             )
 
     async def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1568,9 +1573,11 @@ class Predict:
         url = f"{self.cfg.predict_api_base}{path}"
         last_exc: Optional[BaseException] = None
         max_attempts = max(1, self.cfg.api_max_retries)
-        self._record_request()
 
         for attempt in range(max_attempts):
+            # 每次真实发出的请求都计数（含 429/5xx/网络异常后的重试），
+            # 否则日志里的 req/min 在限流或抖动期间会明显偏低。
+            self._record_request()
             try:
                 resp = await self.client.get(url, params=params, headers=self.headers)
             except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPError) as exc:
